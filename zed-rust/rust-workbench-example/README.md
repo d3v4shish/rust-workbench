@@ -3,8 +3,7 @@
 Launch this directory with the repository's isolated editor:
 
 ```sh
-cd /home/d3v/Workspace/Temp/RustC/zed-rust
-./script/rust-workbench rust-workbench-example
+./workbench run zed-rust/rust-workbench-example
 ```
 
 Choose **Trust and Continue**, open a file in `src/bin`, wait for the check to

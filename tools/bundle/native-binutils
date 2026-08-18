@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+sdk_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+tool="$(basename "$0")"
+exec "$sdk_root/sysroot/usr/bin/x86_64-linux-gnu-$tool" "$@"

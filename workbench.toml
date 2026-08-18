@@ -1,0 +1,63 @@
+[workspace]
+rust = "rust"
+zed = "zed-rust"
+analyzer = "rust/src/tools/rust-analyzer"
+stress_project = "zed-rust/rust-ownership-stress-lab"
+
+[compatibility]
+os = "linux"
+arch = "x86_64"
+glibc_min = "2.43"
+archive = "rust-workbench-linux-x86_64-glibc2.43.tar.zst"
+
+[cleanup]
+debug_caches = [
+  "zed-rust/target/debug",
+  "rust/src/tools/rust-analyzer/target/debug",
+  "zed-rust/build",
+]
+all_generated = [
+  "zed-rust/target/debug",
+  "rust/src/tools/rust-analyzer/target/debug",
+  "zed-rust/build",
+  "zed-rust/rust-workbench-analysis-target",
+  "zed-rust/rust-workbench-data/cache",
+  "dist",
+]
+
+[native_sdk]
+gcc_major = "15"
+packages = [
+  "gcc-15",
+  "gcc-15-x86-64-linux-gnu",
+  "g++-15",
+  "g++-15-x86-64-linux-gnu",
+  "cpp-15",
+  "cpp-15-x86-64-linux-gnu",
+  "binutils",
+  "binutils-common",
+  "binutils-x86-64-linux-gnu",
+  "libbinutils",
+  "libctf0",
+  "libctf-nobfd0",
+  "libgprofng0",
+  "libsframe3",
+  "gcc-15-base",
+  "libgcc-s1",
+  "libstdc++6",
+  "libatomic1",
+  "libasan8",
+  "libtsan2",
+  "libgomp1",
+  "libquadmath0",
+  "libhwasan0",
+  "libubsan1",
+  "liblsan0",
+  "libitm1",
+  "libcc1-0",
+  "libgcc-15-dev",
+  "libstdc++-15-dev",
+  "libc6-dev",
+  "linux-libc-dev",
+  "libc6",
+]

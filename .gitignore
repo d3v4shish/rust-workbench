@@ -1,0 +1,21 @@
+# Local agent state.
+/.agents/
+/.codex/
+**/__pycache__/
+*.pyc
+
+# Unified Rust Workbench outputs.
+/dist/
+/rustc-ice-*.txt
+/rust/ownership_visual_repro
+/zed-rust/.build-deps/
+/zed-rust/build/
+/zed-rust/rust-workbench-analysis-target/
+/zed-rust/rust-workbench-data/
+
+# The nested source trees retain their own detailed ignore rules. These root
+# entries make the important build boundaries explicit to monorepo tooling.
+/rust/build/
+/rust/target/
+/rust/src/tools/rust-analyzer/target/
+/zed-rust/target/

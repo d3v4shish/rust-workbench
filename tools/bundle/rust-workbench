@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bundle_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+editor="$bundle_root/libexec/rust-workbench"
+analyzer="$bundle_root/libexec/rust-analyzer"
+toolchain="$bundle_root/toolchain"
+native="$bundle_root/native"
+
+export RUST_WORKBENCH_BUNDLE_ROOT="$bundle_root"
+export RUST_WORKBENCH_RUST_ANALYZER="$analyzer"
+export RUST_WORKBENCH_RUSTC="$toolchain/bin/rustc"
+export RUST_WORKBENCH_RUSTDOC="$toolchain/bin/rustdoc"
+export RUST_WORKBENCH_CARGO="$toolchain/bin/cargo"
+export RUST_WORKBENCH_RUST_SRC="$toolchain/lib/rustlib/src/rust/library"
+export RUSTUP_AUTO_INSTALL=0
+unset RUSTUP_TOOLCHAIN RUSTC_BOOTSTRAP || true
+
+export PATH="$toolchain/bin:$native/bin:$bundle_root/libexec:$PATH"
+export LD_LIBRARY_PATH="$bundle_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CC="$native/bin/cc"
+export CXX="$native/bin/c++"
+export AR="$native/bin/ar"
+export RANLIB="$native/bin/ranlib"
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$native/bin/cc"
+
+if [[ -n "${RUST_WORKBENCH_DATA_DIR:-}" ]]; then
+  data_root="$(mkdir -p "$RUST_WORKBENCH_DATA_DIR" && cd "$RUST_WORKBENCH_DATA_DIR" && pwd -P)"
+  export XDG_CACHE_HOME="$data_root/cache"
+  export XDG_CONFIG_HOME="$data_root/config"
+  export XDG_DATA_HOME="$data_root/data"
+  cache_base="$XDG_CACHE_HOME"
+  user_data_args=(--user-data-dir "$data_root/zed")
+else
+  cache_base="${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}"
+  data_base="${XDG_DATA_HOME:-${HOME:-/tmp}/.local/share}"
+  user_data_args=()
+  data_root="$data_base/rust-workbench"
+fi
+
+export CARGO_HOME="${CARGO_HOME:-$data_root/cargo}"
+export RUST_WORKBENCH_ANALYSIS_TARGET="${RUST_WORKBENCH_ANALYSIS_TARGET:-$cache_base/rust-workbench/analysis-target}"
+export ZED_UPDATE_EXPLANATION="Rust Workbench is updated by replacing this relocatable bundle."
+export ZED_RELEASE_CHANNEL=dev
+mkdir -p "$CARGO_HOME" "$RUST_WORKBENCH_ANALYSIS_TARGET"
+
+doctor() {
+  local failed=0
+  local required_glibc="2.43"
+  local arch
+  arch="$(uname -m)"
+  echo "Rust Workbench bundle: $bundle_root"
+  echo "Architecture: $arch (required: x86_64)"
+  if [[ "$arch" != "x86_64" ]]; then
+    failed=1
+  fi
+
+  local glibc_line glibc_version
+  glibc_line="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  glibc_version="${glibc_line#glibc }"
+  echo "GLIBC: ${glibc_version:-not found} (required: >= $required_glibc)"
+  if [[ -z "$glibc_version" ]] || [[ "$(printf '%s\n%s\n' "$required_glibc" "$glibc_version" | sort -V | head -n1)" != "$required_glibc" ]]; then
+    failed=1
+  fi
+
+  local component
+  for component in "$editor" "$analyzer" "$toolchain/bin/rustc" "$toolchain/bin/cargo" "$native/bin/cc"; do
+    if [[ -x "$component" ]]; then
+      echo "OK executable: $component"
+    else
+      echo "MISSING executable: $component" >&2
+      failed=1
+    fi
+  done
+
+  if command -v ldd >/dev/null 2>&1; then
+    local missing
+    missing="$(ldd "$editor" 2>&1 | grep 'not found' || true)"
+    if [[ -n "$missing" ]]; then
+      echo "$missing" >&2
+      failed=1
+    else
+      echo "OK shared-library closure"
+    fi
+  fi
+
+  "$toolchain/bin/rustc" -Vv | sed -n '1,3p'
+  "$toolchain/bin/cargo" -V
+  "$analyzer" --version
+  "$native/bin/cc" --version | sed -n '1p'
+
+  if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+    echo "Display: available"
+  else
+    echo "Display: unavailable (CLI checks work; the editor window needs X11 or Wayland)"
+  fi
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep 'libvulkan.so' >/dev/null; then
+    echo "Vulkan loader: available"
+  else
+    echo "Vulkan loader: not detected; a host Vulkan driver is required for the editor window"
+  fi
+  return "$failed"
+}
+
+case "${1:-}" in
+  --doctor)
+    doctor
+    exit $?
+    ;;
+  --print-bundle-root)
+    printf '%s\n' "$bundle_root"
+    exit 0
+    ;;
+  --run-toolchain)
+    shift
+    if [[ $# -eq 0 ]]; then
+      echo "usage: rust-workbench --run-toolchain COMMAND [ARG ...]" >&2
+      exit 2
+    fi
+    exec "$@"
+    ;;
+esac
+
+exec "$editor" "${user_data_args[@]}" "$@"

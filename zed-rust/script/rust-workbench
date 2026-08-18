@@ -3,6 +3,12 @@
 set -euo pipefail
 
 zed_source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+workspace_root="$(cd "$zed_source_dir/.." && pwd)"
+rust_source_dir="$workspace_root/rust"
+analyzer_binary="$rust_source_dir/src/tools/rust-analyzer/target/release/rust-analyzer"
+rustc_binary="$rust_source_dir/build/x86_64-unknown-linux-gnu/stage1/bin/rustc"
+rustdoc_binary="$rust_source_dir/build/x86_64-unknown-linux-gnu/stage1/bin/rustdoc"
+cargo_binary="$rust_source_dir/build/x86_64-unknown-linux-gnu/stage0/bin/cargo"
 profile="${RUST_WORKBENCH_PROFILE:-release}"
 if [[ "${1:-}" == "--debug" ]]; then
   profile="debug"
@@ -21,7 +27,34 @@ if [[ ! -x "$editor_binary" ]]; then
   exit 1
 fi
 
+for component in "$analyzer_binary" "$rustc_binary" "$rustdoc_binary"; do
+  if [[ ! -x "$component" ]]; then
+    echo "Rust Workbench component is missing: $component" >&2
+    echo "Run $workspace_root/workbench build all, then retry." >&2
+    exit 1
+  fi
+done
+if [[ ! -x "$cargo_binary" ]]; then
+  cargo_binary="$(command -v cargo || true)"
+fi
+if [[ -z "$cargo_binary" || ! -x "$cargo_binary" ]]; then
+  echo "Rust Workbench needs Cargo. Run $workspace_root/workbench doctor for details." >&2
+  exit 1
+fi
+
 export LD_LIBRARY_PATH="$local_sysroot/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export RUST_WORKBENCH_RUST_ANALYZER="$analyzer_binary"
+export RUST_WORKBENCH_RUSTC="$rustc_binary"
+export RUST_WORKBENCH_RUSTDOC="$rustdoc_binary"
+export RUST_WORKBENCH_CARGO="$cargo_binary"
+export RUST_WORKBENCH_RUST_SRC="$rust_source_dir/library"
+export RUST_WORKBENCH_ANALYSIS_TARGET="$zed_source_dir/rust-workbench-analysis-target"
+export RUSTC="$rustc_binary"
+export RUSTDOC="$rustdoc_binary"
+export CARGO="$cargo_binary"
+export RUSTUP_AUTO_INSTALL=0
+unset RUST_WORKBENCH_BUNDLE_ROOT RUSTUP_TOOLCHAIN || true
+export PATH="$(dirname "$cargo_binary"):$(dirname "$rustc_binary"):$(dirname "$analyzer_binary"):$PATH"
 export ZED_UPDATE_EXPLANATION="Rust Workbench is updated by rebuilding this source tree."
 export ZED_RELEASE_CHANNEL="dev"
 export XDG_CACHE_HOME="$user_data_dir/cache"

@@ -4,17 +4,23 @@ use std::process::Command;
 fn main() {
     #[cfg(target_os = "linux")]
     {
+        println!("cargo:rerun-if-env-changed=RUST_WORKBENCH_PORTABLE");
         // Add rpaths for libraries that webrtc-sys dlopens at runtime.
         // This is mostly required for hosts with non-standard SO installation
         // locations such as NixOS.
         let dlopened_libs = ["libva", "libva-drm", "egl"];
 
         let mut rpath_dirs = std::collections::BTreeSet::new();
-        for lib in &dlopened_libs {
-            if let Some(libdir) = pkg_config::get_variable(lib, "libdir").ok() {
-                rpath_dirs.insert(libdir);
-            } else {
-                eprintln!("zed build.rs: {lib} not found in pkg-config's path");
+        // The relocatable bundle deliberately uses only $ORIGIN-relative search
+        // paths and host GPU drivers. Baking this build machine's pkg-config
+        // sysroot into DT_RUNPATH would make the resulting editor non-portable.
+        if std::env::var_os("RUST_WORKBENCH_PORTABLE").is_none() {
+            for lib in &dlopened_libs {
+                if let Some(libdir) = pkg_config::get_variable(lib, "libdir").ok() {
+                    rpath_dirs.insert(libdir);
+                } else {
+                    eprintln!("zed build.rs: {lib} not found in pkg-config's path");
+                }
             }
         }
 

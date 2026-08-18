@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rust Workbench
+Comment=Compiler-backed visual Rust ownership learning editor
+Exec=rust-workbench %F
+Icon=rust-workbench
+Terminal=false
+Categories=Development;IDE;
+MimeType=text/plain;inode/directory;
+StartupNotify=true

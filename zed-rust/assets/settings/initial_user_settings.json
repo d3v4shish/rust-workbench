@@ -14,4 +14,71 @@
     "light": "One Light",
     "dark": "One Dark",
   },
+  "semantic_tokens": "combined",
+  "inlay_hints": {
+    "enabled": true,
+    "show_type_hints": true,
+    "show_parameter_hints": true,
+    "show_other_hints": true,
+    "show_background": false,
+  },
+  "diagnostics": {
+    "include_warnings": true,
+    "inline": {
+      "enabled": true,
+      "max_severity": null,
+      "update_debounce_ms": 150,
+      "padding": 4,
+    },
+  },
+  "global_lsp_settings": {
+    "semantic_token_rules": [
+      {
+        "token_modifiers": ["invalidUse"],
+        "foreground_color": "#fb4934",
+        "underline": true,
+        "font_weight": "bold",
+      },
+      {
+        "token_modifiers": ["moved"],
+        "foreground_color": "#928374",
+        "strikethrough": true,
+      },
+      {
+        "token_modifiers": ["partialMove"],
+        "foreground_color": "#d79921",
+        "underline": true,
+      },
+      {
+        "token_modifiers": ["borrowedMut"],
+        "foreground_color": "#fe8019",
+        "underline": true,
+      },
+      {
+        "token_modifiers": ["borrowed"],
+        "foreground_color": "#83a598",
+        "underline": true,
+      },
+      {
+        "token_modifiers": ["reinitialized"],
+        "foreground_color": "#b8bb26",
+        "font_weight": "bold",
+      },
+      {
+        "token_modifiers": ["lastUse"],
+        "foreground_color": "#b8bb26",
+        "font_style": "italic",
+      },
+      {
+        "token_modifiers": ["borrowEnd"],
+        "foreground_color": "#928374",
+        "font_style": "italic",
+      },
+      {
+        "token_modifiers": ["dropped"],
+        "foreground_color": "#928374",
+        "strikethrough": true,
+      },
+    ],
+  },
 }

@@ -71,6 +71,86 @@ impl RustLspAdapter {
 
 const SERVER_NAME: LanguageServerName = LanguageServerName::new_static("rust-analyzer");
 
+const RUST_WORKBENCH_BUNDLE_ROOT: &str = "RUST_WORKBENCH_BUNDLE_ROOT";
+const RUST_WORKBENCH_RUST_ANALYZER: &str = "RUST_WORKBENCH_RUST_ANALYZER";
+const RUST_WORKBENCH_RUSTC: &str = "RUST_WORKBENCH_RUSTC";
+const RUST_WORKBENCH_RUSTDOC: &str = "RUST_WORKBENCH_RUSTDOC";
+const RUST_WORKBENCH_CARGO: &str = "RUST_WORKBENCH_CARGO";
+const RUST_WORKBENCH_RUST_SRC: &str = "RUST_WORKBENCH_RUST_SRC";
+const RUST_WORKBENCH_ANALYSIS_TARGET: &str = "RUST_WORKBENCH_ANALYSIS_TARGET";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RustWorkbenchToolchain {
+    analyzer: PathBuf,
+    rustc: PathBuf,
+    rustdoc: PathBuf,
+    cargo: PathBuf,
+    rust_source: PathBuf,
+    analysis_target: PathBuf,
+}
+
+impl RustWorkbenchToolchain {
+    fn from_bundle_root(root: &Path, analysis_target: PathBuf) -> Self {
+        Self {
+            analyzer: root.join("libexec/rust-analyzer"),
+            rustc: root.join("toolchain/bin/rustc"),
+            rustdoc: root.join("toolchain/bin/rustdoc"),
+            cargo: root.join("toolchain/bin/cargo"),
+            rust_source: root.join("toolchain/lib/rustlib/src/rust/library"),
+            analysis_target,
+        }
+    }
+
+    fn from_environment() -> Option<Self> {
+        let analysis_target = std::env::var_os(RUST_WORKBENCH_ANALYSIS_TARGET)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("rust-workbench-analysis-target"));
+        if let Some(root) = std::env::var_os(RUST_WORKBENCH_BUNDLE_ROOT).map(PathBuf::from) {
+            return Some(Self::from_bundle_root(&root, analysis_target));
+        }
+
+        Some(Self {
+            analyzer: std::env::var_os(RUST_WORKBENCH_RUST_ANALYZER)?.into(),
+            rustc: std::env::var_os(RUST_WORKBENCH_RUSTC)?.into(),
+            rustdoc: std::env::var_os(RUST_WORKBENCH_RUSTDOC)?.into(),
+            cargo: std::env::var_os(RUST_WORKBENCH_CARGO)?.into(),
+            rust_source: std::env::var_os(RUST_WORKBENCH_RUST_SRC)?.into(),
+            analysis_target,
+        })
+    }
+
+    fn initialization_options(&self) -> serde_json::Value {
+        let rustc = self.rustc.to_string_lossy();
+        let rustdoc = self.rustdoc.to_string_lossy();
+        let cargo = self.cargo.to_string_lossy();
+        let analysis_target = self.analysis_target.to_string_lossy();
+        let rust_source = format!(
+            "{}/",
+            self.rust_source.to_string_lossy().trim_end_matches('/')
+        );
+        let toolchain_environment = json!({
+            "CARGO": cargo,
+            "CARGO_TARGET_DIR": analysis_target,
+            "RUSTC": rustc,
+            "RUSTDOC": rustdoc,
+            "RUSTUP_AUTO_INSTALL": "0",
+        });
+
+        json!({
+            "ownership": { "enable": true },
+            "assist": {
+                "ownershipWrapperSuggestions": { "enable": true },
+            },
+            "diagnostics": {
+                "remapPrefix": { "library/": rust_source },
+            },
+            "cargo": { "extraEnv": toolchain_environment.clone() },
+            "check": { "extraEnv": toolchain_environment },
+            "checkOnSave": true,
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
 enum LibcType {
     Gnu,
@@ -314,6 +394,15 @@ impl LspAdapter for RustLspAdapter {
 
     fn disk_based_diagnostics_progress_token(&self) -> Option<String> {
         Some("rust-analyzer/flycheck".into())
+    }
+
+    async fn initialization_options(
+        self: Arc<Self>,
+        _: &Arc<dyn LspAdapterDelegate>,
+        _: &mut AsyncApp,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(RustWorkbenchToolchain::from_environment()
+            .map(|toolchain| toolchain.initialization_options()))
     }
 
     fn process_diagnostics(&self, params: &mut lsp::PublishDiagnosticsParams, _: LanguageServerId) {
@@ -751,6 +840,32 @@ impl LspInstaller for RustLspAdapter {
         let delegate = delegate.clone();
         cx.background_spawn(async move {
             let env = delegate.shell_env().await;
+            if let Some(toolchain) = RustWorkbenchToolchain::from_environment() {
+                let path = toolchain.analyzer;
+                let result = delegate
+                    .try_exec(LanguageServerBinary {
+                        path: path.clone(),
+                        arguments: vec!["--help".into()],
+                        env: Some(env.clone()),
+                    })
+                    .await;
+                if result.is_ok() {
+                    log::info!(
+                        "using the compiler-backed Rust Workbench rust-analyzer at {}",
+                        path.display()
+                    );
+                    return Some(LanguageServerBinary {
+                        path,
+                        env: Some(env),
+                        arguments: vec![],
+                    });
+                }
+                log::error!(
+                    "Rust Workbench rust-analyzer at {} could not be started: {result:?}",
+                    path.display()
+                );
+            }
+
             if let Some(path) = Self::rustup_rust_analyzer_for_worktree(delegate.as_ref()).await {
                 let result = delegate
                     .try_exec(LanguageServerBinary {
@@ -2389,5 +2504,51 @@ mod tests {
             .expect("cachePriming properties should be object");
 
         assert!(cache_priming_props.contains_key("enable"));
+    }
+
+    #[test]
+    fn rust_workbench_bundle_layout_is_relocatable() {
+        let toolchain = RustWorkbenchToolchain::from_bundle_root(
+            Path::new("/opt/Rust Workbench/rust-workbench.app"),
+            PathBuf::from("/tmp/rust-workbench-analysis"),
+        );
+
+        assert_eq!(
+            toolchain.analyzer,
+            PathBuf::from("/opt/Rust Workbench/rust-workbench.app/libexec/rust-analyzer")
+        );
+        assert_eq!(
+            toolchain.rustc,
+            PathBuf::from("/opt/Rust Workbench/rust-workbench.app/toolchain/bin/rustc")
+        );
+        assert_eq!(
+            toolchain.rust_source,
+            PathBuf::from(
+                "/opt/Rust Workbench/rust-workbench.app/toolchain/lib/rustlib/src/rust/library"
+            )
+        );
+    }
+
+    #[test]
+    fn rust_workbench_options_enable_compiler_backed_ownership() {
+        let toolchain = RustWorkbenchToolchain::from_bundle_root(
+            Path::new("/bundle"),
+            PathBuf::from("/cache/analysis"),
+        );
+        let options = toolchain.initialization_options();
+
+        assert_eq!(options.pointer("/ownership/enable"), Some(&json!(true)));
+        assert_eq!(
+            options.pointer("/assist/ownershipWrapperSuggestions/enable"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            options.pointer("/cargo/extraEnv/RUSTC"),
+            Some(&json!("/bundle/toolchain/bin/rustc"))
+        );
+        assert_eq!(
+            options.pointer("/diagnostics/remapPrefix/library~1"),
+            Some(&json!("/bundle/toolchain/lib/rustlib/src/rust/library/"))
+        );
     }
 }

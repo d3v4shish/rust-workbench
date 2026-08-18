@@ -1,4 +1,4 @@
-[attr]rust text eol=lf whitespace=tab-in-indent,trailing-space,tabwidth=4
+# The `rust` macro is defined by the combined repository's root .gitattributes.
 
 * text=auto eol=lf
 *.cpp rust

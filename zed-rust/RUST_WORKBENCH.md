@@ -8,15 +8,14 @@ task switcher, window decorations, and About dialog.
 
 ## Build and launch
 
-From `/home/d3v/Workspace/Temp/RustC/zed-rust`:
+From the combined repository root (the directory containing `workbench.toml`):
 
 ```sh
 # Required once on a clean Debian/Ubuntu checkout. This is rootless.
-./script/bootstrap-rust-workbench-linux
-
-./script/build-rust-workbench
-./script/install-rust-workbench-desktop
-./script/rust-workbench rust-workbench-example
+./workbench bootstrap
+./workbench build all
+./zed-rust/script/install-rust-workbench-desktop
+./workbench run zed-rust/rust-workbench-example
 ```
 
 The normal build and desktop launcher use the optimized release binary. For
@@ -94,14 +93,8 @@ cards with visible diffs. Apply a repair, verify the error disappears, and use
 The relevant local checks are:
 
 ```sh
-cd /home/d3v/Workspace/Temp/RustC/rust
-./x check compiler/rustc_borrowck compiler/rustc_driver_impl
-./x test tests/run-make/borrowck-autofix --force-rerun
-
-cd /home/d3v/Workspace/Temp/RustC/rust/src/tools/rust-analyzer
-cargo test -p rust-analyzer ownership --lib --bins
-
-cd /home/d3v/Workspace/Temp/RustC/zed-rust
-./script/clippy -p rust_workbench
-./script/build-rust-workbench
+./workbench test quick
+./workbench test full
+./workbench test performance
+./workbench package linux
 ```

@@ -22,6 +22,14 @@ export PKG_CONFIG_SYSROOT_DIR="$local_sysroot"
 export ZED_UPDATE_EXPLANATION="Rust Workbench is updated by rebuilding this source tree."
 export ZED_RELEASE_CHANNEL="dev"
 
+# Keep portable linker flags scoped to the two release builds below.  In
+# particular, callers such as the full qualification suite should not have to
+# set global RUSTFLAGS that invalidate every preceding test artifact.
+if [[ -n "${RUST_WORKBENCH_PORTABLE:-}" ]]; then
+  portable_rustflags='-C link-args=-Wl,--disable-new-dtags,-rpath,$ORIGIN/../lib'
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$portable_rustflags"
+fi
+
 # Reuse a previously downloaded pinned WebRTC bundle when available. The upstream build script
 # otherwise downloads the same large archive again whenever its build-script fingerprint changes,
 # which makes an otherwise local Rust Workbench rebuild fail while offline.

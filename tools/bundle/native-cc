@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+sdk_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+sysroot="$sdk_root/sysroot"
+triple="x86_64-linux-gnu"
+gcc_version="15"
+program="$(basename "$0")"
+
+case "$program" in
+  c++|g++) driver="$sysroot/usr/bin/$triple-g++-$gcc_version" ;;
+  *) driver="$sysroot/usr/bin/$triple-gcc-$gcc_version" ;;
+esac
+
+gcc_lib="$sysroot/usr/lib/gcc/$triple/$gcc_version"
+gcc_exec="$sysroot/usr/libexec/gcc/$triple/$gcc_version"
+export GCC_EXEC_PREFIX="$sysroot/usr/libexec/gcc/"
+export COMPILER_PATH="$gcc_exec:$sysroot/usr/bin"
+export LIBRARY_PATH="$gcc_lib:$sysroot/usr/lib/$triple:$sysroot/usr/lib"
+
+include_args=(
+  -isystem "$gcc_lib/include"
+  -isystem "$sysroot/usr/include/$triple"
+  -isystem "$sysroot/usr/include"
+)
+if [[ "$program" == "c++" || "$program" == "g++" ]]; then
+  include_args=(
+    -isystem "$sysroot/usr/include/c++/$gcc_version"
+    -isystem "$sysroot/usr/include/$triple/c++/$gcc_version"
+    -isystem "$sysroot/usr/include/c++/$gcc_version/backward"
+    "${include_args[@]}"
+  )
+fi
+
+exec "$driver" \
+  --sysroot="$sysroot" \
+  -B"$gcc_exec/" \
+  -B"$gcc_lib/" \
+  -B"$sysroot/usr/bin/" \
+  "${include_args[@]}" \
+  "$@"

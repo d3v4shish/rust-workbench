@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bundle_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+desktop_source="$bundle_root/share/applications/dev.rustworkbench.RustWorkbench.desktop"
+desktop_target="${XDG_DATA_HOME:-$HOME/.local/share}/applications/dev.rustworkbench.RustWorkbench.desktop"
+icon_target="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/512x512/apps/rust-workbench.png"
+bin_target="$HOME/.local/bin/rust-workbench"
+
+mkdir -p "$(dirname "$desktop_target")" "$(dirname "$icon_target")" "$(dirname "$bin_target")"
+install -m 0644 "$bundle_root/share/icons/hicolor/512x512/apps/rust-workbench.png" "$icon_target"
+ln -sfn "$bundle_root/bin/rust-workbench" "$bin_target"
+sed \
+  -e "s|^Exec=.*|Exec=$bundle_root/bin/rust-workbench %F|" \
+  -e "s|^Icon=.*|Icon=$icon_target|" \
+  "$desktop_source" > "$desktop_target"
+chmod 0644 "$desktop_target"
+echo "Installed Rust Workbench desktop entry and $bin_target"

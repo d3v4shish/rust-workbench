@@ -10,7 +10,10 @@ icons_dir="$desktop_data_dir/icons/hicolor/512x512/apps"
 
 mkdir -p "$applications_dir"
 mkdir -p "$icons_dir"
-install -m 0644 "$desktop_source" "$applications_dir/dev.rustworkbench.EditorDev.desktop"
+sed \
+  -e "s|^Exec=.*|Exec=$zed_source_dir/script/rust-workbench %F|" \
+  "$desktop_source" > "$applications_dir/dev.rustworkbench.EditorDev.desktop"
+chmod 0644 "$applications_dir/dev.rustworkbench.EditorDev.desktop"
 install -m 0644 \
   "$zed_source_dir/crates/zed/resources/app-icon-rust-workbench.png" \
   "$icons_dir/dev.rustworkbench.EditorDev.png"
