@@ -1,17 +1,22 @@
 mod learning_catalog;
 
-use std::{collections::BTreeSet, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use db::kvp::KeyValueStore;
 use editor::{
     Editor, EditorEvent, HighlightKey, RowHighlightOptions, RustInlineDiagnosticMode,
-    RustOwnershipDisplayPreferences, RustOwnershipDisplayProfile, RustOwnershipHintScope,
+    RustMechanicsHintMode, RustOwnershipDisplayPreferences, RustOwnershipDisplayProfile,
+    RustOwnershipHintScope, actions::OpenRustWorkbenchForClue,
 };
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions,
-    prelude::*, px,
+    Focusable, IntoElement, ParentElement, PathBuilder, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, canvas,
+    point, prelude::*, px,
 };
 use language::{Buffer, point_from_lsp, point_to_lsp};
 use project::{
@@ -38,6 +43,18 @@ actions!(
         Refresh,
         /// Opens the Rust learning display profiles and hint filters.
         OpenDisplaySettings,
+        /// Toggles compact layout/storage/access/wrapper clues in Rust source.
+        ToggleEditorClues,
+        /// Selects the previous compiler issue in the active Rust file.
+        PreviousIssue,
+        /// Selects the next compiler issue in the active Rust file.
+        NextIssue,
+        /// Moves the ownership event scrubber one step backward.
+        PreviousVisualStep,
+        /// Moves the ownership event scrubber one step forward.
+        NextVisualStep,
+        /// Reveals the selected ownership event in Rust source.
+        FocusVisualStepSource,
     ]
 );
 
@@ -49,23 +66,27 @@ const MAX_PANEL_FONT_SCALE_PERCENT: u16 = 180;
 const PANEL_FONT_SCALE_STEP_PERCENT: i16 = 10;
 struct OwnershipStudioCue;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum LearningSection {
-    Advanced,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetailDrawer {
+    Why,
+    Variables,
+    Lifetimes,
+    Calls,
+    Layout,
+    C,
+    Evidence,
 }
 
-impl LearningSection {
-    fn title(self) -> &'static str {
+impl DetailDrawer {
+    fn label(self) -> &'static str {
         match self {
-            Self::Advanced => "Explore deeper (optional)",
-        }
-    }
-
-    fn subtitle(self) -> &'static str {
-        match self {
-            Self::Advanced => {
-                "Memory, lifetimes, resolved calls, MIR evidence, and the optional C comparison"
-            }
+            Self::Why => "Why",
+            Self::Variables => "Variables",
+            Self::Lifetimes => "Lifetimes",
+            Self::Calls => "Calls",
+            Self::Layout => "Layout",
+            Self::C => "C intent",
+            Self::Evidence => "Evidence",
         }
     }
 }
@@ -148,6 +169,66 @@ pub fn init(cx: &mut App) {
                 });
             }
         });
+        workspace.register_action(|workspace, _: &ToggleEditorClues, _window, cx| {
+            if let Some(panel) = workspace.panel::<RustWorkbenchPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.display_preferences.mechanics_mode =
+                        if panel.display_preferences.mechanics_mode == RustMechanicsHintMode::Off {
+                            RustMechanicsHintMode::SelectedPath
+                        } else {
+                            RustMechanicsHintMode::Off
+                        };
+                    panel.display_preferences.profile = RustOwnershipDisplayProfile::Custom;
+                    panel.display_preferences_changed(cx);
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &OpenRustWorkbenchForClue, window, cx| {
+            workspace.open_panel::<RustWorkbenchPanel>(window, cx);
+            if let Some(panel) = workspace.panel::<RustWorkbenchPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    // The editor has already placed the cursor at the semantic
+                    // clue's source anchor. Unlock the previous diagnostic so
+                    // the next bounded scan can select the exact field/place.
+                    panel.selected_problem_id = None;
+                    panel.selection_epoch = panel.selection_epoch.wrapping_add(1);
+                    panel.last_problem_key = None;
+                    panel.pending_problem_key = None;
+                    panel.last_model_key = None;
+                    panel.pending_model_key = None;
+                    panel.selected_topology_element = None;
+                    panel.schedule_problem_scan(cx);
+                    cx.notify();
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &PreviousIssue, _window, cx| {
+            if let Some(panel) = workspace.panel::<RustWorkbenchPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.select_relative_problem(-1, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &NextIssue, _window, cx| {
+            if let Some(panel) = workspace.panel::<RustWorkbenchPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.select_relative_problem(1, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &PreviousVisualStep, _window, cx| {
+            if let Some(panel) = workspace.panel::<RustWorkbenchPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.select_relative_visual_step(-1, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &NextVisualStep, _window, cx| {
+            if let Some(panel) = workspace.panel::<RustWorkbenchPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.select_relative_visual_step(1, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &FocusVisualStepSource, _window, cx| {
+            if let Some(panel) = workspace.panel::<RustWorkbenchPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.select_visual_step(panel.visual_step, cx)
+                });
+            }
+        });
     })
     .detach();
 }
@@ -178,7 +259,7 @@ pub struct RustWorkbenchPanel {
     display_preferences: RustOwnershipDisplayPreferences,
     show_display_controls: bool,
     show_issue_list: bool,
-    collapsed_sections: BTreeSet<LearningSection>,
+    active_detail_drawer: Option<DetailDrawer>,
     expanded_operations: BTreeSet<String>,
     repair_verification: Option<RepairVerification>,
     repair_validation_task: Task<()>,
@@ -189,6 +270,9 @@ pub struct RustWorkbenchPanel {
     generated_c_task: Task<()>,
     exact_mode: bool,
     visual_step: usize,
+    topology_scene: Option<OwnershipTopologyScene>,
+    full_topology_scene: Option<OwnershipTopologyScene>,
+    selected_topology_element: Option<String>,
     preview_repair_id: Option<String>,
     show_repair_alternatives: bool,
     _subscriptions: Vec<Subscription>,
@@ -408,7 +492,7 @@ impl RustWorkbenchPanel {
                     display_preferences,
                     show_display_controls: false,
                     show_issue_list: false,
-                    collapsed_sections: BTreeSet::from([LearningSection::Advanced]),
+                    active_detail_drawer: None,
                     expanded_operations: BTreeSet::new(),
                     repair_verification: None,
                     repair_validation_task: Task::ready(()),
@@ -419,6 +503,9 @@ impl RustWorkbenchPanel {
                     generated_c_task: Task::ready(()),
                     exact_mode: false,
                     visual_step: 0,
+                    topology_scene: None,
+                    full_topology_scene: None,
+                    selected_topology_element: None,
                     preview_repair_id: None,
                     show_repair_alternatives: false,
                     _subscriptions: vec![workspace_subscription, project_subscription],
@@ -445,6 +532,9 @@ impl RustWorkbenchPanel {
         self.selected_problem_id = None;
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         self.model = OwnershipModel::default();
+        self.topology_scene = None;
+        self.full_topology_scene = None;
+        self.selected_topology_element = None;
         self.preview_repair_id = None;
         self.show_repair_alternatives = false;
         self.repair_validation_task = Task::ready(());
@@ -488,9 +578,7 @@ impl RustWorkbenchPanel {
                 }
                 if panel.active
                     && panel.c_view_mode == CViewMode::Generated
-                    && !panel
-                        .collapsed_sections
-                        .contains(&LearningSection::Advanced)
+                    && panel.active_detail_drawer == Some(DetailDrawer::C)
                     && matches!(event, EditorEvent::Saved)
                 {
                     panel.schedule_generated_c(cx);
@@ -587,6 +675,9 @@ impl RustWorkbenchPanel {
         self.last_model_key = None;
         self.pending_model_key = None;
         self.model = OwnershipModel::default();
+        self.topology_scene = None;
+        self.full_topology_scene = None;
+        self.selected_topology_element = None;
         self.repair_verification = None;
         self.repair_validation_task = Task::ready(());
         self.validating_repair_id = None;
@@ -616,9 +707,18 @@ impl RustWorkbenchPanel {
     fn select_visual_step(&mut self, index: usize, cx: &mut Context<Self>) {
         let range = self
             .model
-            .value_trace
+            .memory_graph
+            .snapshots
             .get(index)
-            .map(|step| step.range)
+            .map(|snapshot| snapshot.range)
+            .or_else(|| {
+                self.model
+                    .conflict_graph
+                    .as_ref()
+                    .and_then(|graph| graph.snapshots.get(index))
+                    .map(|snapshot| snapshot.range)
+            })
+            .or_else(|| self.model.value_trace.get(index).map(|step| step.range))
             .or_else(|| {
                 visual_moments(self.selected_problem(), &self.model)
                     .get(index)
@@ -628,7 +728,109 @@ impl RustWorkbenchPanel {
             return;
         };
         self.visual_step = index;
+        self.update_topology_scene_step(index);
         self.cue_range(range, cx);
+        cx.notify();
+    }
+
+    fn select_relative_visual_step(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let count = ownership_visual_step_count(self.selected_problem(), &self.model);
+        if count == 0 {
+            return;
+        }
+        let next = self
+            .visual_step
+            .saturating_add_signed(direction)
+            .min(count.saturating_sub(1));
+        if next != self.visual_step {
+            self.select_visual_step(next, cx);
+        }
+    }
+
+    fn rebuild_topology_scene(&mut self) {
+        let problem = self.selected_problem().cloned();
+        self.topology_scene =
+            derive_ownership_topology_scene(problem.as_ref(), &self.model, self.visual_step);
+    }
+
+    fn rebuild_full_topology_scene(&mut self) {
+        let problem = self.selected_problem().cloned();
+        self.full_topology_scene = derive_ownership_topology_scene_with_limits(
+            problem.as_ref(),
+            &self.model,
+            self.visual_step,
+            64,
+            96,
+            true,
+        );
+    }
+
+    fn update_topology_scene_step(&mut self, index: usize) {
+        let node_states = topology_state_at_step(&self.model, index);
+        let edge_states = self
+            .model
+            .memory_graph
+            .edges
+            .iter()
+            .map(|edge| {
+                (
+                    edge.id.as_str(),
+                    topology_edge_active_at_step(edge, &self.model, index),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let conflict_states = self
+            .model
+            .conflict_graph
+            .as_ref()
+            .and_then(|graph| {
+                graph
+                    .snapshots
+                    .get(index)
+                    .or_else(|| graph.snapshots.last())
+            })
+            .map(|snapshot| {
+                snapshot
+                    .states
+                    .iter()
+                    .map(|state| (format!("conflict:{}", state.node_id), state.state.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        for scene in self
+            .topology_scene
+            .iter_mut()
+            .chain(self.full_topology_scene.iter_mut())
+        {
+            scene.selected_step = index.min(scene.moments.len().saturating_sub(1));
+            for node in &mut scene.nodes {
+                if let Some(state) = node_states
+                    .get(&node.id)
+                    .or_else(|| conflict_states.get(&node.id))
+                {
+                    node.state.clone_from(state);
+                }
+            }
+            for edge in &mut scene.edges {
+                if let Some(active) = edge_states.get(edge.id.as_str()) {
+                    edge.active = *active;
+                }
+            }
+        }
+    }
+
+    fn inspect_topology_element(
+        &mut self,
+        element_id: String,
+        summary: String,
+        range: Option<lsp::Range>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_topology_element = Some(element_id);
+        self.status_message = summary.into();
+        if let Some(range) = range {
+            self.cue_range(range, cx);
+        }
         cx.notify();
     }
 
@@ -708,14 +910,20 @@ impl RustWorkbenchPanel {
         cx.notify();
     }
 
-    fn toggle_learning_section(&mut self, section: LearningSection, cx: &mut Context<Self>) {
-        if !self.collapsed_sections.remove(&section) {
-            self.collapsed_sections.insert(section);
-            if section == LearningSection::Advanced {
+    fn toggle_detail_drawer(&mut self, drawer: DetailDrawer, cx: &mut Context<Self>) {
+        if self.active_detail_drawer == Some(drawer) {
+            self.active_detail_drawer = None;
+            if drawer == DetailDrawer::C {
                 self.cancel_generated_c(cx);
             }
-        } else if section == LearningSection::Advanced && self.c_view_mode == CViewMode::Generated {
-            self.schedule_generated_c(cx);
+        } else {
+            self.active_detail_drawer = Some(drawer);
+            if drawer == DetailDrawer::Variables && self.full_topology_scene.is_none() {
+                self.rebuild_full_topology_scene();
+            }
+            if drawer == DetailDrawer::C && self.c_view_mode == CViewMode::Generated {
+                self.schedule_generated_c(cx);
+            }
         }
         cx.notify();
     }
@@ -778,6 +986,10 @@ impl RustWorkbenchPanel {
             "ownership_colors" => {
                 preferences.show_ownership_coloring = !preferences.show_ownership_coloring
             }
+            "layout" => preferences.show_layout = !preferences.show_layout,
+            "storage" => preferences.show_storage = !preferences.show_storage,
+            "access" => preferences.show_access = !preferences.show_access,
+            "wrappers" => preferences.show_wrappers = !preferences.show_wrappers,
             _ => return,
         }
         preferences.profile = RustOwnershipDisplayProfile::Custom;
@@ -894,7 +1106,7 @@ impl RustWorkbenchPanel {
 
     fn schedule_generated_c(&mut self, cx: &mut Context<Self>) {
         if self.c_view_mode != CViewMode::Generated
-            || self.collapsed_sections.contains(&LearningSection::Advanced)
+            || self.active_detail_drawer != Some(DetailDrawer::C)
         {
             return;
         }
@@ -1015,7 +1227,9 @@ impl RustWorkbenchPanel {
                         if panel.pending_problem_key.is_none() {
                             panel.schedule_problem_scan(cx);
                         }
-                    } else if let Some(index) = panel.problem_index_at_cursor(cx) {
+                    } else if panel.selected_problem_id.is_none()
+                        && let Some(index) = panel.problem_index_at_cursor(cx)
+                    {
                         panel.select_problem_index(index, false, cx);
                     }
                 })
@@ -1135,6 +1349,9 @@ impl RustWorkbenchPanel {
                                 if selected_id != previous_id {
                                     panel.selection_epoch = panel.selection_epoch.wrapping_add(1);
                                     panel.model = OwnershipModel::default();
+                                    panel.topology_scene = None;
+                                    panel.full_topology_scene = None;
+                                    panel.selected_topology_element = None;
                                     panel.last_model_key = None;
                                     panel.pending_model_key = None;
                                 }
@@ -1235,6 +1452,9 @@ impl RustWorkbenchPanel {
         let Some(editor) = self.active_editor.as_ref().and_then(WeakEntity::upgrade) else {
             self.status_message = "Open a Rust source file to inspect ownership.".into();
             self.model = OwnershipModel::default();
+            self.topology_scene = None;
+            self.full_topology_scene = None;
+            self.selected_topology_element = None;
             cx.notify();
             return;
         };
@@ -1312,6 +1532,9 @@ impl RustWorkbenchPanel {
                             if source_is_current && problem_is_current {
                                 panel.status_message = ownership_status(&model).into();
                                 panel.model = model;
+                                panel.full_topology_scene = None;
+                                panel.selected_topology_element = None;
+                                panel.rebuild_topology_scene();
                                 panel.last_model_key = Some(request_key.clone());
                                 panel.apply_display_to_editor(cx);
                                 if let Some(range) = panel
@@ -1337,6 +1560,9 @@ impl RustWorkbenchPanel {
                             panel.status_message =
                                 format!("Ownership analysis failed: {error}").into();
                             panel.model = OwnershipModel::default();
+                            panel.topology_scene = None;
+                            panel.full_topology_scene = None;
+                            panel.selected_topology_element = None;
                         }
                     }
                     cx.notify();
@@ -1742,6 +1968,7 @@ fn reconciled_ownership_problem_index(
         .map(|(index, _)| index)
 }
 
+#[cfg(test)]
 fn distance_to_range(cursor: lsp::Position, range: lsp::Range) -> (u32, u32) {
     if position_is_before(cursor, range.start) {
         let line_distance = range.start.line - cursor.line;
@@ -1764,6 +1991,7 @@ fn distance_to_range(cursor: lsp::Position, range: lsp::Range) -> (u32, u32) {
     }
 }
 
+#[cfg(test)]
 fn problem_distance(cursor: lsp::Position, problem: &OwnershipProblem) -> (u32, u32) {
     std::iter::once(problem.primary_range)
         .chain(std::iter::once(problem.binding_range))
@@ -1773,6 +2001,7 @@ fn problem_distance(cursor: lsp::Position, problem: &OwnershipProblem) -> (u32, 
         .unwrap_or((u32::MAX, u32::MAX))
 }
 
+#[cfg(test)]
 fn nearest_ownership_problem_index(
     problems: &[OwnershipProblem],
     cursor: lsp::Position,
@@ -1943,7 +2172,7 @@ impl Panel for RustWorkbenchPanel {
 
 impl Render for RustWorkbenchPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let collapsed_sections = self.collapsed_sections.clone();
+        let active_detail_drawer = self.active_detail_drawer;
         let expanded_operations = self.expanded_operations.clone();
         let repair_verification = self.repair_verification.clone();
         let c_view_mode = self.c_view_mode;
@@ -1951,6 +2180,9 @@ impl Render for RustWorkbenchPanel {
         let generated_c = self.generated_c.clone();
         let exact_mode = self.exact_mode;
         let visual_step = self.visual_step;
+        let topology_scene = self.topology_scene.clone();
+        let full_topology_scene = self.full_topology_scene.clone();
+        let selected_topology_element = self.selected_topology_element.clone();
         let preview_repair_id = self.preview_repair_id.clone();
         let show_repair_alternatives = self.show_repair_alternatives;
         let problem = self.selected_problem().cloned();
@@ -1965,6 +2197,7 @@ impl Render for RustWorkbenchPanel {
                 format!("`{target}`")
             }
         });
+        let selected_problem_range = problem.as_ref().map(|problem| problem.primary_range);
         let font_scale_percent = self.font_scale_percent;
         let display_preferences = self.display_preferences.clone();
         let show_display_controls = self.show_display_controls;
@@ -1976,29 +2209,36 @@ impl Render for RustWorkbenchPanel {
             v_flex()
                 .id("rust-ownership-workbench")
                 .track_focus(&self.focus_handle)
+                .key_context(PANEL_KEY)
+                .on_action(cx.listener(|panel, _: &PreviousIssue, _window, cx| {
+                    panel.select_relative_problem(-1, cx);
+                }))
+                .on_action(cx.listener(|panel, _: &NextIssue, _window, cx| {
+                    panel.select_relative_problem(1, cx);
+                }))
+                .on_action(cx.listener(|panel, _: &PreviousVisualStep, _window, cx| {
+                    panel.select_relative_visual_step(-1, cx);
+                }))
+                .on_action(cx.listener(|panel, _: &NextVisualStep, _window, cx| {
+                    panel.select_relative_visual_step(1, cx);
+                }))
+                .on_action(
+                    cx.listener(|panel, _: &FocusVisualStepSource, _window, cx| {
+                        panel.select_visual_step(panel.visual_step, cx);
+                    }),
+                )
                 .size_full()
                 .bg(cx.theme().colors().panel_background)
                 .border_t_2()
                 .border_color(cx.theme().status().error)
                 .child(
                     h_flex()
-                        .p_3()
-                        .gap_2()
+                        .p_2()
+                        .gap_1()
                         .justify_between()
                         .border_b_1()
                         .border_color(cx.theme().colors().border)
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(Label::new("Rust Ownership Guide").size(LabelSize::Large))
-                                .child(
-                                    Label::new(
-                                        "One problem → one value trace → one rule → verified fixes",
-                                    )
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                                ),
-                        )
+                        .child(Label::new("Rust guide").size(LabelSize::Small))
                         .child(
                             h_flex()
                                 .gap_1()
@@ -2006,10 +2246,16 @@ impl Render for RustWorkbenchPanel {
                                     Button::new(
                                         "rust-learning-display",
                                         format!(
-                                            "Hints: {}",
-                                            display_profile_label(display_preferences.profile)
+                                            "Clues: {}",
+                                            match display_preferences.mechanics_mode {
+                                                RustMechanicsHintMode::Off => "off",
+                                                RustMechanicsHintMode::SelectedPath => "path",
+                                                RustMechanicsHintMode::ConfiguredScope => "scope",
+                                            }
                                         ),
                                     )
+                                    .aria_expanded(show_display_controls)
+                                    .aria_label("Configure inline Rust ownership clues")
                                     .on_click(cx.listener(
                                         |panel, _, _window, cx| {
                                             panel.show_display_controls =
@@ -2018,25 +2264,37 @@ impl Render for RustWorkbenchPanel {
                                         },
                                     )),
                                 )
-                                .child(Button::new("decrease-coach-font", "A−").on_click(
-                                    cx.listener(|panel, _, _window, cx| {
-                                        panel.adjust_font_scale(-PANEL_FONT_SCALE_STEP_PERCENT, cx);
-                                    }),
-                                ))
-                                .child(Button::new("increase-coach-font", "A+").on_click(
-                                    cx.listener(|panel, _, _window, cx| {
-                                        panel.adjust_font_scale(PANEL_FONT_SCALE_STEP_PERCENT, cx);
-                                    }),
-                                ))
-                                .child(Button::new("refresh-ownership", "Refresh").on_click(
-                                    cx.listener(|panel, _, _window, cx| {
-                                        panel.last_model_key = None;
-                                        panel.pending_model_key = None;
-                                        panel.last_problem_key = None;
-                                        panel.pending_problem_key = None;
-                                        panel.schedule_problem_scan(cx);
-                                    }),
-                                )),
+                                .child(
+                                    Button::new("decrease-coach-font", "A−")
+                                        .on_click(cx.listener(|panel, _, _window, cx| {
+                                            panel.adjust_font_scale(
+                                                -PANEL_FONT_SCALE_STEP_PERCENT,
+                                                cx,
+                                            );
+                                        }))
+                                        .aria_label("Decrease Rust guide font size"),
+                                )
+                                .child(
+                                    Button::new("increase-coach-font", "A+")
+                                        .on_click(cx.listener(|panel, _, _window, cx| {
+                                            panel.adjust_font_scale(
+                                                PANEL_FONT_SCALE_STEP_PERCENT,
+                                                cx,
+                                            );
+                                        }))
+                                        .aria_label("Increase Rust guide font size"),
+                                )
+                                .child(
+                                    Button::new("refresh-ownership", "↻")
+                                        .aria_label("Refresh compiler ownership facts")
+                                        .on_click(cx.listener(|panel, _, _window, cx| {
+                                            panel.last_model_key = None;
+                                            panel.pending_model_key = None;
+                                            panel.last_problem_key = None;
+                                            panel.pending_problem_key = None;
+                                            panel.schedule_problem_scan(cx);
+                                        })),
+                                ),
                         ),
                 )
                 .when(show_display_controls, |this| {
@@ -2045,20 +2303,20 @@ impl Render for RustWorkbenchPanel {
                 .when(problem_count > 0, |this| {
                     this.child(
                         h_flex()
-                            .mx_3()
-                            .mt_2()
-                            .p_2()
-                            .gap_2()
+                            .mx_2()
+                            .mt_1()
+                            .p_1()
+                            .gap_1()
                             .justify_between()
                             .rounded_md()
                             .border_1()
                             .border_color(cx.theme().colors().border_variant)
                             .child(
-                                Button::new("previous-ownership-issue", "← Previous").on_click(
-                                    cx.listener(|panel, _, _window, cx| {
+                                Button::new("previous-ownership-issue", "‹")
+                                    .on_click(cx.listener(|panel, _, _window, cx| {
                                         panel.select_relative_problem(-1, cx);
-                                    }),
-                                ),
+                                    }))
+                                    .aria_label("Previous compiler issue; Up Arrow"),
                             )
                             .child(
                                 v_flex()
@@ -2078,20 +2336,31 @@ impl Render for RustWorkbenchPanel {
                                         )
                                     }),
                             )
-                            .child(Button::new("next-ownership-issue", "Next →").on_click(
-                                cx.listener(|panel, _, _window, cx| {
-                                    panel.select_relative_problem(1, cx);
-                                }),
-                            ))
+                            .child(
+                                Button::new("next-ownership-issue", "›")
+                                    .on_click(cx.listener(|panel, _, _window, cx| {
+                                        panel.select_relative_problem(1, cx);
+                                    }))
+                                    .aria_label("Next compiler issue; Down Arrow"),
+                            )
+                            .when_some(selected_problem_range, |this, range| {
+                                this.child(
+                                    Button::new("show-selected-ownership-issue", "Code")
+                                        .aria_label(
+                                            "Show the selected compiler issue in Rust source",
+                                        )
+                                        .on_click(cx.listener(move |panel, _, _window, cx| {
+                                            panel.cue_range(range, cx)
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new(
                                     "toggle-ownership-issue-list",
-                                    if show_issue_list {
-                                        "Hide issues"
-                                    } else {
-                                        "All issues"
-                                    },
+                                    if show_issue_list { "Hide" } else { "Issues" },
                                 )
+                                .aria_expanded(show_issue_list)
+                                .aria_label("Show or hide all compiler issues in this Rust file")
                                 .on_click(cx.listener(
                                     |panel, _, _window, cx| {
                                         panel.show_issue_list = !panel.show_issue_list;
@@ -2139,20 +2408,11 @@ impl Render for RustWorkbenchPanel {
                     )
                 })
                 .child(
-                    v_flex()
-                        .mx_3()
-                        .my_2()
-                        .gap_1()
-                        .child(
-                            Label::new(problem_status)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new(status_message)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
+                    v_flex().mx_2().my_1().child(
+                        Label::new(format!("{problem_status} · {status_message}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
                 )
                 .child(
                     v_flex()
@@ -2160,16 +2420,18 @@ impl Render for RustWorkbenchPanel {
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
-                        .px_3()
-                        .pb_4()
-                        .gap_3()
+                        .px_2()
+                        .pb_3()
+                        .gap_2()
                         .child(
                             v_flex()
-                                .gap_3()
+                                .gap_2()
                                 .child(render_beginner_flow(
                                     problem.as_ref(),
                                     &self.problems,
                                     &self.model,
+                                    topology_scene.as_ref(),
+                                    selected_topology_element.as_deref(),
                                     visual_step,
                                     repair_verification.as_ref(),
                                     preview_repair_id.as_deref(),
@@ -2177,49 +2439,19 @@ impl Render for RustWorkbenchPanel {
                                     exact_mode,
                                     cx,
                                 ))
-                                .child(render_learning_section(
-                                    LearningSection::Advanced,
-                                    collapsed_sections.contains(&LearningSection::Advanced),
-                                    |cx| {
-                                        v_flex()
-                                            .gap_3()
-                                            .child(render_codebase_context(&self.model, cx))
-                                            .child(render_operation_insights(
-                                                &self.model,
-                                                &expanded_operations,
-                                                cx,
-                                            ))
-                                            .child(render_timeline(&self.model, exact_mode, cx))
-                                            .child(render_lifetimes(&self.model, exact_mode, cx))
-                                            .child(render_memory(&self.model, exact_mode, cx))
-                                            .child(render_c_view(
-                                                &self.model,
-                                                exact_mode,
-                                                c_view_mode,
-                                                c_generation_state,
-                                                generated_c,
-                                                cx,
-                                            ))
-                                            .into_any_element()
-                                    },
+                                .child(render_detail_drawers(
+                                    active_detail_drawer,
+                                    problem.as_ref(),
+                                    &self.model,
+                                    full_topology_scene.as_ref(),
+                                    selected_topology_element.as_deref(),
+                                    &expanded_operations,
+                                    exact_mode,
+                                    c_view_mode,
+                                    c_generation_state,
+                                    generated_c,
                                     cx,
                                 ))
-                                .child(
-                                    Button::new(
-                                        "toggle-exact-details",
-                                        if exact_mode {
-                                            "Hide MIR coordinates"
-                                        } else {
-                                            "Show MIR coordinates"
-                                        },
-                                    )
-                                    .on_click(cx.listener(
-                                        |panel, _, _window, cx| {
-                                            panel.exact_mode = !panel.exact_mode;
-                                            cx.notify();
-                                        },
-                                    )),
-                                )
                                 .into_any_element(),
                         ),
                 ),
@@ -2321,6 +2553,23 @@ fn visual_moments(problem: Option<&OwnershipProblem>, model: &OwnershipModel) ->
     moments
 }
 
+fn ownership_visual_step_count(
+    problem: Option<&OwnershipProblem>,
+    model: &OwnershipModel,
+) -> usize {
+    if !model.memory_graph.snapshots.is_empty() {
+        model.memory_graph.snapshots.len()
+    } else if let Some(graph) = &model.conflict_graph
+        && !graph.snapshots.is_empty()
+    {
+        graph.snapshots.len()
+    } else if !model.value_trace.is_empty() {
+        model.value_trace.len()
+    } else {
+        visual_moments(problem, model).len()
+    }
+}
+
 fn visual_event_title(kind: &str) -> &'static str {
     match kind {
         "move" => "Move",
@@ -2340,6 +2589,8 @@ fn render_beginner_flow(
     problem: Option<&OwnershipProblem>,
     problems: &OwnershipProblems,
     model: &OwnershipModel,
+    topology_scene: Option<&OwnershipTopologyScene>,
+    selected_topology_element: Option<&str>,
     selected_step: usize,
     verification: Option<&RepairVerification>,
     preview_repair_id: Option<&str>,
@@ -2348,10 +2599,17 @@ fn render_beginner_flow(
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     v_flex()
-        .gap_3()
+        .gap_2()
         .child(render_visual_problem_header(problem, model, cx))
         .child(render_beginner_concept(problem, cx))
-        .child(render_guided_visual_step(problem, model, selected_step, cx))
+        .child(render_guided_visual_step(
+            problem,
+            model,
+            topology_scene,
+            selected_topology_element,
+            selected_step,
+            cx,
+        ))
         .child(render_guided_fix_step(
             problem,
             problems,
@@ -2368,26 +2626,21 @@ fn render_beginner_flow(
 fn render_guided_visual_step(
     problem: Option<&OwnershipProblem>,
     model: &OwnershipModel,
+    topology_scene: Option<&OwnershipTopologyScene>,
+    selected_topology_element: Option<&str>,
     selected_step: usize,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
-    v_flex()
-        .p_3()
-        .gap_3()
-        .rounded_md()
-        .border_1()
-        .border_color(cx.theme().colors().border_variant)
-        .child(Label::new("3 · See the access and memory").size(LabelSize::Large))
-        .child(
-            Label::new(
-                "The first picture follows the rejected operation. The second separates references, owners, stack handles, and heap storage.",
-            )
-            .size(LabelSize::Small)
-            .color(Color::Muted),
-        )
-        .child(render_value_journey(problem, model, selected_step, cx))
-        .child(render_visual_memory_map(model, selected_step, cx))
-        .into_any_element()
+    if topology_scene.is_some() {
+        return render_visual_memory_map(
+            topology_scene,
+            selected_topology_element,
+            model,
+            selected_step,
+            cx,
+        );
+    }
+    render_value_journey(problem, model, selected_step, cx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2402,12 +2655,7 @@ fn render_guided_fix_step(
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     v_flex()
-        .p_3()
         .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(cx.theme().colors().border_variant)
-        .child(Label::new("4 · Choose and verify a fix").size(LabelSize::Large))
         .child(render_guided_repairs(
             problem,
             model,
@@ -2463,8 +2711,8 @@ fn render_value_journey(
     let selected_index = selected_step.min(visible.len().saturating_sub(1));
     let selected = visible.get(selected_index).copied().cloned();
     v_flex()
-        .p_3()
-        .gap_2()
+        .p_2()
+        .gap_1()
         .rounded_md()
         .border_1()
         .border_color(cx.theme().colors().border_variant)
@@ -2996,26 +3244,20 @@ fn render_beginner_concept(
         .border_1()
         .border_color(cx.theme().status().info)
         .bg(cx.theme().status().info_background.opacity(0.08))
-        .child(
-            Label::new(format!("2 · Why Rust rejects this · {}", lesson.title))
-                .size(LabelSize::Large),
-        )
+        .child(Label::new(format!("2 · Rule · {}", lesson.title)).size(LabelSize::Small))
         .child(Label::new(lesson.one_line).size(LabelSize::Small))
-        .child(Label::new(lesson.rule).size(LabelSize::Small))
         .child(
-            Label::new(format!("Why: {}", lesson.why))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-        )
-        .child(
-            Label::new(format!("Picture: {}", lesson.memory_model))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-        )
-        .child(
-            Label::new(format!("Watch for: {}", lesson.misconception))
+            Label::new(format!("{} Why: {}", lesson.rule, lesson.why))
                 .size(LabelSize::XSmall)
-                .color(Color::Warning),
+                .color(Color::Muted),
+        )
+        .child(
+            Label::new(format!(
+                "Memory picture: {} Watch for: {}",
+                lesson.memory_model, lesson.misconception
+            ))
+            .size(LabelSize::XSmall)
+            .color(Color::Warning),
         )
         .into_any_element()
 }
@@ -3110,8 +3352,8 @@ fn render_visual_problem_header(
         problem.message.clone()
     };
     v_flex()
-        .p_3()
-        .gap_2()
+        .p_2()
+        .gap_1()
         .rounded_md()
         .border_1()
         .border_color(cx.theme().status().error)
@@ -3123,7 +3365,7 @@ fn render_visual_problem_header(
                 .child(
                     v_flex()
                         .gap_0p5()
-                        .child(Label::new("1 · Problem").size(LabelSize::Large))
+                        .child(Label::new("1 · Problem").size(LabelSize::Small))
                         .child(Label::new(facts.headline.clone()).size(LabelSize::Small))
                         .child(
                             Label::new(format!(
@@ -3146,8 +3388,8 @@ fn render_visual_problem_header(
                     })),
                 ),
         )
-        .child(Label::new(diagnostic).size(LabelSize::Small).color(Color::Error))
-        .child(Label::new(what).size(LabelSize::Small))
+        .child(Label::new(diagnostic).size(LabelSize::XSmall).color(Color::Error))
+        .child(Label::new(what).size(LabelSize::XSmall))
         .child(
             h_flex()
                 .gap_1()
@@ -3188,8 +3430,8 @@ fn render_visual_timeline(
         return empty_card("Waiting for compiler and source facts for this diagnostic.");
     }
     v_flex()
-        .p_3()
-        .gap_3()
+        .p_2()
+        .gap_2()
         .rounded_md()
         .border_1()
         .border_color(cx.theme().colors().border_variant)
@@ -3309,11 +3551,899 @@ fn visual_state_color(state: &str, cx: &App) -> gpui::Hsla {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TopologyColumn {
+    Local,
+    Wrapper,
+    Target,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TopologyRect {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TopologyNode {
+    id: String,
+    label: String,
+    type_name: String,
+    detail: String,
+    kind: String,
+    state: String,
+    provenance: String,
+    column: TopologyColumn,
+    range: Option<lsp::Range>,
+    rect: TopologyRect,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TopologyEdge {
+    id: String,
+    source: String,
+    target: String,
+    label: String,
+    provenance: String,
+    active: bool,
+    range: Option<lsp::Range>,
+    route: Vec<(u16, u16)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TopologyMoment {
+    title: String,
+    explanation: String,
+    range: lsp::Range,
+    path_marker: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OwnershipTopologyScene {
+    nodes: Vec<TopologyNode>,
+    edges: Vec<TopologyEdge>,
+    moments: Vec<TopologyMoment>,
+    selected_step: usize,
+    access_lines: Vec<String>,
+    canvas_height: u16,
+    expanded: bool,
+    truncated: bool,
+}
+
+fn topology_column(kind: &str, storage: &str) -> TopologyColumn {
+    if matches!(
+        kind,
+        "wrapper_state"
+            | "control_block"
+            | "borrow_flag"
+            | "lock_state"
+            | "gate"
+            | "guard"
+            | "field"
+            | "metadata"
+    ) {
+        TopologyColumn::Wrapper
+    } else if matches!(storage, "heap" | "static" | "borrowed")
+        || matches!(kind, "allocation" | "buffer" | "borrowed_view" | "pointee")
+    {
+        TopologyColumn::Target
+    } else if matches!(storage, "inline") {
+        TopologyColumn::Wrapper
+    } else {
+        TopologyColumn::Local
+    }
+}
+
+fn topology_state_at_step(
+    model: &OwnershipModel,
+    selected_step: usize,
+) -> BTreeMap<String, String> {
+    let mut states = model
+        .memory_graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), "available".to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    for snapshot in model.memory_graph.snapshots.iter().take(selected_step + 1) {
+        for delta in &snapshot.deltas {
+            states.insert(delta.node_id.clone(), delta.to.clone());
+        }
+    }
+    states
+}
+
+fn topology_edge_active_at_step(
+    edge: &rust_analyzer_ext::OwnershipMemoryEdge,
+    model: &OwnershipModel,
+    selected_step: usize,
+) -> bool {
+    let snapshots = model.memory_graph.snapshots.iter().take(selected_step + 1);
+    let created = edge.event_id.as_deref().is_none_or(|event_id| {
+        snapshots
+            .clone()
+            .any(|snapshot| snapshot.event_id == event_id)
+    });
+    let removed = snapshots.clone().any(|snapshot| {
+        snapshot.deltas.iter().any(|delta| {
+            delta.relation_removed.as_deref() == Some(edge.relation.as_str())
+                && (delta.node_id == edge.source || delta.node_id == edge.target)
+        })
+    });
+    created && !removed
+}
+
+fn topology_detail(node: &rust_analyzer_ext::OwnershipMemoryNode) -> String {
+    let layout = match (node.size, node.align) {
+        (Some(size), Some(align)) => format!("{size} B · align {align}"),
+        (Some(size), None) => format!("{size} B"),
+        _ => "runtime/unsized layout unknown".to_owned(),
+    };
+    format!("{} · {layout}", node.storage.replace('_', " "))
+}
+
+fn topology_moment_explanation(kind: &str, place: &str) -> String {
+    match kind {
+        "move" | "partial_move" => {
+            format!("Ownership leaves `{place}` here; its destination becomes the usable owner.")
+        }
+        "clone" => format!(
+            "A new shared handle is created from `{place}`; the allocation is shared, not duplicated."
+        ),
+        "borrow_shared" => format!("A read-only loan from `{place}` starts here."),
+        "borrow_mutable" | "borrow_activate" => {
+            format!("An exclusive mutable loan from `{place}` becomes active here.")
+        }
+        "borrow_end" => format!("The loan from `{place}` is no longer needed after this point."),
+        "invalid_use" | "conflict" => {
+            format!("Rust rejects this operation because `{place}` lacks the required access.")
+        }
+        "reinitialize" => format!("A new value makes `{place}` usable again."),
+        "drop" => format!("The value owned through `{place}` is destroyed here."),
+        _ => format!("The ownership state of `{place}` changes here."),
+    }
+}
+
+const TOPOLOGY_CANVAS_WIDTH: u16 = 420;
+const TOPOLOGY_NODE_WIDTH: u16 = 124;
+const TOPOLOGY_NODE_HEIGHT: u16 = 68;
+const TOPOLOGY_COLUMN_X: [u16; 3] = [2, 148, 294];
+const TOPOLOGY_ROW_START: u16 = 4;
+const TOPOLOGY_ROW_STRIDE: u16 = 76;
+
+fn layout_topology_scene(nodes: &mut [TopologyNode], edges: &mut [TopologyEdge]) -> u16 {
+    let mut rows = [0_u16; 3];
+    for node in nodes.iter_mut() {
+        let column = match node.column {
+            TopologyColumn::Local => 0,
+            TopologyColumn::Wrapper => 1,
+            TopologyColumn::Target => 2,
+        };
+        node.rect = TopologyRect {
+            x: TOPOLOGY_COLUMN_X[column],
+            y: TOPOLOGY_ROW_START + rows[column] * TOPOLOGY_ROW_STRIDE,
+            width: TOPOLOGY_NODE_WIDTH,
+            height: TOPOLOGY_NODE_HEIGHT,
+        };
+        rows[column] += 1;
+    }
+
+    let rects = nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node.rect))
+        .collect::<BTreeMap<_, _>>();
+    for edge in edges {
+        let (Some(source), Some(target)) = (
+            rects.get(edge.source.as_str()),
+            rects.get(edge.target.as_str()),
+        ) else {
+            continue;
+        };
+        let source_center_y = source.y + source.height / 2;
+        let target_center_y = target.y + target.height / 2;
+        if source.x <= target.x {
+            let start = (source.x + source.width, source_center_y);
+            let end = (target.x, target_center_y);
+            let middle_x = start.0 + end.0.saturating_sub(start.0) / 2;
+            edge.route = vec![start, (middle_x, start.1), (middle_x, end.1), end];
+        } else {
+            let start = (source.x, source_center_y);
+            let end = (target.x + target.width, target_center_y);
+            let middle_x = end.0 + start.0.saturating_sub(end.0) / 2;
+            edge.route = vec![start, (middle_x, start.1), (middle_x, end.1), end];
+        }
+    }
+
+    TOPOLOGY_ROW_START + rows.into_iter().max().unwrap_or(1).max(1) * TOPOLOGY_ROW_STRIDE
+}
+
+fn derive_ownership_topology_scene(
+    problem: Option<&OwnershipProblem>,
+    model: &OwnershipModel,
+    selected_step: usize,
+) -> Option<OwnershipTopologyScene> {
+    derive_ownership_topology_scene_with_limits(problem, model, selected_step, 8, 10, false)
+}
+
+fn derive_ownership_topology_scene_with_limits(
+    problem: Option<&OwnershipProblem>,
+    model: &OwnershipModel,
+    selected_step: usize,
+    node_limit: usize,
+    edge_limit: usize,
+    expanded: bool,
+) -> Option<OwnershipTopologyScene> {
+    if model.memory_graph.nodes.is_empty()
+        && model
+            .conflict_graph
+            .as_ref()
+            .is_none_or(|graph| graph.nodes.is_empty())
+        && model.mutation_requirement.is_none()
+    {
+        return None;
+    }
+
+    let selected_step = selected_step.min(
+        model
+            .memory_graph
+            .snapshots
+            .len()
+            .max(
+                model
+                    .conflict_graph
+                    .as_ref()
+                    .map_or(0, |graph| graph.snapshots.len()),
+            )
+            .saturating_sub(1),
+    );
+    let states = topology_state_at_step(model, selected_step);
+    let mut nodes = model
+        .memory_graph
+        .nodes
+        .iter()
+        .map(|node| TopologyNode {
+            id: node.id.clone(),
+            label: node.label.clone(),
+            type_name: node.type_name.clone(),
+            detail: topology_detail(node),
+            kind: node.kind.clone(),
+            state: states
+                .get(&node.id)
+                .cloned()
+                .unwrap_or_else(|| node.state.clone()),
+            provenance: node.provenance.clone(),
+            column: topology_column(&node.kind, &node.storage),
+            range: node.range,
+            rect: TopologyRect::default(),
+        })
+        .collect::<Vec<_>>();
+    let mut edges = model
+        .memory_graph
+        .edges
+        .iter()
+        .map(|edge| TopologyEdge {
+            id: edge.id.clone(),
+            source: edge.source.clone(),
+            target: edge.target.clone(),
+            label: edge.relation.replace('_', " "),
+            provenance: edge.provenance.clone(),
+            active: topology_edge_active_at_step(edge, model, selected_step),
+            range: edge.range,
+            route: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(graph) = &model.conflict_graph {
+        let snapshot = graph
+            .snapshots
+            .get(selected_step)
+            .or_else(|| graph.snapshots.last());
+        for node in &graph.nodes {
+            let id = format!("conflict:{}", node.id);
+            if nodes.iter().any(|existing| existing.label == node.label) {
+                continue;
+            }
+            let state = snapshot
+                .and_then(|snapshot| {
+                    snapshot
+                        .states
+                        .iter()
+                        .find(|state| state.node_id == node.id)
+                })
+                .map(|state| state.state.clone())
+                .unwrap_or_else(|| "alive".to_owned());
+            nodes.push(TopologyNode {
+                id,
+                label: node.label.clone(),
+                type_name: node
+                    .type_name
+                    .clone()
+                    .unwrap_or_else(|| "type unknown".to_owned()),
+                detail: node.memory.clone(),
+                kind: node.role.clone(),
+                state,
+                provenance: graph.provenance.clone(),
+                column: if node.role.contains("reference") {
+                    TopologyColumn::Local
+                } else if node.role.contains("owner") {
+                    TopologyColumn::Wrapper
+                } else {
+                    TopologyColumn::Target
+                },
+                range: node.range,
+                rect: TopologyRect::default(),
+            });
+        }
+        for edge in &graph.edges {
+            let source_label = graph
+                .nodes
+                .iter()
+                .find(|node| node.id == edge.from)
+                .map(|node| node.label.as_str());
+            let target_label = graph
+                .nodes
+                .iter()
+                .find(|node| node.id == edge.to)
+                .map(|node| node.label.as_str());
+            let source = source_label.and_then(|label| {
+                nodes
+                    .iter()
+                    .find(|node| node.label == label)
+                    .map(|node| node.id.clone())
+            });
+            let target = target_label.and_then(|label| {
+                nodes
+                    .iter()
+                    .find(|node| node.label == label)
+                    .map(|node| node.id.clone())
+            });
+            if let (Some(source), Some(target)) = (source, target) {
+                edges.push(TopologyEdge {
+                    id: format!("conflict:{}:{}:{}", edge.from, edge.to, edge.label),
+                    source,
+                    target,
+                    label: edge.label.clone(),
+                    provenance: edge.provenance.clone(),
+                    active: true,
+                    range: None,
+                    route: Vec::new(),
+                });
+            }
+        }
+    }
+
+    if let Some(requirement) = &model.mutation_requirement {
+        let target_id = nodes
+            .iter()
+            .find(|node| {
+                node.label == requirement.target_place || node.id == requirement.target_place
+            })
+            .map(|node| node.id.clone())
+            .unwrap_or_else(|| {
+                let id = format!("target:{}", requirement.target_place);
+                nodes.push(TopologyNode {
+                    id: id.clone(),
+                    label: requirement.target_place.clone(),
+                    type_name: selected_mutation_operation(model)
+                        .and_then(|operation| operation.receiver_type.clone())
+                        .unwrap_or_else(|| "resolved field type".to_owned()),
+                    detail: "the field rustc rejected writing through".to_owned(),
+                    kind: "field".to_owned(),
+                    state: "alive · write blocked".to_owned(),
+                    provenance: requirement.provenance.clone(),
+                    column: TopologyColumn::Target,
+                    range: problem.map(|problem| problem.primary_range),
+                    rect: TopologyRect::default(),
+                });
+                id
+            });
+        let access_id = format!("access:{}", requirement.access_source);
+        if !nodes.iter().any(|node| node.id == access_id) {
+            nodes.push(TopologyNode {
+                id: access_id.clone(),
+                label: requirement.access_source.clone(),
+                type_name: readable_available_access(&requirement.available_access).to_owned(),
+                detail: "access available at the function boundary".to_owned(),
+                kind: "reference_handle".to_owned(),
+                state: "read-only access".to_owned(),
+                provenance: requirement.provenance.clone(),
+                column: TopologyColumn::Local,
+                range: problem.map(|problem| problem.binding_range),
+                rect: TopologyRect::default(),
+            });
+        }
+        edges.push(TopologyEdge {
+            id: format!("mutation-access:{}", requirement.target_place),
+            source: access_id,
+            target: target_id,
+            label: format!(
+                "has {}; operation needs {}",
+                readable_available_access(&requirement.available_access),
+                readable_access(&requirement.required_access)
+            ),
+            provenance: requirement.provenance.clone(),
+            active: true,
+            range: problem.map(|problem| problem.primary_range),
+            route: Vec::new(),
+        });
+    }
+
+    nodes.sort_by(|left, right| {
+        (left.column, &left.label, &left.kind, &left.id).cmp(&(
+            right.column,
+            &right.label,
+            &right.kind,
+            &right.id,
+        ))
+    });
+    nodes.dedup_by(|left, right| left.id == right.id);
+    let truncated =
+        model.memory_graph.truncated || nodes.len() > node_limit || edges.len() > edge_limit;
+    nodes.truncate(node_limit);
+    let retained_ids = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    edges.retain(|edge| {
+        retained_ids.contains(edge.source.as_str()) && retained_ids.contains(edge.target.as_str())
+    });
+    edges.sort_by(|left, right| {
+        (&left.source, &left.target, &left.label).cmp(&(&right.source, &right.target, &right.label))
+    });
+    edges.dedup_by(|left, right| {
+        left.source == right.source && left.target == right.target && left.label == right.label
+    });
+    edges.truncate(edge_limit);
+    let canvas_height = layout_topology_scene(&mut nodes, &mut edges);
+
+    let moments = if !model.memory_graph.snapshots.is_empty() {
+        model
+            .memory_graph
+            .snapshots
+            .iter()
+            .take(12)
+            .map(|snapshot| TopologyMoment {
+                title: snapshot.kind.replace('_', " "),
+                explanation: topology_moment_explanation(&snapshot.kind, &snapshot.place),
+                range: snapshot.range,
+                path_marker: snapshot.path_marker.clone(),
+            })
+            .collect()
+    } else {
+        model
+            .conflict_graph
+            .as_ref()
+            .map(|graph| {
+                graph
+                    .snapshots
+                    .iter()
+                    .take(12)
+                    .map(|snapshot| TopologyMoment {
+                        title: snapshot.title.clone(),
+                        explanation: snapshot.explanation.clone(),
+                        range: snapshot.range,
+                        path_marker: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let access_lines = model
+        .memory_graph
+        .access_paths
+        .iter()
+        .take(3)
+        .map(|path| {
+            let chain = path
+                .steps
+                .iter()
+                .map(|step| {
+                    format!(
+                        "{} → {} ({})",
+                        step.starting_type,
+                        step.result_type,
+                        step.kind.replace('_', " ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" → ");
+            if chain.is_empty() {
+                format!("`{}`: direct access", path.place)
+            } else {
+                format!("`{}`: {chain}", path.place)
+            }
+        })
+        .collect();
+
+    Some(OwnershipTopologyScene {
+        nodes,
+        edges,
+        moments,
+        selected_step,
+        access_lines,
+        canvas_height,
+        expanded,
+        truncated,
+    })
+}
+
+fn topology_node_color(state: &str) -> Color {
+    if state.contains("blocked") || state.contains("reject") || state.contains("invalid") {
+        Color::Error
+    } else if state.contains("borrow") || state.contains("read-only") {
+        Color::Info
+    } else if state.contains("move") || state.contains("drop") {
+        Color::Warning
+    } else {
+        Color::Success
+    }
+}
+
+fn topology_column_title(column: TopologyColumn) -> &'static str {
+    match column {
+        TopologyColumn::Local => "LOCAL / HANDLE",
+        TopologyColumn::Wrapper => "INLINE / GATE",
+        TopologyColumn::Target => "POINTEE / HEAP",
+    }
+}
+
+fn render_topology_node(
+    node: TopologyNode,
+    selected_element: Option<&str>,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    let color = topology_node_color(&node.state);
+    let rect = node.rect;
+    let selected = selected_element == Some(node.id.as_str());
+    let node_id = node.id.clone();
+    let range = node.range;
+    let accessible_name = format!(
+        "{}; type {}; state {}; {}; {}",
+        node.label, node.type_name, node.state, node.detail, node.provenance
+    );
+    let inspection_summary = format!(
+        "Inspecting `{}`: {}. This does not change the selected compiler issue.",
+        node.label, node.state
+    );
+    v_flex()
+        .absolute()
+        .left(px(f32::from(rect.x)))
+        .top(px(f32::from(rect.y)))
+        .w(px(f32::from(rect.width)))
+        .h(px(f32::from(rect.height)))
+        .overflow_hidden()
+        .p_1()
+        .gap_0p5()
+        .rounded_md()
+        .border_1()
+        .border_color(match color {
+            Color::Error => cx.theme().status().error,
+            Color::Warning => cx.theme().status().warning,
+            Color::Info => cx.theme().status().info,
+            _ => cx.theme().status().success,
+        })
+        .child(
+            Button::new(
+                SharedString::from(format!("topology-node-{}", node.id)),
+                format!("{} `{}`", visual_state_symbol(&node.state), node.label),
+            )
+            .toggle_state(selected)
+            .aria_label(accessible_name.clone())
+            .aria_description("Select this memory node and reveal its related source range")
+            .tooltip(ui::Tooltip::text(accessible_name))
+            .on_click(cx.listener(move |panel, _, _window, cx| {
+                panel.inspect_topology_element(
+                    node_id.clone(),
+                    inspection_summary.clone(),
+                    range,
+                    cx,
+                )
+            })),
+        )
+        .child(
+            Label::new(node.type_name)
+                .size(LabelSize::XSmall)
+                .buffer_font(cx),
+        )
+        .child(
+            Label::new(node.detail)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(
+            Label::new(format!(
+                "{} · {}",
+                node.state,
+                node.provenance.replace('_', " ")
+            ))
+            .size(LabelSize::XSmall)
+            .color(color),
+        )
+        .into_any_element()
+}
+
+fn render_topology_edge_canvas(edges: Vec<TopologyEdge>) -> AnyElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, cx| {
+            for edge in edges {
+                if edge.route.len() < 2 {
+                    continue;
+                }
+                let mut builder = if !edge.active
+                    || edge.label.contains("weak")
+                    || edge.label.contains("conditional")
+                {
+                    PathBuilder::stroke(px(1.)).dash_array(&[px(4.), px(3.)])
+                } else {
+                    PathBuilder::stroke(px(1.5))
+                };
+                for (index, (x, y)) in edge.route.iter().copied().enumerate() {
+                    let point = point(
+                        bounds.origin.x + px(f32::from(x)),
+                        bounds.origin.y + px(f32::from(y)),
+                    );
+                    if index == 0 {
+                        builder.move_to(point);
+                    } else {
+                        builder.line_to(point);
+                    }
+                }
+                let (end_x, end_y) = edge.route[edge.route.len() - 1];
+                let (before_x, before_y) = edge.route[edge.route.len() - 2];
+                let end = point(
+                    bounds.origin.x + px(f32::from(end_x)),
+                    bounds.origin.y + px(f32::from(end_y)),
+                );
+                let arrow = 5.0;
+                if before_x < end_x {
+                    builder.move_to(point(end.x - px(arrow), end.y - px(arrow)));
+                    builder.line_to(end);
+                    builder.line_to(point(end.x - px(arrow), end.y + px(arrow)));
+                } else if before_x > end_x {
+                    builder.move_to(point(end.x + px(arrow), end.y - px(arrow)));
+                    builder.line_to(end);
+                    builder.line_to(point(end.x + px(arrow), end.y + px(arrow)));
+                } else if before_y <= end_y {
+                    builder.move_to(point(end.x - px(arrow), end.y - px(arrow)));
+                    builder.line_to(end);
+                    builder.line_to(point(end.x + px(arrow), end.y - px(arrow)));
+                } else {
+                    builder.move_to(point(end.x - px(arrow), end.y + px(arrow)));
+                    builder.line_to(end);
+                    builder.line_to(point(end.x + px(arrow), end.y + px(arrow)));
+                }
+                if let Ok(path) = builder.build() {
+                    let color =
+                        if edge.label.contains("mutable") || edge.label.contains("exclusive") {
+                            cx.theme().status().warning
+                        } else if edge.label.contains("borrow") {
+                            cx.theme().status().info
+                        } else if edge.label.contains("owns") || edge.label.contains("shares") {
+                            cx.theme().status().success
+                        } else {
+                            cx.theme().colors().text_muted
+                        };
+                    window.paint_path(
+                        path,
+                        if edge.active {
+                            color
+                        } else {
+                            color.opacity(0.35)
+                        },
+                    );
+                }
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+    .into_any_element()
+}
+
+fn render_topology_scene(
+    scene: OwnershipTopologyScene,
+    selected_element: Option<&str>,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    let selected_moment = scene.moments.get(scene.selected_step).cloned();
+    let canvas_edges = scene.edges.clone();
+    v_flex()
+        .p_2()
+        .gap_1()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().colors().border_variant)
+        .child(
+            h_flex()
+                .justify_between()
+                .child(
+                    Label::new(if scene.expanded {
+                        "All ownership values in this function"
+                    } else {
+                        "3 · Flow and memory"
+                    })
+                    .size(LabelSize::Small),
+                )
+                .child(
+                    Label::new("● usable  ◇ borrowed  → moved  ! blocked")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        )
+        .child(
+            h_flex()
+                .w(px(f32::from(TOPOLOGY_CANVAS_WIDTH)))
+                .justify_between()
+                .children(
+                    [TopologyColumn::Local, TopologyColumn::Wrapper, TopologyColumn::Target]
+                        .into_iter()
+                        .map(|column| {
+                            Label::new(topology_column_title(column))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                        }),
+                ),
+        )
+        .child(
+            gpui::div()
+                .relative()
+                .w(px(f32::from(TOPOLOGY_CANVAS_WIDTH)))
+                .max_w_full()
+                .h(px(f32::from(scene.canvas_height)))
+                .child(render_topology_edge_canvas(canvas_edges))
+                .children(
+                    scene
+                        .nodes
+                        .iter()
+                        .cloned()
+                        .map(|node| render_topology_node(node, selected_element, cx)),
+                ),
+        )
+        .when(!scene.edges.is_empty(), |this| {
+            this.child(Label::new("Connections").size(LabelSize::Small)).child(
+                h_flex().gap_1().flex_wrap().children(scene.edges.iter().map(|edge| {
+                    let source = scene
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == edge.source)
+                        .map(|node| node.label.as_str())
+                        .unwrap_or("?");
+                    let target = scene
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == edge.target)
+                        .map(|node| node.label.as_str())
+                        .unwrap_or("?");
+                    let edge_id = edge.id.clone();
+                    let range = edge.range;
+                    let summary = format!(
+                        "`{source}` {} `{target}`. Provenance: {}.",
+                        edge.label,
+                        edge.provenance.replace('_', " ")
+                    );
+                    Button::new(
+                        SharedString::from(format!("topology-edge-{}", edge.id)),
+                        format!(
+                            "{} `{source}` ─{}→ `{target}`",
+                            if edge.active { "●" } else { "○" },
+                            edge.label,
+                        ),
+                    )
+                    .toggle_state(selected_element == Some(edge.id.as_str()))
+                    .aria_label(summary.clone())
+                    .aria_description("Select this ownership relation and reveal its source")
+                    .tooltip(ui::Tooltip::text(summary.clone()))
+                    .on_click(cx.listener(move |panel, _, _window, cx| {
+                        panel.inspect_topology_element(
+                            edge_id.clone(),
+                            summary.clone(),
+                            range,
+                            cx,
+                        )
+                    }))
+                })),
+            )
+        })
+        .when(!scene.moments.is_empty(), |this| {
+            let last = scene.moments.len().saturating_sub(1);
+            this.child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("topology-previous-step", "←")
+                            .aria_label("Previous ownership event; Left Arrow")
+                            .disabled(scene.selected_step == 0)
+                            .on_click(cx.listener(move |panel, _, _window, cx| {
+                                panel.select_visual_step(scene.selected_step.saturating_sub(1), cx)
+                            })),
+                    )
+                    .children(scene.moments.iter().enumerate().map(|(index, moment)| {
+                        let tooltip = moment.title.clone();
+                        Button::new(
+                            SharedString::from(format!("topology-step-{index}")),
+                            if index == scene.selected_step {
+                                format!("● {}", index + 1)
+                            } else {
+                                format!("○ {}", index + 1)
+                            },
+                        )
+                        .aria_label(format!(
+                            "Ownership event {} of {}: {}",
+                            index + 1,
+                            scene.moments.len(),
+                            moment.title
+                        ))
+                        .tooltip(ui::Tooltip::text(tooltip))
+                        .on_click(cx.listener(move |panel, _, _window, cx| {
+                            panel.select_visual_step(index, cx)
+                        }))
+                    }))
+                    .child(
+                        Button::new("topology-next-step", "→")
+                            .aria_label("Next ownership event; Right Arrow")
+                            .disabled(scene.selected_step >= last)
+                            .on_click(cx.listener(move |panel, _, _window, cx| {
+                                panel.select_visual_step((scene.selected_step + 1).min(last), cx)
+                            })),
+                    ),
+            )
+        })
+        .when_some(selected_moment, |this, moment| {
+            this.child(
+                v_flex()
+                    .p_2()
+                    .gap_0p5()
+                    .rounded_md()
+                    .bg(cx.theme().status().info_background.opacity(0.1))
+                    .child(
+                        Label::new(format!(
+                            "Step {} · {} · line {}{}",
+                            scene.selected_step + 1,
+                            moment.title,
+                            moment.range.start.line + 1,
+                            moment
+                                .path_marker
+                                .as_deref()
+                                .map(|path| format!(" · path {path}"))
+                                .unwrap_or_default()
+                        ))
+                        .size(LabelSize::Small),
+                    )
+                    .child(Label::new(moment.explanation).size(LabelSize::Small)),
+            )
+        })
+        .when(!scene.access_lines.is_empty(), |this| {
+            this.child(Label::new("How Rust reaches the value").size(LabelSize::Small))
+                .children(scene.access_lines.into_iter().map(|line| {
+                    Label::new(line).size(LabelSize::XSmall).color(Color::Muted)
+                }))
+        })
+        .when(scene.truncated, |this| {
+            this.child(
+                Label::new(if scene.expanded {
+                    "This full-function view is bounded to 64 nodes and 96 connections; omitted topology is marked explicitly."
+                } else {
+                    "This compact view is bounded to 8 nodes and 10 connections; omitted topology is marked explicitly."
+                })
+                    .size(LabelSize::XSmall)
+                    .color(Color::Warning),
+            )
+        })
+        .into_any_element()
+}
+
 fn render_visual_memory_map(
+    topology_scene: Option<&OwnershipTopologyScene>,
+    selected_topology_element: Option<&str>,
     model: &OwnershipModel,
     selected_step: usize,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
+    if let Some(scene) = topology_scene {
+        return render_topology_scene(scene.clone(), selected_topology_element, cx);
+    }
     if let Some(graph) = &model.conflict_graph {
         let snapshot = graph
             .snapshots
@@ -4041,51 +5171,160 @@ fn render_concept_lesson(
         .into_any_element()
 }
 
-fn render_learning_section(
-    section: LearningSection,
-    collapsed: bool,
-    render_content: impl FnOnce(&mut Context<RustWorkbenchPanel>) -> AnyElement,
+#[allow(clippy::too_many_arguments)]
+fn render_detail_drawers(
+    active: Option<DetailDrawer>,
+    problem: Option<&OwnershipProblem>,
+    model: &OwnershipModel,
+    full_topology_scene: Option<&OwnershipTopologyScene>,
+    selected_topology_element: Option<&str>,
+    expanded_operations: &BTreeSet<String>,
+    exact_mode: bool,
+    c_view_mode: CViewMode,
+    c_generation_state: CGenerationState,
+    generated_c: Option<GeneratedCArtifact>,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
-    let content = (!collapsed).then(|| render_content(cx));
+    let content = active.map(|drawer| match drawer {
+        DetailDrawer::Why => render_why_details(problem, cx),
+        DetailDrawer::Variables => v_flex()
+            .gap_2()
+            .when_some(full_topology_scene, |this, scene| {
+                this.child(render_topology_scene(
+                    scene.clone(),
+                    selected_topology_element,
+                    cx,
+                ))
+            })
+            .child(render_codebase_context(model, cx))
+            .into_any_element(),
+        DetailDrawer::Lifetimes => v_flex()
+            .gap_2()
+            .child(render_timeline(model, exact_mode, cx))
+            .child(render_lifetimes(model, exact_mode, cx))
+            .into_any_element(),
+        DetailDrawer::Calls => render_operation_insights(model, expanded_operations, cx),
+        DetailDrawer::Layout => render_memory(model, exact_mode, cx),
+        DetailDrawer::C => render_c_view(
+            model,
+            exact_mode,
+            c_view_mode,
+            c_generation_state,
+            generated_c,
+            cx,
+        ),
+        DetailDrawer::Evidence => v_flex()
+            .gap_2()
+            .child(render_timeline(model, true, cx))
+            .child(
+                Button::new(
+                    "toggle-exact-details",
+                    if exact_mode {
+                        "Hide MIR coordinates"
+                    } else {
+                        "Show MIR coordinates"
+                    },
+                )
+                .on_click(cx.listener(|panel, _, _window, cx| {
+                    panel.exact_mode = !panel.exact_mode;
+                    cx.notify();
+                })),
+            )
+            .into_any_element(),
+    });
     v_flex()
         .rounded_md()
         .border_1()
         .border_color(cx.theme().colors().border_variant)
         .child(
             h_flex()
-                .p_3()
-                .gap_2()
-                .justify_between()
+                .p_1()
+                .gap_1()
+                .flex_wrap()
                 .child(
-                    v_flex()
-                        .gap_0p5()
-                        .child(Label::new(section.title()).size(LabelSize::Large))
-                        .child(
-                            Label::new(section.subtitle())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
+                    Label::new("Explore")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
                 )
-                .child(
-                    Button::new(
-                        SharedString::from(format!("toggle-learning-section-{section:?}")),
-                        if collapsed { "Expand" } else { "Collapse" },
-                    )
-                    .on_click(cx.listener(move |panel, _, _window, cx| {
-                        panel.toggle_learning_section(section, cx);
-                    })),
+                .children(
+                    [
+                        DetailDrawer::Why,
+                        DetailDrawer::Variables,
+                        DetailDrawer::Lifetimes,
+                        DetailDrawer::Calls,
+                        DetailDrawer::Layout,
+                        DetailDrawer::C,
+                        DetailDrawer::Evidence,
+                    ]
+                    .into_iter()
+                    .map(|drawer| {
+                        Button::new(
+                            SharedString::from(format!("detail-drawer-{drawer:?}")),
+                            if active == Some(drawer) {
+                                format!("{} ▲", drawer.label())
+                            } else {
+                                drawer.label().to_owned()
+                            },
+                        )
+                        .aria_expanded(active == Some(drawer))
+                        .aria_label(format!("Show or hide {} details", drawer.label()))
+                        .on_click(cx.listener(
+                            move |panel, _, _window, cx| {
+                                panel.toggle_detail_drawer(drawer, cx);
+                            },
+                        ))
+                    }),
                 ),
         )
         .when_some(content, |this, content| {
             this.child(
                 v_flex()
-                    .p_3()
+                    .p_2()
                     .border_t_1()
                     .border_color(cx.theme().colors().border_variant)
                     .child(content),
             )
         })
+        .into_any_element()
+}
+
+fn render_why_details(
+    problem: Option<&OwnershipProblem>,
+    _cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    let Some(problem) = problem else {
+        return empty_card("Select a compiler issue to inspect its rule in more detail.");
+    };
+    let Some(lesson) = learning_catalog::lesson_ids_for_problem(
+        &problem.category,
+        problem.diagnostic_code.as_deref(),
+    )
+    .first()
+    .and_then(|id| learning_catalog::lesson(id)) else {
+        return empty_card("No extended explanation is bundled for this diagnostic yet.");
+    };
+    v_flex()
+        .gap_1()
+        .child(Label::new(lesson.title).size(LabelSize::Small))
+        .child(Label::new(lesson.rule).size(LabelSize::Small))
+        .child(Label::new(format!("Why the rule exists: {}", lesson.why)).size(LabelSize::Small))
+        .child(
+            Label::new(format!("Memory model: {}", lesson.memory_model))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .child(
+            Label::new(format!("Common misconception: {}", lesson.misconception))
+                .size(LabelSize::Small)
+                .color(Color::Warning),
+        )
+        .child(
+            Label::new(
+                "This teaching text explains the rule. Variable states and source locations remain compiler/analyzer facts.",
+            )
+            .size(LabelSize::XSmall)
+            .color(Color::Muted),
+        )
         .into_any_element()
 }
 
@@ -4250,6 +5489,7 @@ fn render_operation_insights(
                                         "Show all known related operations"
                                     },
                                 )
+                                .aria_expanded(expanded)
                                 .on_click(cx.listener(move |panel, _, _window, cx| {
                                     panel.toggle_operation_details(operation_id.clone(), cx);
                                 })),
@@ -4305,6 +5545,7 @@ fn render_display_controls(
     let profile = preferences.profile;
     let inline_mode = preferences.inline_diagnostics;
     let scope = preferences.scope;
+    let mechanics_mode = preferences.mechanics_mode;
     let filters = [
         ("types", "Types", preferences.show_type_hints),
         ("parameters", "Parameters", preferences.show_parameter_hints),
@@ -4331,6 +5572,10 @@ fn render_display_controls(
             "Ownership colors",
             preferences.show_ownership_coloring,
         ),
+        ("layout", "Size + align", preferences.show_layout),
+        ("storage", "Stack / heap", preferences.show_storage),
+        ("access", "Deref + access", preferences.show_access),
+        ("wrappers", "Wrapper gates", preferences.show_wrappers),
     ];
     v_flex()
         .px_3()
@@ -4394,6 +5639,27 @@ fn render_display_controls(
                     panel.display_preferences_changed(cx);
                 }))
             })),
+        )
+        .child(Label::new("Editor mechanics clues").size(LabelSize::XSmall).color(Color::Muted))
+        .child(
+            h_flex()
+                .gap_1()
+                .flex_wrap()
+                .children([
+                    (RustMechanicsHintMode::Off, "Off"),
+                    (RustMechanicsHintMode::SelectedPath, "Selected path"),
+                    (RustMechanicsHintMode::ConfiguredScope, "Configured scope"),
+                ].into_iter().map(|(candidate, label)| {
+                    Button::new(
+                        SharedString::from(format!("mechanics-mode-{candidate:?}")),
+                        selected_button_label(candidate == mechanics_mode, label),
+                    )
+                    .on_click(cx.listener(move |panel, _, _window, cx| {
+                        panel.display_preferences.mechanics_mode = candidate;
+                        panel.display_preferences.profile = RustOwnershipDisplayProfile::Custom;
+                        panel.display_preferences_changed(cx);
+                    }))
+                })),
         )
         .child(Label::new("Hint categories").size(LabelSize::XSmall).color(Color::Muted))
         .child(h_flex().gap_1().flex_wrap().children(filters.into_iter().map(
@@ -5263,7 +6529,7 @@ fn render_guided_repairs(
         .rounded_md()
         .border_1()
         .border_color(cx.theme().colors().border_variant)
-        .child(Label::new("Fix it safely").size(LabelSize::Large))
+        .child(Label::new("4 · Fix and result").size(LabelSize::Small))
         .child(
             Label::new(if has_preferred {
                 "Start with ordinary compile-time mutability. Shared-ownership wrappers are design alternatives, not automatic upgrades."
@@ -5795,6 +7061,16 @@ fn render_memory(
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         )
+        .when(!model.target_triple.is_empty(), |this| {
+            this.child(
+                Label::new(format!(
+                    "Layout target: {} · provenance: compiler target layout",
+                    model.target_triple
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+        })
         .children(model.bindings.clone().into_iter().take(24).map(|binding| {
             render_binding_memory(binding, exact_mode, cx)
         }))
@@ -6009,26 +7285,7 @@ fn render_repair_counterfactual(
     repair: &rust_analyzer_ext::OwnershipRepair,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
-    let topology = match repair.strategy.as_str() {
-        "rc" => {
-            "stack owner A ─► Rc allocation ◄─ stack owner B\nshared value · non-atomic strong count"
-        }
-        "arc" => {
-            "thread owner A ─► Arc allocation ◄─ thread owner B\nshared value · atomic strong count"
-        }
-        "refcell" => {
-            "stack owner ─► RefCell { borrow flag | value }\nshared outer access · runtime checked mutation"
-        }
-        "rc_refcell" => {
-            "owner A ─► Rc { count | RefCell { flag | value } } ◄─ owner B\nshared ownership · runtime checked mutation"
-        }
-        "arc_mutex" => {
-            "thread A ─► Arc { atomic count | Mutex { lock | value } } ◄─ thread B\nshared ownership · blocking exclusive mutation"
-        }
-        _ => {
-            "The source diff changes ownership or access as described below; no wrapper topology is assumed."
-        }
-    };
+    let preview_graph = repair.preview_graph.clone();
     v_flex()
         .p_2()
         .gap_1()
@@ -6037,7 +7294,81 @@ fn render_repair_counterfactual(
         .border_color(cx.theme().status().info)
         .bg(cx.theme().status().info_background.opacity(0.1))
         .child(Label::new("Counterfactual result — source is not changed yet").size(LabelSize::Small))
-        .child(Label::new(topology).size(LabelSize::XSmall).buffer_font(cx))
+        .when_some(preview_graph, |this, graph| {
+            this.child(
+                h_flex()
+                    .gap_1()
+                    .items_start()
+                    .children(
+                        [TopologyColumn::Local, TopologyColumn::Wrapper, TopologyColumn::Target]
+                            .into_iter()
+                            .map(|column| {
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(topology_column_title(column))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .children(
+                                        graph
+                                            .nodes
+                                            .iter()
+                                            .filter(move |node| {
+                                                topology_column(&node.kind, &node.storage) == column
+                                            })
+                                            .map(|node| {
+                                                v_flex()
+                                                    .p_1()
+                                                    .rounded_sm()
+                                                    .border_1()
+                                                    .border_color(cx.theme().colors().border_variant)
+                                                    .child(
+                                                        Label::new(format!("`{}`", node.label))
+                                                            .size(LabelSize::XSmall),
+                                                    )
+                                                    .child(
+                                                        Label::new(node.type_name.clone())
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted),
+                                                    )
+                                            }),
+                                    )
+                            }),
+                    ),
+            )
+            .children(graph.edges.iter().map(|edge| {
+                let source = graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == edge.source)
+                    .map(|node| node.label.as_str())
+                    .unwrap_or("?");
+                let target = graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == edge.target)
+                    .map(|node| node.label.as_str())
+                    .unwrap_or("?");
+                Label::new(format!(
+                    "`{source}` ─{}→ `{target}` · {}",
+                    edge.relation.replace('_', " "),
+                    edge.provenance.replace('_', " ")
+                ))
+                .size(LabelSize::XSmall)
+            }))
+        })
+        .when(repair.preview_graph.is_none(), |this| {
+            this.child(
+                Label::new(
+                    "This repair changes access or ownership, but no honest counterfactual topology is available for it.",
+                )
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+        })
         .child(Label::new(format!("Ownership: {}", repair.effects.ownership)).size(LabelSize::XSmall))
         .child(Label::new(format!("Mutation: {}", repair.effects.mutation)).size(LabelSize::XSmall))
         .child(Label::new(format!("Runtime risk: {}", repair.effects.runtime_risk)).size(LabelSize::XSmall))
@@ -6636,6 +7967,236 @@ mod tests {
             resolved_problem_target(&coarse_problem, &fallback_model),
             "self"
         );
+
+        let scene = derive_ownership_topology_scene(Some(&coarse_problem), &model, 0).unwrap();
+        assert!(scene.nodes.iter().any(|node| node.label == "self.events"));
+        assert!(scene.nodes.iter().any(|node| node.label == "&self"));
+        assert!(scene.edges.iter().any(|edge| {
+            edge.label.contains("shared access") && edge.label.contains("exclusive mutable borrow")
+        }));
+    }
+
+    #[test]
+    fn compiler_graph_scene_is_deterministic_and_keeps_shared_allocation() {
+        let model: OwnershipModel = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 12,
+            "precision": "compiler_exact",
+            "status": "ready",
+            "sourceHash": "abc",
+            "events": [],
+            "repairs": [],
+            "memoryGraph": {
+                "nodes": [
+                    {
+                        "id": "handle-values", "bodyId": 1, "place": "values",
+                        "kind": "handle", "storage": "stack", "label": "values",
+                        "typeName": "Rc<Vec<i32>>", "size": 8, "align": 8,
+                        "range": null, "state": "available", "provenance": "compiler_exact",
+                        "physicalPlacementNote": "source-level placement", "truncated": false
+                    },
+                    {
+                        "id": "handle-shared", "bodyId": 1, "place": "shared",
+                        "kind": "handle", "storage": "stack", "label": "shared",
+                        "typeName": "Rc<Vec<i32>>", "size": 8, "align": 8,
+                        "range": null, "state": "available", "provenance": "derived",
+                        "physicalPlacementNote": "source-level placement", "truncated": false
+                    },
+                    {
+                        "id": "control", "bodyId": 1, "place": "values::control",
+                        "kind": "control_block", "storage": "heap", "label": "Rc control block",
+                        "typeName": "Rc control block", "size": null, "align": null,
+                        "range": null, "state": "available", "provenance": "conceptual",
+                        "physicalPlacementNote": "runtime address and counts unknown", "truncated": false
+                    }
+                ],
+                "edges": [
+                    {"id":"a", "source":"handle-values", "target":"control", "relation":"shares_allocation", "eventId":null, "loanId":null, "range":null, "provenance":"conceptual", "pathMarker":null},
+                    {"id":"b", "source":"handle-shared", "target":"control", "relation":"shares_allocation", "eventId":"clone", "loanId":null, "range":null, "provenance":"derived", "pathMarker":null}
+                ],
+                "snapshots": [
+                    {"id":"s", "eventId":"clone", "bodyId":1, "basicBlock":0, "statementIndex":1, "kind":"clone", "range":{"start":{"line":2,"character":17},"end":{"line":2,"character":35}}, "place":"values", "loanId":null, "pathMarker":null, "deltas":[], "provenance":"derived"},
+                    {"id":"s2", "eventId":"drop-shared", "bodyId":1, "basicBlock":0, "statementIndex":2, "kind":"drop", "range":{"start":{"line":3,"character":4},"end":{"line":3,"character":16}}, "place":"shared", "loanId":null, "pathMarker":null, "deltas":[{"nodeId":"handle-shared","from":"available","to":"dropped","relationAdded":null,"relationRemoved":"shares_allocation"}], "provenance":"compiler_exact"}
+                ],
+                "accessPaths": [],
+                "truncated": false
+            }
+        }))
+        .unwrap();
+
+        let first = derive_ownership_topology_scene(None, &model, 0).unwrap();
+        let second = derive_ownership_topology_scene(None, &model, 0).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first
+                .nodes
+                .iter()
+                .filter(|node| node.id == "control")
+                .count(),
+            1
+        );
+        assert_eq!(
+            first
+                .edges
+                .iter()
+                .filter(|edge| edge.target == "control" && edge.label == "shares allocation")
+                .count(),
+            2
+        );
+        assert!(first.nodes.len() <= 8);
+        assert!(first.edges.len() <= 10);
+
+        let after_drop = derive_ownership_topology_scene(None, &model, 1).unwrap();
+        assert_eq!(
+            first
+                .nodes
+                .iter()
+                .map(|node| (&node.id, node.rect))
+                .collect::<Vec<_>>(),
+            after_drop
+                .nodes
+                .iter()
+                .map(|node| (&node.id, node.rect))
+                .collect::<Vec<_>>(),
+            "scrubber state changes must not move graph nodes"
+        );
+        assert!(
+            after_drop
+                .edges
+                .iter()
+                .find(|edge| edge.id == "a")
+                .is_some_and(|edge| edge.active)
+        );
+        assert!(
+            after_drop
+                .edges
+                .iter()
+                .find(|edge| edge.id == "b")
+                .is_some_and(|edge| !edge.active)
+        );
+    }
+
+    #[test]
+    fn compact_scene_and_issue_navigation_meet_ui_latency_budget() {
+        let model: OwnershipModel = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 12,
+            "precision": "compiler_exact",
+            "status": "ready",
+            "sourceHash": "benchmark",
+            "events": [],
+            "repairs": [],
+            "memoryGraph": {
+                "nodes": (0..128).map(|index| serde_json::json!({
+                    "id": format!("node-{index}"), "bodyId": 1, "place": format!("value.{index}"),
+                    "kind": if index % 4 == 0 { "control_block" } else { "binding" },
+                    "storage": if index % 3 == 0 { "heap" } else { "stack" },
+                    "label": format!("value_{index}"), "typeName": "Vec<i32>",
+                    "size": 24, "align": 8, "range": null, "state": "available",
+                    "provenance": "compiler_exact",
+                    "physicalPlacementNote": "source-level placement", "truncated": false
+                })).collect::<Vec<_>>(),
+                "edges": (1..128).map(|index| serde_json::json!({
+                    "id": format!("edge-{index}"), "source": format!("node-{}", index - 1),
+                    "target": format!("node-{index}"), "relation": "contains",
+                    "eventId": null, "loanId": null, "range": null,
+                    "provenance": "compiler_exact", "pathMarker": null
+                })).collect::<Vec<_>>(),
+                "snapshots": [], "accessPaths": [], "truncated": true
+            }
+        }))
+        .unwrap();
+        let mut scene_ns = Vec::with_capacity(1_000);
+        let mut full_scene_ns = Vec::with_capacity(1_000);
+        let mut scrubber_ns = Vec::with_capacity(10_000);
+        let mut repair_swap_ns = Vec::with_capacity(10_000);
+        for _ in 0..1_000 {
+            let started = std::time::Instant::now();
+            let scene = derive_ownership_topology_scene(None, &model, 0).unwrap();
+            std::hint::black_box(scene);
+            scene_ns.push(started.elapsed().as_nanos());
+
+            let started = std::time::Instant::now();
+            let scene =
+                derive_ownership_topology_scene_with_limits(None, &model, 0, 64, 96, true).unwrap();
+            assert!(scene.nodes.len() <= 64);
+            assert!(scene.edges.len() <= 96);
+            std::hint::black_box(scene);
+            full_scene_ns.push(started.elapsed().as_nanos());
+        }
+        scene_ns.sort_unstable();
+        let scene_p95_ns = scene_ns[scene_ns.len() * 95 / 100];
+        full_scene_ns.sort_unstable();
+        let full_scene_p95_ns = full_scene_ns[full_scene_ns.len() * 95 / 100];
+
+        for index in 0..10_000 {
+            let started = std::time::Instant::now();
+            let states = topology_state_at_step(&model, index % 4);
+            std::hint::black_box(states);
+            scrubber_ns.push(started.elapsed().as_nanos());
+        }
+        scrubber_ns.sort_unstable();
+        let scrubber_p95_ns = scrubber_ns[scrubber_ns.len() * 95 / 100];
+
+        let repair_ids = [
+            Some("repair-rc".to_owned()),
+            Some("repair-arc".to_owned()),
+            None,
+        ];
+        let mut selected_repair = None;
+        for index in 0..10_000 {
+            let started = std::time::Instant::now();
+            selected_repair.clone_from(&repair_ids[index % repair_ids.len()]);
+            std::hint::black_box(selected_repair.as_deref());
+            repair_swap_ns.push(started.elapsed().as_nanos());
+        }
+        repair_swap_ns.sort_unstable();
+        let repair_swap_p95_ns = repair_swap_ns[repair_swap_ns.len() * 95 / 100];
+
+        let problems = (0..50)
+            .map(|index| {
+                test_problem(
+                    &format!("problem-{index}"),
+                    "value",
+                    index as u32,
+                    index as u32,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut issue_ns = Vec::with_capacity(10_000);
+        for index in 0..10_000 {
+            let started = std::time::Instant::now();
+            std::hint::black_box(relative_problem_index(
+                Some(index % problems.len()),
+                problems.len(),
+                1,
+            ));
+            issue_ns.push(started.elapsed().as_nanos());
+        }
+        issue_ns.sort_unstable();
+        let issue_p95_ns = issue_ns[issue_ns.len() * 95 / 100];
+
+        println!(
+            "RUST_WORKBENCH_UI_BENCHMARK={{\"schemaVersion\":3,\"sceneDerivationP95Ns\":{scene_p95_ns},\"fullMapDerivationP95Ns\":{full_scene_p95_ns},\"scrubberStateP95Ns\":{scrubber_p95_ns},\"cachedIssueSwitchP95Ns\":{issue_p95_ns},\"repairPreviewSwapP95Ns\":{repair_swap_p95_ns}}}"
+        );
+        assert!(
+            scene_p95_ns < 2_000_000,
+            "compact scene derivation p95 was {scene_p95_ns} ns"
+        );
+        assert!(
+            issue_p95_ns < 16_000_000,
+            "cached issue switching p95 was {issue_p95_ns} ns"
+        );
+        assert!(
+            full_scene_p95_ns < 8_000_000,
+            "full map derivation p95 was {full_scene_p95_ns} ns"
+        );
+        assert!(
+            scrubber_p95_ns < 4_000_000,
+            "scrubber state p95 was {scrubber_p95_ns} ns"
+        );
+        assert!(
+            repair_swap_p95_ns < 4_000_000,
+            "repair preview state swap p95 was {repair_swap_p95_ns} ns"
+        );
     }
 
     #[test]
@@ -6649,6 +8210,7 @@ mod tests {
             compiler_validated: false,
             validation_state: "candidate".to_owned(),
             effects: rust_analyzer_ext::OwnershipRepairEffects::default(),
+            preview_graph: None,
         };
         assert!(!repair_is_compiler_validated(&candidate));
 
@@ -6797,8 +8359,26 @@ mod tests {
         assert_eq!(restored.profile, RustOwnershipDisplayProfile::Learn);
         assert!(restored.show_lifetimes);
         assert!(restored.show_ownership_coloring);
+        assert_eq!(restored.mechanics_mode, RustMechanicsHintMode::SelectedPath);
+        assert!(restored.show_layout && restored.show_storage);
         assert!(!restored.enabled);
         assert!(restored.focus_rows.is_empty());
+
+        let mut legacy = serde_json::to_value(RustOwnershipDisplayPreferences::focus()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        for field in [
+            "mechanics_mode",
+            "show_layout",
+            "show_storage",
+            "show_access",
+            "show_wrappers",
+        ] {
+            object.remove(field);
+        }
+        let restored_legacy: RustOwnershipDisplayPreferences =
+            serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored_legacy.mechanics_mode, RustMechanicsHintMode::Off);
+        assert!(!restored_legacy.show_layout);
     }
 
     #[cfg(any())]
@@ -7140,6 +8720,54 @@ mod tests {
         assert_eq!(moments[1].phase, "operation_rejected");
         assert_eq!(moments[2].phase, "repair");
         assert_eq!(moments[1].range, problem.primary_range);
+    }
+
+    #[test]
+    fn scrubber_count_uses_the_same_fact_source_as_the_visual_flow() {
+        let problem = test_problem("type-error", "value", 4, 7);
+        assert_eq!(
+            ownership_visual_step_count(Some(&problem), &OwnershipModel::default()),
+            3
+        );
+
+        let mut model = OwnershipModel::default();
+        let trace_step = rust_analyzer_ext::OwnershipValueTraceStep {
+            id: "trace".to_owned(),
+            kind: "move".to_owned(),
+            range: lsp::Range::default(),
+            from_label: "value".to_owned(),
+            to_label: Some("destination".to_owned()),
+            source_state: "moved".to_owned(),
+            destination_state: Some("initialized".to_owned()),
+            allocation_effect: "allocation unchanged".to_owned(),
+            explanation: "ownership moved".to_owned(),
+            provenance: "compiler_exact".to_owned(),
+            control_flow: None,
+        };
+        model.value_trace = vec![trace_step.clone(), trace_step];
+        assert_eq!(ownership_visual_step_count(Some(&problem), &model), 2);
+
+        let snapshot = rust_analyzer_ext::OwnershipMemorySnapshot {
+            id: "snapshot".to_owned(),
+            event_id: "event".to_owned(),
+            body_id: 1,
+            basic_block: 0,
+            statement_index: 0,
+            kind: "move".to_owned(),
+            range: lsp::Range::default(),
+            place: "value".to_owned(),
+            loan_id: None,
+            path_marker: None,
+            deltas: Vec::new(),
+            provenance: "compiler_exact".to_owned(),
+        };
+        model.memory_graph.snapshots = vec![
+            snapshot.clone(),
+            snapshot.clone(),
+            snapshot.clone(),
+            snapshot,
+        ];
+        assert_eq!(ownership_visual_step_count(Some(&problem), &model), 4);
     }
 
     #[test]
