@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-18",
+  "commit": "c5295eda49310c240b4a5a7d18b273148d576eb0",
+  "branch": "feature/visual-ownership-sidebar",
+  "machine": {
+    "hostname": "d3v-4090",
+    "kernel": "Linux 7.0.0-29-generic x86_64",
+    "cpu": "AMD Ryzen 7 7800X3D 8-Core Processor",
+    "logical_cpus": 16,
+    "glibc": "2.43"
+  },
+  "runs": [
+    {
+      "source": "./workbench test full",
+      "compiler_transport": {
+        "baseline_median_ms": 391.562,
+        "baseline_p95_ms": 397.200,
+        "model_median_ms": 712.379,
+        "model_p95_ms": 721.094,
+        "median_delta_ms": 320.817,
+        "median_ratio": 1.819,
+        "artifact_count": 9,
+        "largest_artifact_bytes": 1290521
+      },
+      "learning_fixture": {
+        "request_median_ms": 1.415,
+        "request_p95_ms": 2.011,
+        "request_max_ms": 3.959,
+        "analyzer_peak_rss_kib": 606616,
+        "ownership_stalls": 0
+      },
+      "self_events_fixture": {
+        "request_median_ms": 6.906,
+        "request_p95_ms": 8.020,
+        "request_max_ms": 10.504,
+        "analyzer_peak_rss_kib": 615104,
+        "selected_place": "self.events",
+        "mutation_target": "self.events",
+        "access_source": "&self",
+        "ownership_stalls": 0
+      },
+      "wrapper_repair_fixture": {
+        "request_median_ms": 0.930,
+        "request_p95_ms": 0.936,
+        "validation_ms": 514.761,
+        "selected_place": "measurements",
+        "validated_wrappers": ["Rc", "Arc"]
+      }
+    },
+    {
+      "source": "./workbench test performance",
+      "sequence": 1,
+      "compiler_transport": {
+        "baseline_median_ms": 441.640,
+        "baseline_p95_ms": 453.331,
+        "model_median_ms": 661.155,
+        "model_p95_ms": 684.764,
+        "median_delta_ms": 219.515,
+        "median_ratio": 1.497,
+        "largest_artifact_bytes": 1290521
+      },
+      "learning_fixture": {
+        "cold_start_ms": 4436.084,
+        "request_median_ms": 1.307,
+        "request_p95_ms": 3.533,
+        "request_max_ms": 5.300,
+        "analyzer_peak_rss_kib": 611708,
+        "ownership_stalls": 0
+      }
+    },
+    {
+      "source": "./workbench test performance",
+      "sequence": 2,
+      "compiler_transport": {
+        "baseline_median_ms": 362.060,
+        "baseline_p95_ms": 371.214,
+        "model_median_ms": 657.819,
+        "model_p95_ms": 664.741,
+        "median_delta_ms": 295.759,
+        "median_ratio": 1.817,
+        "largest_artifact_bytes": 1290521
+      },
+      "learning_fixture": {
+        "cold_start_ms": 4684.760,
+        "request_median_ms": 1.397,
+        "request_p95_ms": 2.579,
+        "request_max_ms": 4.032,
+        "analyzer_peak_rss_kib": 605784,
+        "ownership_stalls": 0
+      }
+    },
+    {
+      "source": "./workbench test performance",
+      "sequence": 3,
+      "compiler_transport": {
+        "baseline_median_ms": 403.402,
+        "baseline_p95_ms": 455.470,
+        "model_median_ms": 763.658,
+        "model_p95_ms": 798.900,
+        "median_delta_ms": 360.257,
+        "median_ratio": 1.893,
+        "largest_artifact_bytes": 1290521
+      },
+      "learning_fixture": {
+        "cold_start_ms": 4286.716,
+        "request_median_ms": 1.422,
+        "request_p95_ms": 4.683,
+        "request_max_ms": 8.692,
+        "analyzer_peak_rss_kib": 608620,
+        "ownership_stalls": 0
+      }
+    }
+  ],
+  "disk_usage_bytes_human": {
+    "rust": "35.2 GiB",
+    "rust_build": "26.2 GiB",
+    "rust_analyzer_debug_target": "6.8 GiB",
+    "rust_analyzer_release_target": "2.0 GiB",
+    "zed_rust": "49.5 GiB",
+    "zed_debug_target": "17.3 GiB",
+    "zed_release_target": "31.6 GiB",
+    "rust_workbench_data": "220 MiB",
+    "analysis_target": "110.4 MiB",
+    "dist": "2.1 GiB",
+    "filesystem_available": "533 GiB"
+  },
+  "notes": [
+    "The analyzer benchmark process reported zero ownership-specific event-loop stalls.",
+    "No editor or analyzer process was live during the baseline disk command, so live editor RSS is not claimed here.",
+    "No pre-existing sidebar issue-switch harness was available; that latency must be introduced and measured with the new UI harness."
+  ]
+}
