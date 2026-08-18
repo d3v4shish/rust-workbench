@@ -1,6 +1,7 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "commitBaseline": "c5295eda49310c240b4a5a7d18b273148d576eb0",
+  "implementationCommit": "d5853abfbe190b0866a949ac570c35c0e8f1ae5b",
   "measuredAt": "2026-08-19",
   "command": "cargo test --manifest-path zed-rust/Cargo.toml -p rust_workbench --lib compact_scene_and_issue_navigation_meet_ui_latency_budget -- --nocapture",
   "iterations": {
@@ -15,7 +16,7 @@
     "scrubberState": 39615,
     "cachedIssueSwitch": 30,
     "repairPreviewSwap": 31,
-    "visibleRangeInlineFilter": 3376
+    "visibleRangeInlineFilter": 75333
   },
   "thresholdNanoseconds": {
     "sceneDerivation": 2000000,
