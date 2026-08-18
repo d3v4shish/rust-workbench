@@ -70,8 +70,7 @@ impl<'tcx> Visitor<'tcx> for TransferCollector<'_, 'tcx> {
 
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
         match &terminator.kind {
-            TerminatorKind::Call { func, args, .. }
-            | TerminatorKind::TailCall { func, args, .. } => {
+            TerminatorKind::Call { func, args, .. } => {
                 self.visit_operand(func, location);
                 for (index, arg) in args.iter().enumerate() {
                     let previous = self.destination.take();
@@ -92,6 +91,22 @@ impl<'tcx> Visitor<'tcx> for TransferCollector<'_, 'tcx> {
                         transfer.destination = Some(call_destination.clone());
                     }
                     self.destination = Some(call_destination);
+                    self.visit_operand(&arg.node, location);
+                    self.destination = previous;
+                    self.destination_local = previous_local;
+                }
+            }
+            TerminatorKind::TailCall { func, args, .. } => {
+                self.visit_operand(func, location);
+                for (index, arg) in args.iter().enumerate() {
+                    let previous = self.destination.take();
+                    let previous_local = self.destination_local.take();
+                    self.destination = Some(BorrowckOwnershipDestination {
+                        kind: BorrowckOwnershipDestinationKind::FunctionArgument,
+                        label: format!("argument {} of this tail call", index + 1),
+                        place: None,
+                        span: Some(terminator.source_info.span),
+                    });
                     self.visit_operand(&arg.node, location);
                     self.destination = previous;
                     self.destination_local = previous_local;
@@ -389,8 +404,10 @@ pub(crate) fn record_ownership_events<'tcx>(
             let InitLocation::Statement(location) = init.location else { continue };
             let local = move_data.base_local(init.path);
             if transfers.transfers.iter().any(|transfer| {
-                transfer.kind != BorrowckOwnershipEventKind::Copy
-                    && transfer.source.local == local
+                matches!(
+                    transfer.kind,
+                    BorrowckOwnershipEventKind::Move | BorrowckOwnershipEventKind::PartialMove
+                ) && transfer.source.local == local
                     && transfer.location.is_predecessor_of(location, body)
             }) {
                 push(
@@ -492,6 +509,65 @@ fn push_memory_layers<'tcx>(
     if depth >= 12 {
         return;
     }
+    match ty.kind() {
+        ty::Ref(_, pointee, mutability) => {
+            let (size, align) = type_layout(tcx, body, ty);
+            layers.push(BorrowckMemoryLayer {
+                kind: BorrowckMemoryKind::ReferenceHandle,
+                storage: BorrowckMemoryStorage::Inline,
+                label: match mutability {
+                    ty::Mutability::Mut => "mutable reference handle",
+                    ty::Mutability::Not => "shared reference handle",
+                }
+                .to_string(),
+                type_name: ty.to_string(),
+                size,
+                align,
+            });
+            if matches!(pointee.kind(), ty::Str | ty::Slice(_) | ty::Dynamic(..)) {
+                layers.push(BorrowckMemoryLayer {
+                    kind: BorrowckMemoryKind::FatPointerMetadata,
+                    storage: BorrowckMemoryStorage::Inline,
+                    label: "fat-pointer metadata (runtime length or vtable)".to_string(),
+                    type_name: pointee.to_string(),
+                    size: None,
+                    align: None,
+                });
+            }
+            return;
+        }
+        ty::RawPtr(pointee, mutability) => {
+            let (size, align) = type_layout(tcx, body, ty);
+            layers.push(BorrowckMemoryLayer {
+                kind: BorrowckMemoryKind::RawPointer,
+                storage: BorrowckMemoryStorage::Inline,
+                label: match mutability {
+                    ty::Mutability::Mut => {
+                        "mutable raw pointer (non-owning; unsafe to dereference)"
+                    }
+                    ty::Mutability::Not => "const raw pointer (non-owning; unsafe to dereference)",
+                }
+                .to_string(),
+                type_name: pointee.to_string(),
+                size,
+                align,
+            });
+            return;
+        }
+        ty::Array(..) | ty::Tuple(_) => {
+            let (size, align) = type_layout(tcx, body, ty);
+            layers.push(BorrowckMemoryLayer {
+                kind: BorrowckMemoryKind::AggregateValue,
+                storage: BorrowckMemoryStorage::Inline,
+                label: "inline aggregate value".to_string(),
+                type_name: ty.to_string(),
+                size,
+                align,
+            });
+            return;
+        }
+        _ => {}
+    }
     let ty::Adt(def, args) = ty.kind() else {
         let (size, align) = type_layout(tcx, body, ty);
         layers.push(BorrowckMemoryLayer {
@@ -552,6 +628,48 @@ fn push_memory_layers<'tcx>(
             );
             push_memory_layers(tcx, body, inner, layers, depth + 1);
         }
+    } else if path.ends_with("::rc::Weak") || path.ends_with("::sync::Weak") {
+        if let Some(inner) = inner {
+            push(
+                BorrowckMemoryKind::WeakAllocation,
+                BorrowckMemoryStorage::Heap,
+                "weak handle to a shared control block (value may already be gone)",
+                inner,
+                false,
+            );
+        }
+    } else if path.ends_with("::pin::Pin") {
+        if let Some(inner) = inner {
+            push(
+                BorrowckMemoryKind::PinConstraint,
+                BorrowckMemoryStorage::Conceptual,
+                "pinning constraint (not a storage location)",
+                inner,
+                false,
+            );
+            push_memory_layers(tcx, body, inner, layers, depth + 1);
+        }
+    } else if path.ends_with("::ptr::non_null::NonNull") {
+        if let Some(inner) = inner {
+            push(
+                BorrowckMemoryKind::RawPointer,
+                BorrowckMemoryStorage::Inline,
+                "non-null raw pointer (non-owning; unsafe access contract)",
+                inner,
+                false,
+            );
+        }
+    } else if path.ends_with("::cell::Cell") {
+        if let Some(inner) = inner {
+            push(
+                BorrowckMemoryKind::CellState,
+                BorrowckMemoryStorage::Inline,
+                "interior-mutable inline value (copy in/out)",
+                ty,
+                true,
+            );
+            push_memory_layers(tcx, body, inner, layers, depth + 1);
+        }
     } else if path.ends_with("::cell::RefCell") {
         if let Some(inner) = inner {
             push(
@@ -563,7 +681,32 @@ fn push_memory_layers<'tcx>(
             );
             push_memory_layers(tcx, body, inner, layers, depth + 1);
         }
-    } else if path.ends_with("::sync::poison::mutex::Mutex") {
+    } else if path.ends_with("::cell::UnsafeCell") {
+        if let Some(inner) = inner {
+            push(
+                BorrowckMemoryKind::UnsafeCellState,
+                BorrowckMemoryStorage::Inline,
+                "unsafe interior-mutation boundary",
+                ty,
+                true,
+            );
+            push_memory_layers(tcx, body, inner, layers, depth + 1);
+        }
+    } else if path.ends_with("::cell::OnceCell")
+        || path.ends_with("::cell::once::OnceCell")
+        || path.ends_with("::sync::once_lock::OnceLock")
+    {
+        if let Some(inner) = inner {
+            push(
+                BorrowckMemoryKind::OnceState,
+                BorrowckMemoryStorage::Inline,
+                "one-time initialization state and conditional value",
+                ty,
+                true,
+            );
+            push_memory_layers(tcx, body, inner, layers, depth + 1);
+        }
+    } else if path.ends_with("::sync::poison::mutex::Mutex") || path.ends_with("::sync::Mutex") {
         if let Some(inner) = inner {
             push(
                 BorrowckMemoryKind::MutexState,
@@ -574,7 +717,7 @@ fn push_memory_layers<'tcx>(
             );
             push_memory_layers(tcx, body, inner, layers, depth + 1);
         }
-    } else if path.ends_with("::sync::poison::rwlock::RwLock") {
+    } else if path.ends_with("::sync::poison::rwlock::RwLock") || path.ends_with("::sync::RwLock") {
         if let Some(inner) = inner {
             push(
                 BorrowckMemoryKind::RwLockState,
@@ -585,6 +728,22 @@ fn push_memory_layers<'tcx>(
             );
             push_memory_layers(tcx, body, inner, layers, depth + 1);
         }
+    } else if path.ends_with("::sync::poison::mutex::MutexGuard")
+        || path.ends_with("::sync::MutexGuard")
+        || path.ends_with("::sync::poison::rwlock::RwLockReadGuard")
+        || path.ends_with("::sync::RwLockReadGuard")
+        || path.ends_with("::sync::poison::rwlock::RwLockWriteGuard")
+        || path.ends_with("::sync::RwLockWriteGuard")
+        || path.ends_with("::cell::Ref")
+        || path.ends_with("::cell::RefMut")
+    {
+        push(
+            BorrowckMemoryKind::GuardState,
+            BorrowckMemoryStorage::Inline,
+            "temporary guard; access ends when this value is dropped",
+            ty,
+            true,
+        );
     } else if path.ends_with("::vec::Vec") {
         push(
             BorrowckMemoryKind::VecHeader,
@@ -617,12 +776,50 @@ fn push_memory_layers<'tcx>(
             ty,
             false,
         );
+    } else if path.ends_with("::collections::vec_deque::VecDeque")
+        || path.ends_with("::collections::binary_heap::BinaryHeap")
+        || path.ends_with("::path::PathBuf")
+        || path.ends_with("::ffi::os_str::OsString")
+        || path.ends_with("::collections::hash::map::HashMap")
+        || path.ends_with("::collections::hash::set::HashSet")
+        || path.ends_with("::collections::btree::map::BTreeMap")
+        || path.ends_with("::collections::btree::set::BTreeSet")
+        || path.ends_with("::collections::linked_list::LinkedList")
+    {
+        push(
+            BorrowckMemoryKind::ContainerHeader,
+            BorrowckMemoryStorage::Inline,
+            "fixed-size container handle; private fields are not a stable API",
+            ty,
+            true,
+        );
+        push(
+            BorrowckMemoryKind::ContainerBuffer,
+            BorrowckMemoryStorage::Heap,
+            "conceptual allocation; runtime length/capacity/node count is unknown",
+            ty,
+            false,
+        );
+    } else if path.ends_with("::option::Option")
+        || path.ends_with("::result::Result")
+        || path.ends_with("::borrow::Cow")
+    {
+        push(
+            BorrowckMemoryKind::ConditionalValue,
+            BorrowckMemoryStorage::Inline,
+            "conditional variant; active runtime branch is unknown",
+            ty,
+            true,
+        );
+        if let Some(inner) = inner {
+            push_memory_layers(tcx, body, inner, layers, depth + 1);
+        }
     } else {
         let (size, align) = type_layout(tcx, body, ty);
         layers.push(BorrowckMemoryLayer {
-            kind: BorrowckMemoryKind::InlineValue,
+            kind: BorrowckMemoryKind::AggregateValue,
             storage: BorrowckMemoryStorage::Inline,
-            label: "inline value (allocation semantics unknown)".to_string(),
+            label: "inline aggregate (field ownership is opaque unless proven)".to_string(),
             type_name: ty.to_string(),
             size,
             align,
@@ -636,7 +833,9 @@ fn ownership_state(kind: BorrowckOwnershipEventKind) -> BorrowckOwnershipState {
             BorrowckOwnershipState::MutablyBorrowed
         }
         BorrowckOwnershipEventKind::BorrowShared => BorrowckOwnershipState::SharedBorrowed,
-        BorrowckOwnershipEventKind::Copy => BorrowckOwnershipState::Available,
+        BorrowckOwnershipEventKind::Clone | BorrowckOwnershipEventKind::Copy => {
+            BorrowckOwnershipState::Available
+        }
         BorrowckOwnershipEventKind::Drop => BorrowckOwnershipState::Dropped,
         BorrowckOwnershipEventKind::Move => BorrowckOwnershipState::Moved,
         BorrowckOwnershipEventKind::PartialMove => BorrowckOwnershipState::PartiallyMoved,

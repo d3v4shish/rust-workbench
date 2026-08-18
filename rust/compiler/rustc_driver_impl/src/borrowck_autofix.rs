@@ -309,6 +309,7 @@ fn ownership_event_code(kind: BorrowckOwnershipEventKind) -> &'static str {
         BorrowckOwnershipEventKind::BorrowEnd => "borrowck_ownership_borrow_end",
         BorrowckOwnershipEventKind::BorrowMutable => "borrowck_ownership_borrow_mutable",
         BorrowckOwnershipEventKind::BorrowShared => "borrowck_ownership_borrow_shared",
+        BorrowckOwnershipEventKind::Clone => "borrowck_ownership_clone",
         BorrowckOwnershipEventKind::Copy => "borrowck_ownership_copy",
         BorrowckOwnershipEventKind::Drop => "borrowck_ownership_drop",
         BorrowckOwnershipEventKind::LastUse => "borrowck_ownership_last_use",

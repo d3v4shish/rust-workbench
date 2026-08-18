@@ -1,6 +1,6 @@
 //! Structured source edits produced by conservative borrow-checker diagnostics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use crate::Session;
 pub const AUTOFIX_CHILD_ENV: &str = "RUSTC_BORROWCK_AUTOFIX_CHILD";
 pub const AUTOFIX_OVERLAY_ENV: &str = "RUSTC_BORROWCK_AUTOFIX_OVERLAY";
 pub const AUTOFIX_PLAN_ENV: &str = "RUSTC_BORROWCK_AUTOFIX_PLAN";
-pub const BORROWCK_OWNERSHIP_MODEL_SCHEMA_VERSION: u32 = 5;
+pub const BORROWCK_OWNERSHIP_MODEL_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,18 +53,31 @@ pub struct BorrowckRepairCollector {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BorrowckMemoryKind {
+    AggregateValue,
     ArcAllocation,
     BoxAllocation,
+    CellState,
+    ConditionalValue,
+    ContainerBuffer,
+    ContainerHeader,
+    FatPointerMetadata,
+    GuardState,
     InlineValue,
     MutexState,
+    OnceState,
+    PinConstraint,
+    RawPointer,
     RcAllocation,
+    ReferenceHandle,
     RefCellState,
     RwLockState,
     StackBinding,
     StringBuffer,
     StringHeader,
+    UnsafeCellState,
     VecBuffer,
     VecHeader,
+    WeakAllocation,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -148,6 +161,7 @@ pub enum BorrowckOwnershipEventKind {
     BorrowEnd,
     BorrowMutable,
     BorrowShared,
+    Clone,
     Copy,
     Drop,
     LastUse,
@@ -182,6 +196,8 @@ pub enum BorrowckOwnershipState {
     MutablyBorrowed,
     PartiallyMoved,
     SharedBorrowed,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +315,225 @@ pub struct SerializedBorrowckSpan {
     pub byte_end: usize,
 }
 
+/// Where a source-level value is represented. This describes Rust's abstract
+/// storage model; it deliberately does not promise where an optimizer will
+/// place a value in the final machine code.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowckGraphStorageRegion {
+    Stack,
+    Inline,
+    Heap,
+    Static,
+    ThreadLocal,
+    Conceptual,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowckGraphNodeKind {
+    Binding,
+    InlineValue,
+    HeapAllocation,
+    Buffer,
+    ControlBlock,
+    BorrowFlag,
+    LockState,
+    BorrowedView,
+    ProjectedPlace,
+    Guard,
+    Metadata,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowckGraphEdgeRelation {
+    Owns,
+    Contains,
+    OwnsBuffer,
+    PointsTo,
+    BorrowShared,
+    BorrowMutable,
+    Reborrow,
+    SharesAllocation,
+    WeakReference,
+    GuardsAccess,
+    Conditional,
+    MovedTo,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowckOwnershipProvenance {
+    Exact,
+    Derived,
+    Conceptual,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowckSnapshotKind {
+    Initialize,
+    BorrowReserve,
+    BorrowActivate,
+    Move,
+    Copy,
+    Clone,
+    Reborrow,
+    LastUse,
+    BorrowEnd,
+    Conflict,
+    Reinitialize,
+    Drop,
+    PartialMove,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowckAccessKind {
+    BuiltinDeref,
+    TraitDeref,
+    TraitDerefMut,
+    AutoBorrowShared,
+    AutoBorrowMutable,
+    RawPointerDeref,
+    WrapperBorrow,
+    WrapperBorrowMut,
+    GuardDeref,
+    WeakUpgrade,
+    OptionExtract,
+    ResultExtract,
+    LockAcquire,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowckAccessMutability {
+    Shared,
+    Mutable,
+    NotApplicable,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowckAccessExplicitness {
+    Automatic,
+    Explicit,
+    Either,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SerializedBorrowckMemoryNode {
+    pub id: String,
+    pub body_id: u64,
+    pub place: String,
+    pub kind: BorrowckGraphNodeKind,
+    pub storage: BorrowckGraphStorageRegion,
+    pub label: String,
+    pub type_name: String,
+    pub size: Option<u64>,
+    pub align: Option<u64>,
+    pub span: Option<SerializedBorrowckSpan>,
+    pub state: BorrowckOwnershipState,
+    pub provenance: BorrowckOwnershipProvenance,
+    pub physical_placement_note: String,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SerializedBorrowckMemoryEdge {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub relation: BorrowckGraphEdgeRelation,
+    pub event_id: Option<String>,
+    pub loan_id: Option<u32>,
+    pub span: Option<SerializedBorrowckSpan>,
+    pub provenance: BorrowckOwnershipProvenance,
+    pub path_marker: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SerializedBorrowckStateDelta {
+    pub node_id: String,
+    pub from: Option<BorrowckOwnershipState>,
+    pub to: BorrowckOwnershipState,
+    pub relation_added: Option<BorrowckGraphEdgeRelation>,
+    pub relation_removed: Option<BorrowckGraphEdgeRelation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SerializedBorrowckOwnershipSnapshot {
+    pub id: String,
+    pub event_id: String,
+    pub body_id: u64,
+    pub basic_block: u32,
+    pub statement_index: u32,
+    pub kind: BorrowckSnapshotKind,
+    pub span: SerializedBorrowckSpan,
+    pub place: String,
+    pub loan_id: Option<u32>,
+    pub path_marker: Option<String>,
+    pub deltas: Vec<SerializedBorrowckStateDelta>,
+    pub provenance: BorrowckOwnershipProvenance,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SerializedBorrowckAccessStep {
+    pub kind: BorrowckAccessKind,
+    pub starting_type: String,
+    pub result_type: String,
+    pub mutability: BorrowckAccessMutability,
+    pub explicitness: BorrowckAccessExplicitness,
+    pub fallible: bool,
+    pub may_panic: bool,
+    pub requires_unsafe: bool,
+    pub explanation: String,
+    pub provenance: BorrowckOwnershipProvenance,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SerializedBorrowckAccessPath {
+    pub id: String,
+    pub body_id: u64,
+    pub node_id: String,
+    pub place: String,
+    pub purpose: String,
+    pub steps: Vec<SerializedBorrowckAccessStep>,
+    pub provenance: BorrowckOwnershipProvenance,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SerializedBorrowckMemoryGraph {
+    #[serde(default)]
+    pub nodes: Vec<SerializedBorrowckMemoryNode>,
+    #[serde(default)]
+    pub edges: Vec<SerializedBorrowckMemoryEdge>,
+    #[serde(default)]
+    pub snapshots: Vec<SerializedBorrowckOwnershipSnapshot>,
+    #[serde(default)]
+    pub access_paths: Vec<SerializedBorrowckAccessPath>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SerializedBorrowckMemoryLayer {
     pub kind: BorrowckMemoryKind,
@@ -393,6 +628,8 @@ pub struct SerializedBorrowckOwnershipDestination {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SerializedBorrowckRepairPlan {
     pub schema_version: u32,
+    #[serde(default)]
+    pub target_triple: String,
     pub crate_name: String,
     pub stable_crate_id: u64,
     pub sources: Vec<SerializedBorrowckRepairSource>,
@@ -400,6 +637,8 @@ pub struct SerializedBorrowckRepairPlan {
     pub ownership_bindings: Vec<SerializedBorrowckOwnershipBinding>,
     pub ownership_events: Vec<SerializedBorrowckOwnershipEvent>,
     pub ownership_loans: Vec<SerializedBorrowckOwnershipLoan>,
+    #[serde(default)]
+    pub memory_graph: SerializedBorrowckMemoryGraph,
     pub repairs: Vec<SerializedBorrowckRepairGroup>,
     pub wrapper_variants: Vec<SerializedBorrowckWrapperVariant>,
     pub wrapper_rejections: Vec<SerializedBorrowckWrapperRejection>,
@@ -653,7 +892,18 @@ impl Session {
                         type_name: layer.type_name.clone(),
                         size: layer.size,
                         align: layer.align,
-                        provenance: if layer.kind == BorrowckMemoryKind::StackBinding {
+                        provenance: if layer.size.is_some()
+                            && !matches!(
+                                layer.kind,
+                                BorrowckMemoryKind::ArcAllocation
+                                    | BorrowckMemoryKind::ContainerBuffer
+                                    | BorrowckMemoryKind::FatPointerMetadata
+                                    | BorrowckMemoryKind::PinConstraint
+                                    | BorrowckMemoryKind::RcAllocation
+                                    | BorrowckMemoryKind::StringBuffer
+                                    | BorrowckMemoryKind::VecBuffer
+                                    | BorrowckMemoryKind::WeakAllocation
+                            ) {
                             "target_layout"
                         } else {
                             "conceptual"
@@ -785,8 +1035,15 @@ impl Session {
         });
         ownership_events.dedup_by(|left, right| left.event_id == right.event_id);
 
+        let memory_graph = build_ownership_memory_graph(
+            &sources,
+            &ownership_bindings,
+            &ownership_events,
+            &ownership_loans,
+        );
         let mut plan = SerializedBorrowckRepairPlan {
             schema_version: BORROWCK_OWNERSHIP_MODEL_SCHEMA_VERSION,
+            target_triple: self.opts.target_triple.to_string(),
             crate_name,
             stable_crate_id,
             sources: sources.into_values().collect(),
@@ -794,6 +1051,7 @@ impl Session {
             ownership_bindings,
             ownership_events,
             ownership_loans,
+            memory_graph,
             repairs,
             wrapper_variants,
             wrapper_rejections,
@@ -819,6 +1077,1025 @@ impl Session {
         }
         write_atomic_json(&model_path, &plan)
     }
+}
+
+fn graph_id(prefix: &str, identity: &str) -> String {
+    format!("{prefix}-{}", stable_bytes_hash(identity.as_bytes()))
+}
+
+fn binding_node_id(
+    binding: &SerializedBorrowckOwnershipBinding,
+    bindings: &[SerializedBorrowckOwnershipBinding],
+) -> String {
+    let mut same_name = bindings
+        .iter()
+        .filter(|candidate| {
+            candidate.body_id == binding.body_id
+                && candidate.binding.path == binding.binding.path
+                && candidate.binding.name == binding.binding.name
+        })
+        .collect::<Vec<_>>();
+    same_name.sort_by_key(|candidate| candidate.binding.byte_start);
+    let shadow_ordinal = same_name
+        .iter()
+        .position(|candidate| candidate.binding.byte_start == binding.binding.byte_start)
+        .unwrap_or(0);
+    graph_id(
+        "node",
+        &format!(
+            "{}:{}:{}:{}:{shadow_ordinal}:binding",
+            binding.body_id,
+            binding.binding.path.display(),
+            binding.binding.name,
+            binding.type_name,
+        ),
+    )
+}
+
+fn layer_node_kind(kind: BorrowckMemoryKind) -> BorrowckGraphNodeKind {
+    match kind {
+        BorrowckMemoryKind::StackBinding => BorrowckGraphNodeKind::Binding,
+        BorrowckMemoryKind::AggregateValue
+        | BorrowckMemoryKind::CellState
+        | BorrowckMemoryKind::ConditionalValue
+        | BorrowckMemoryKind::ContainerHeader
+        | BorrowckMemoryKind::InlineValue
+        | BorrowckMemoryKind::PinConstraint
+        | BorrowckMemoryKind::RawPointer
+        | BorrowckMemoryKind::ReferenceHandle
+        | BorrowckMemoryKind::StringHeader
+        | BorrowckMemoryKind::UnsafeCellState
+        | BorrowckMemoryKind::VecHeader => BorrowckGraphNodeKind::InlineValue,
+        BorrowckMemoryKind::BoxAllocation => BorrowckGraphNodeKind::HeapAllocation,
+        BorrowckMemoryKind::RcAllocation
+        | BorrowckMemoryKind::ArcAllocation
+        | BorrowckMemoryKind::WeakAllocation => BorrowckGraphNodeKind::ControlBlock,
+        BorrowckMemoryKind::ContainerBuffer
+        | BorrowckMemoryKind::StringBuffer
+        | BorrowckMemoryKind::VecBuffer => BorrowckGraphNodeKind::Buffer,
+        BorrowckMemoryKind::RefCellState => BorrowckGraphNodeKind::BorrowFlag,
+        BorrowckMemoryKind::GuardState => BorrowckGraphNodeKind::Guard,
+        BorrowckMemoryKind::MutexState
+        | BorrowckMemoryKind::OnceState
+        | BorrowckMemoryKind::RwLockState => BorrowckGraphNodeKind::LockState,
+        BorrowckMemoryKind::FatPointerMetadata => BorrowckGraphNodeKind::Metadata,
+    }
+}
+
+fn graph_storage(storage: BorrowckMemoryStorage) -> BorrowckGraphStorageRegion {
+    match storage {
+        BorrowckMemoryStorage::Conceptual => BorrowckGraphStorageRegion::Conceptual,
+        BorrowckMemoryStorage::Heap => BorrowckGraphStorageRegion::Heap,
+        BorrowckMemoryStorage::Inline => BorrowckGraphStorageRegion::Inline,
+        BorrowckMemoryStorage::Stack => BorrowckGraphStorageRegion::Stack,
+    }
+}
+
+fn graph_provenance(layer: &SerializedBorrowckMemoryLayer) -> BorrowckOwnershipProvenance {
+    match layer.provenance.as_str() {
+        "target_layout" => BorrowckOwnershipProvenance::Exact,
+        "derived" => BorrowckOwnershipProvenance::Derived,
+        "conceptual" => BorrowckOwnershipProvenance::Conceptual,
+        _ => BorrowckOwnershipProvenance::Unknown,
+    }
+}
+
+fn topology_relation(kind: BorrowckMemoryKind) -> BorrowckGraphEdgeRelation {
+    match kind {
+        BorrowckMemoryKind::BoxAllocation => BorrowckGraphEdgeRelation::Owns,
+        BorrowckMemoryKind::RcAllocation | BorrowckMemoryKind::ArcAllocation => {
+            BorrowckGraphEdgeRelation::SharesAllocation
+        }
+        BorrowckMemoryKind::WeakAllocation => BorrowckGraphEdgeRelation::WeakReference,
+        BorrowckMemoryKind::ContainerBuffer
+        | BorrowckMemoryKind::StringBuffer
+        | BorrowckMemoryKind::VecBuffer => BorrowckGraphEdgeRelation::OwnsBuffer,
+        BorrowckMemoryKind::ConditionalValue => BorrowckGraphEdgeRelation::Conditional,
+        BorrowckMemoryKind::GuardState => BorrowckGraphEdgeRelation::GuardsAccess,
+        BorrowckMemoryKind::PinConstraint => BorrowckGraphEdgeRelation::GuardsAccess,
+        BorrowckMemoryKind::ReferenceHandle | BorrowckMemoryKind::RawPointer => {
+            BorrowckGraphEdgeRelation::PointsTo
+        }
+        BorrowckMemoryKind::StackBinding
+        | BorrowckMemoryKind::AggregateValue
+        | BorrowckMemoryKind::CellState
+        | BorrowckMemoryKind::ContainerHeader
+        | BorrowckMemoryKind::FatPointerMetadata
+        | BorrowckMemoryKind::InlineValue
+        | BorrowckMemoryKind::MutexState
+        | BorrowckMemoryKind::OnceState
+        | BorrowckMemoryKind::RefCellState
+        | BorrowckMemoryKind::RwLockState
+        | BorrowckMemoryKind::StringHeader
+        | BorrowckMemoryKind::UnsafeCellState
+        | BorrowckMemoryKind::VecHeader => BorrowckGraphEdgeRelation::Contains,
+    }
+}
+
+fn snapshot_kind(kind: BorrowckOwnershipEventKind) -> BorrowckSnapshotKind {
+    match kind {
+        BorrowckOwnershipEventKind::BorrowActivate => BorrowckSnapshotKind::BorrowActivate,
+        BorrowckOwnershipEventKind::BorrowEnd => BorrowckSnapshotKind::BorrowEnd,
+        BorrowckOwnershipEventKind::BorrowMutable | BorrowckOwnershipEventKind::BorrowShared => {
+            BorrowckSnapshotKind::BorrowReserve
+        }
+        BorrowckOwnershipEventKind::Clone => BorrowckSnapshotKind::Clone,
+        BorrowckOwnershipEventKind::Copy => BorrowckSnapshotKind::Copy,
+        BorrowckOwnershipEventKind::Drop => BorrowckSnapshotKind::Drop,
+        BorrowckOwnershipEventKind::LastUse => BorrowckSnapshotKind::LastUse,
+        BorrowckOwnershipEventKind::Move => BorrowckSnapshotKind::Move,
+        BorrowckOwnershipEventKind::PartialMove => BorrowckSnapshotKind::PartialMove,
+        BorrowckOwnershipEventKind::Reinitialize => BorrowckSnapshotKind::Reinitialize,
+    }
+}
+
+fn find_binding_node_id(
+    bindings: &[SerializedBorrowckOwnershipBinding],
+    body_id: u64,
+    place: &str,
+) -> Option<String> {
+    let root = place.trim_start_matches('*').split(['.', '[', ':']).next().unwrap_or(place);
+    bindings
+        .iter()
+        .find(|binding| binding.body_id == body_id && binding.binding.name == root)
+        .map(|binding| binding_node_id(binding, bindings))
+}
+
+fn ensure_place_node(
+    graph: &mut SerializedBorrowckMemoryGraph,
+    bindings: &[SerializedBorrowckOwnershipBinding],
+    body_id: u64,
+    place: &str,
+    span: Option<SerializedBorrowckSpan>,
+    provenance: BorrowckOwnershipProvenance,
+) -> Option<String> {
+    let root_id = find_binding_node_id(bindings, body_id, place)?;
+    let root_name = place.trim_start_matches('*').split(['.', '[', ':']).next().unwrap_or(place);
+    if place == root_name {
+        return Some(root_id);
+    }
+    let id = graph_id("place", &format!("{body_id}:{place}"));
+    if !graph.nodes.iter().any(|node| node.id == id) {
+        graph.nodes.push(SerializedBorrowckMemoryNode {
+            id: id.clone(),
+            body_id,
+            place: place.to_string(),
+            kind: BorrowckGraphNodeKind::ProjectedPlace,
+            storage: BorrowckGraphStorageRegion::Inline,
+            label: place.to_string(),
+            type_name: "projected place (type available from MIR owner)".to_string(),
+            size: None,
+            align: None,
+            span: span.clone(),
+            state: BorrowckOwnershipState::Available,
+            provenance,
+            physical_placement_note:
+                "A source/MIR subplace of its owner; optimized machine placement may differ."
+                    .to_string(),
+            truncated: false,
+        });
+        graph.edges.push(SerializedBorrowckMemoryEdge {
+            id: graph_id("edge", &format!("{root_id}:contains:{id}")),
+            source: root_id,
+            target: id.clone(),
+            relation: BorrowckGraphEdgeRelation::Contains,
+            event_id: None,
+            loan_id: None,
+            span,
+            provenance,
+            path_marker: None,
+        });
+    }
+    Some(id)
+}
+
+fn access_step(
+    kind: BorrowckAccessKind,
+    starting_type: &str,
+    result_type: &str,
+    mutability: BorrowckAccessMutability,
+    explicitness: BorrowckAccessExplicitness,
+    fallible: bool,
+    may_panic: bool,
+    requires_unsafe: bool,
+    explanation: &str,
+) -> SerializedBorrowckAccessStep {
+    SerializedBorrowckAccessStep {
+        kind,
+        starting_type: starting_type.to_string(),
+        result_type: result_type.to_string(),
+        mutability,
+        explicitness,
+        fallible,
+        may_panic,
+        requires_unsafe,
+        explanation: explanation.to_string(),
+        provenance: BorrowckOwnershipProvenance::Derived,
+    }
+}
+
+fn access_paths_for_binding(
+    binding: &SerializedBorrowckOwnershipBinding,
+    node_id: String,
+) -> Vec<SerializedBorrowckAccessPath> {
+    let ty = binding.type_name.as_str();
+    let inner = binding
+        .memory_layers
+        .iter()
+        .skip(1)
+        .map(|layer| layer.type_name.as_str())
+        .find(|candidate| *candidate != ty)
+        .unwrap_or("the inner value");
+    let mut paths = Vec::new();
+    let mut push = |purpose: &str, steps: Vec<SerializedBorrowckAccessStep>| {
+        paths.push(SerializedBorrowckAccessPath {
+            id: graph_id("access", &format!("{}:{}:{purpose}", binding.body_id, node_id)),
+            body_id: binding.body_id,
+            node_id: node_id.clone(),
+            place: binding.binding.name.clone(),
+            purpose: purpose.to_string(),
+            steps,
+            provenance: BorrowckOwnershipProvenance::Derived,
+        });
+    };
+
+    if ty.starts_with("&mut ") {
+        push(
+            "mutate the referenced value",
+            vec![access_step(
+                BorrowckAccessKind::BuiltinDeref,
+                ty,
+                ty.trim_start_matches("&mut "),
+                BorrowckAccessMutability::Mutable,
+                BorrowckAccessExplicitness::Either,
+                false,
+                false,
+                false,
+                "A mutable reference provides exclusive access while its loan is live.",
+            )],
+        );
+    } else if ty.starts_with('&') {
+        push(
+            "read the referenced value",
+            vec![access_step(
+                BorrowckAccessKind::BuiltinDeref,
+                ty,
+                ty.trim_start_matches('&'),
+                BorrowckAccessMutability::Shared,
+                BorrowckAccessExplicitness::Either,
+                false,
+                false,
+                false,
+                "A shared reference permits reads but not mutation through this path.",
+            )],
+        );
+    } else if ty.starts_with("*mut ") || ty.starts_with("*const ") {
+        push(
+            "dereference the raw pointer",
+            vec![access_step(
+                BorrowckAccessKind::RawPointerDeref,
+                ty,
+                ty.split_once(' ').map_or("the pointee", |(_, pointee)| pointee),
+                if ty.starts_with("*mut ") {
+                    BorrowckAccessMutability::Mutable
+                } else {
+                    BorrowckAccessMutability::Shared
+                },
+                BorrowckAccessExplicitness::Explicit,
+                false,
+                false,
+                true,
+                "The compiler cannot prove raw-pointer validity; dereferencing requires unsafe.",
+            )],
+        );
+    } else if ty.contains("NonNull<") {
+        push(
+            "dereference the non-null raw pointer",
+            vec![access_step(
+                BorrowckAccessKind::RawPointerDeref,
+                ty,
+                inner,
+                BorrowckAccessMutability::Unknown,
+                BorrowckAccessExplicitness::Explicit,
+                false,
+                false,
+                true,
+                "NonNull proves non-nullness, not validity, alignment, initialization, or alias safety.",
+            )],
+        );
+    } else if ty.contains("RefMut<")
+        || ty.contains("MutexGuard<")
+        || ty.contains("RwLockWriteGuard<")
+    {
+        push(
+            "mutate through the live guard",
+            vec![access_step(
+                BorrowckAccessKind::GuardDeref,
+                ty,
+                inner,
+                BorrowckAccessMutability::Mutable,
+                BorrowckAccessExplicitness::Either,
+                false,
+                false,
+                false,
+                "Dropping the guard releases the runtime borrow or synchronization gate.",
+            )],
+        );
+    } else if ty.contains("Ref<") || ty.contains("RwLockReadGuard<") {
+        push(
+            "read through the live guard",
+            vec![access_step(
+                BorrowckAccessKind::GuardDeref,
+                ty,
+                inner,
+                BorrowckAccessMutability::Shared,
+                BorrowckAccessExplicitness::Either,
+                false,
+                false,
+                false,
+                "Dropping the guard releases the runtime borrow or synchronization gate.",
+            )],
+        );
+    } else if (ty.contains("Rc<") || ty.contains("Arc<")) && ty.contains("RefCell<") {
+        push(
+            "mutate a shared value through runtime borrow checking",
+            vec![
+                access_step(
+                    BorrowckAccessKind::TraitDeref,
+                    ty,
+                    "RefCell<inner>",
+                    BorrowckAccessMutability::Shared,
+                    BorrowckAccessExplicitness::Either,
+                    false,
+                    false,
+                    false,
+                    "The shared handle dereferences to the allocation without granting mutable access.",
+                ),
+                access_step(
+                    BorrowckAccessKind::WrapperBorrowMut,
+                    "RefCell<inner>",
+                    inner,
+                    BorrowckAccessMutability::Mutable,
+                    BorrowckAccessExplicitness::Explicit,
+                    false,
+                    true,
+                    false,
+                    "borrow_mut() checks exclusivity at runtime and can panic on a conflict.",
+                ),
+            ],
+        );
+    } else if (ty.contains("Arc<") || ty.contains("Rc<"))
+        && (ty.contains("Mutex<") || ty.contains("RwLock<"))
+    {
+        push(
+            "reach a shared value through a synchronization guard",
+            vec![
+                access_step(
+                    BorrowckAccessKind::TraitDeref,
+                    ty,
+                    "synchronization wrapper",
+                    BorrowckAccessMutability::Shared,
+                    BorrowckAccessExplicitness::Either,
+                    false,
+                    false,
+                    false,
+                    "The shared handle dereferences to the synchronization wrapper.",
+                ),
+                access_step(
+                    BorrowckAccessKind::LockAcquire,
+                    "synchronization wrapper",
+                    "lock guard",
+                    BorrowckAccessMutability::Mutable,
+                    BorrowckAccessExplicitness::Explicit,
+                    true,
+                    false,
+                    false,
+                    "Acquiring a lock can block and may report poisoning.",
+                ),
+                access_step(
+                    BorrowckAccessKind::GuardDeref,
+                    "lock guard",
+                    inner,
+                    BorrowckAccessMutability::Mutable,
+                    BorrowckAccessExplicitness::Either,
+                    false,
+                    false,
+                    false,
+                    "The guard grants access until it is dropped.",
+                ),
+            ],
+        );
+    } else if ty.contains("RefCell<") && !ty.contains("Weak<") {
+        push(
+            "read through runtime borrow checking",
+            vec![access_step(
+                BorrowckAccessKind::WrapperBorrow,
+                ty,
+                inner,
+                BorrowckAccessMutability::Shared,
+                BorrowckAccessExplicitness::Explicit,
+                false,
+                true,
+                false,
+                "borrow() creates a shared guard and panics if a mutable guard is active.",
+            )],
+        );
+        push(
+            "mutate through runtime borrow checking",
+            vec![access_step(
+                BorrowckAccessKind::WrapperBorrowMut,
+                ty,
+                inner,
+                BorrowckAccessMutability::Mutable,
+                BorrowckAccessExplicitness::Explicit,
+                false,
+                true,
+                false,
+                "borrow_mut() creates an exclusive guard and panics if any guard is active.",
+            )],
+        );
+    } else if (ty.contains("Mutex<") || ty.contains("RwLock<")) && !ty.contains("Weak<") {
+        let read_only = ty.contains("RwLock<");
+        push(
+            if read_only { "read through a lock guard" } else { "mutate through a lock guard" },
+            vec![
+                access_step(
+                    BorrowckAccessKind::LockAcquire,
+                    ty,
+                    "lock guard",
+                    if read_only {
+                        BorrowckAccessMutability::Shared
+                    } else {
+                        BorrowckAccessMutability::Mutable
+                    },
+                    BorrowckAccessExplicitness::Explicit,
+                    true,
+                    false,
+                    false,
+                    "Lock acquisition can block and returns a Result because a lock may be poisoned.",
+                ),
+                access_step(
+                    BorrowckAccessKind::GuardDeref,
+                    "lock guard",
+                    inner,
+                    if read_only {
+                        BorrowckAccessMutability::Shared
+                    } else {
+                        BorrowckAccessMutability::Mutable
+                    },
+                    BorrowckAccessExplicitness::Either,
+                    false,
+                    false,
+                    false,
+                    "The guard controls how long access to the protected value remains active.",
+                ),
+            ],
+        );
+    } else if ty.contains("Weak<") {
+        push(
+            "attempt to reach the shared allocation",
+            vec![
+                access_step(
+                    BorrowckAccessKind::WeakUpgrade,
+                    ty,
+                    "Option<shared handle>",
+                    BorrowckAccessMutability::Shared,
+                    BorrowckAccessExplicitness::Explicit,
+                    true,
+                    false,
+                    false,
+                    "upgrade() is fallible because all strong owners may already be gone.",
+                ),
+                access_step(
+                    BorrowckAccessKind::OptionExtract,
+                    "Option<shared handle>",
+                    inner,
+                    BorrowckAccessMutability::Shared,
+                    BorrowckAccessExplicitness::Explicit,
+                    true,
+                    false,
+                    false,
+                    "Handle the None case before accessing the value.",
+                ),
+            ],
+        );
+    } else if ty.contains("Pin<") {
+        push(
+            "access through the pinned pointer",
+            vec![access_step(
+                BorrowckAccessKind::TraitDeref,
+                ty,
+                inner,
+                BorrowckAccessMutability::Shared,
+                BorrowckAccessExplicitness::Either,
+                false,
+                false,
+                false,
+                "Pin constrains movement of the pointee; it is not a separate storage region.",
+            )],
+        );
+    } else if ty.contains("Option<") || ty.contains("Result<") {
+        push(
+            "extract the active value",
+            vec![access_step(
+                if ty.contains("Option<") {
+                    BorrowckAccessKind::OptionExtract
+                } else {
+                    BorrowckAccessKind::ResultExtract
+                },
+                ty,
+                inner,
+                BorrowckAccessMutability::NotApplicable,
+                BorrowckAccessExplicitness::Explicit,
+                true,
+                false,
+                false,
+                "The active runtime variant must be handled before the contained value is available.",
+            )],
+        );
+    } else if ty.contains("Box<") {
+        push(
+            "access the owned heap value",
+            vec![access_step(
+                BorrowckAccessKind::BuiltinDeref,
+                ty,
+                inner,
+                BorrowckAccessMutability::Mutable,
+                BorrowckAccessExplicitness::Either,
+                false,
+                false,
+                false,
+                "Box uniquely owns its allocation, so a mutable Box can provide mutable access.",
+            )],
+        );
+    } else if ty.contains("Rc<") || ty.contains("Arc<") {
+        push(
+            "read the shared allocation",
+            vec![access_step(
+                BorrowckAccessKind::TraitDeref,
+                ty,
+                inner,
+                BorrowckAccessMutability::Shared,
+                BorrowckAccessExplicitness::Either,
+                false,
+                false,
+                false,
+                "Shared ownership provides shared dereference; mutation needs uniqueness or interior mutability.",
+            )],
+        );
+    }
+    paths
+}
+
+fn build_ownership_memory_graph(
+    sources: &BTreeMap<PathBuf, SerializedBorrowckRepairSource>,
+    bindings: &[SerializedBorrowckOwnershipBinding],
+    events: &[SerializedBorrowckOwnershipEvent],
+    loans: &[SerializedBorrowckOwnershipLoan],
+) -> SerializedBorrowckMemoryGraph {
+    let mut graph = SerializedBorrowckMemoryGraph::default();
+    for binding in bindings {
+        let binding_id = binding_node_id(binding, bindings);
+        let binding_span = SerializedBorrowckSpan {
+            path: binding.binding.path.clone(),
+            byte_start: binding.binding.byte_start,
+            byte_end: binding.binding.byte_start + binding.binding.name.len(),
+        };
+        let mut previous: Option<String> = None;
+        for (index, layer) in binding.memory_layers.iter().enumerate().take(12) {
+            let id = if index == 0 {
+                binding_id.clone()
+            } else {
+                graph_id(
+                    "node",
+                    &format!("{}:{:?}:{}:{}", binding_id, layer.kind, layer.label, index),
+                )
+            };
+            graph.nodes.push(SerializedBorrowckMemoryNode {
+                id: id.clone(),
+                body_id: binding.body_id,
+                place: binding.binding.name.clone(),
+                kind: layer_node_kind(layer.kind),
+                storage: graph_storage(layer.storage),
+                label: layer.label.clone(),
+                type_name: layer.type_name.clone(),
+                size: layer.size,
+                align: layer.align,
+                span: Some(binding_span.clone()),
+                state: BorrowckOwnershipState::Available,
+                provenance: graph_provenance(layer),
+                physical_placement_note:
+                    "Source-level model; optimized machine placement may differ.".to_string(),
+                truncated: binding.memory_layers.len() > 12 && index == 11,
+            });
+            if let Some(source) = previous {
+                let relation = topology_relation(layer.kind);
+                graph.edges.push(SerializedBorrowckMemoryEdge {
+                    id: graph_id("edge", &format!("{source}:{relation:?}:{id}")),
+                    source,
+                    target: id.clone(),
+                    relation,
+                    event_id: None,
+                    loan_id: None,
+                    span: Some(binding_span.clone()),
+                    provenance: graph_provenance(layer),
+                    path_marker: None,
+                });
+            }
+            previous = Some(id);
+        }
+        graph.truncated |= binding.memory_layers.len() > 12;
+        let initialization_id = graph_id("initialize", &binding_id);
+        graph.snapshots.push(SerializedBorrowckOwnershipSnapshot {
+            id: graph_id("snapshot", &initialization_id),
+            event_id: initialization_id,
+            body_id: binding.body_id,
+            basic_block: 0,
+            statement_index: 0,
+            kind: BorrowckSnapshotKind::Initialize,
+            span: binding_span,
+            place: binding.binding.name.clone(),
+            loan_id: None,
+            path_marker: Some("binding_initialization".to_string()),
+            deltas: vec![SerializedBorrowckStateDelta {
+                node_id: binding_id.clone(),
+                from: None,
+                to: BorrowckOwnershipState::Available,
+                relation_added: None,
+                relation_removed: None,
+            }],
+            provenance: BorrowckOwnershipProvenance::Derived,
+        });
+        graph.access_paths.extend(access_paths_for_binding(binding, binding_id));
+    }
+
+    for destination in bindings {
+        let Some(source_name) = shared_clone_source(sources, destination) else {
+            continue;
+        };
+        let Some(source) = bindings.iter().find(|source| {
+            source.body_id == destination.body_id && source.binding.name == source_name
+        }) else {
+            continue;
+        };
+        let source_root = binding_node_id(source, bindings);
+        let destination_root = binding_node_id(destination, bindings);
+        let Some(source_allocation) = graph
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.source == source_root
+                    && edge.relation == BorrowckGraphEdgeRelation::SharesAllocation
+            })
+            .map(|edge| edge.target.clone())
+        else {
+            continue;
+        };
+        if let Some(destination_allocation) = graph
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.source == destination_root
+                    && edge.relation == BorrowckGraphEdgeRelation::SharesAllocation
+            })
+            .map(|edge| edge.target.clone())
+        {
+            remove_duplicate_allocation(&mut graph, &destination_allocation);
+        }
+        let span = SerializedBorrowckSpan {
+            path: destination.binding.path.clone(),
+            byte_start: destination.binding.byte_start,
+            byte_end: destination.binding.byte_start + destination.binding.name.len(),
+        };
+        let event_id = graph_id(
+            "derived-clone",
+            &format!(
+                "{}:{}:{}:{}",
+                destination.body_id,
+                destination.binding.path.display(),
+                source.binding.name,
+                destination.binding.name
+            ),
+        );
+        graph.edges.push(SerializedBorrowckMemoryEdge {
+            id: graph_id(
+                "edge",
+                &format!("{destination_root}:shares_allocation:{source_allocation}"),
+            ),
+            source: destination_root.clone(),
+            target: source_allocation,
+            relation: BorrowckGraphEdgeRelation::SharesAllocation,
+            event_id: Some(event_id.clone()),
+            loan_id: None,
+            span: Some(span.clone()),
+            provenance: BorrowckOwnershipProvenance::Derived,
+            path_marker: Some("source_expression".to_string()),
+        });
+        graph.snapshots.push(SerializedBorrowckOwnershipSnapshot {
+            id: graph_id("snapshot", &event_id),
+            event_id,
+            body_id: destination.body_id,
+            basic_block: 0,
+            statement_index: 0,
+            kind: BorrowckSnapshotKind::Clone,
+            span,
+            place: source.binding.name.clone(),
+            loan_id: None,
+            path_marker: Some("source_expression".to_string()),
+            deltas: vec![SerializedBorrowckStateDelta {
+                node_id: destination_root,
+                from: None,
+                to: BorrowckOwnershipState::Available,
+                relation_added: Some(BorrowckGraphEdgeRelation::SharesAllocation),
+                relation_removed: None,
+            }],
+            provenance: BorrowckOwnershipProvenance::Derived,
+        });
+    }
+
+    for loan in loans {
+        let Some(root_id) = ensure_place_node(
+            &mut graph,
+            bindings,
+            loan.body_id,
+            &loan.place,
+            Some(loan.reserve.span.clone()),
+            BorrowckOwnershipProvenance::Exact,
+        ) else {
+            continue;
+        };
+        let view_id =
+            graph_id("node", &format!("{}:{}:loan:{}", loan.body_id, loan.place, loan.loan_id));
+        graph.nodes.push(SerializedBorrowckMemoryNode {
+            id: view_id.clone(),
+            body_id: loan.body_id,
+            place: loan.place.clone(),
+            kind: BorrowckGraphNodeKind::BorrowedView,
+            storage: BorrowckGraphStorageRegion::Conceptual,
+            label: match loan.kind {
+                BorrowckLoanKind::Mutable => "exclusive borrowed view",
+                BorrowckLoanKind::Shared => "shared borrowed view",
+            }
+            .to_string(),
+            type_name: "borrowed view".to_string(),
+            size: None,
+            align: None,
+            span: Some(loan.reserve.span.clone()),
+            state: match loan.kind {
+                BorrowckLoanKind::Mutable => BorrowckOwnershipState::MutablyBorrowed,
+                BorrowckLoanKind::Shared => BorrowckOwnershipState::SharedBorrowed,
+            },
+            provenance: BorrowckOwnershipProvenance::Exact,
+            physical_placement_note:
+                "A MIR loan, not a claim that a separate runtime allocation exists.".to_string(),
+            truncated: loan.truncated,
+        });
+        let relation = match loan.kind {
+            BorrowckLoanKind::Mutable => BorrowckGraphEdgeRelation::BorrowMutable,
+            BorrowckLoanKind::Shared => BorrowckGraphEdgeRelation::BorrowShared,
+        };
+        graph.edges.push(SerializedBorrowckMemoryEdge {
+            id: graph_id("edge", &format!("{root_id}:{relation:?}:{view_id}:{}", loan.loan_id)),
+            source: view_id,
+            target: root_id,
+            relation,
+            event_id: None,
+            loan_id: Some(loan.loan_id),
+            span: Some(loan.reserve.span.clone()),
+            provenance: BorrowckOwnershipProvenance::Exact,
+            path_marker: Some(format!("bb{}", loan.reserve.basic_block)),
+        });
+    }
+
+    for event in events {
+        let event_span = SerializedBorrowckSpan {
+            path: event.path.clone(),
+            byte_start: event.byte_start,
+            byte_end: event.byte_end,
+        };
+        let Some(node_id) = ensure_place_node(
+            &mut graph,
+            bindings,
+            event.body_id,
+            &event.place,
+            Some(event_span.clone()),
+            BorrowckOwnershipProvenance::Exact,
+        ) else {
+            continue;
+        };
+        let relation = match event.kind {
+            BorrowckOwnershipEventKind::Move | BorrowckOwnershipEventKind::PartialMove => {
+                Some(BorrowckGraphEdgeRelation::MovedTo)
+            }
+            BorrowckOwnershipEventKind::BorrowMutable => {
+                Some(BorrowckGraphEdgeRelation::BorrowMutable)
+            }
+            BorrowckOwnershipEventKind::BorrowShared => {
+                Some(BorrowckGraphEdgeRelation::BorrowShared)
+            }
+            BorrowckOwnershipEventKind::Clone => Some(BorrowckGraphEdgeRelation::SharesAllocation),
+            _ => None,
+        };
+        if matches!(
+            event.kind,
+            BorrowckOwnershipEventKind::Move | BorrowckOwnershipEventKind::PartialMove
+        ) && let Some(destination) = event.destination.as_ref()
+            && let Some(destination_place) = destination.place.as_deref()
+            && let Some(target) = ensure_place_node(
+                &mut graph,
+                bindings,
+                event.body_id,
+                destination_place,
+                destination.span.clone(),
+                BorrowckOwnershipProvenance::Exact,
+            )
+        {
+            graph.edges.push(SerializedBorrowckMemoryEdge {
+                id: graph_id("edge", &format!("{}:moved_to:{target}", event.event_id)),
+                source: node_id.clone(),
+                target,
+                relation: BorrowckGraphEdgeRelation::MovedTo,
+                event_id: Some(event.event_id.clone()),
+                loan_id: event.loan_id,
+                span: Some(event_span.clone()),
+                provenance: BorrowckOwnershipProvenance::Exact,
+                path_marker: Some(format!("bb{}", event.basic_block)),
+            });
+        }
+        if event.kind == BorrowckOwnershipEventKind::Clone
+            && let Some(destination) = event.destination.as_ref()
+            && let Some(destination_place) = destination.place.as_deref()
+            && let Some(destination_root) = ensure_place_node(
+                &mut graph,
+                bindings,
+                event.body_id,
+                destination_place,
+                destination.span.clone(),
+                BorrowckOwnershipProvenance::Exact,
+            )
+            && let Some(source_allocation) = graph
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.source == node_id
+                        && edge.relation == BorrowckGraphEdgeRelation::SharesAllocation
+                })
+                .map(|edge| edge.target.clone())
+        {
+            if let Some(destination_allocation) = graph
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.source == destination_root
+                        && edge.relation == BorrowckGraphEdgeRelation::SharesAllocation
+                })
+                .map(|edge| edge.target.clone())
+            {
+                let mut duplicate_nodes = vec![destination_allocation];
+                let mut cursor = 0;
+                while cursor < duplicate_nodes.len() {
+                    let current = duplicate_nodes[cursor].clone();
+                    cursor += 1;
+                    let children = graph
+                        .edges
+                        .iter()
+                        .filter(|edge| edge.source == current)
+                        .map(|edge| edge.target.clone())
+                        .collect::<Vec<_>>();
+                    for child in children {
+                        if !duplicate_nodes.contains(&child) {
+                            duplicate_nodes.push(child);
+                        }
+                    }
+                }
+                graph.nodes.retain(|node| !duplicate_nodes.contains(&node.id));
+                graph.edges.retain(|edge| {
+                    !duplicate_nodes.contains(&edge.source)
+                        && !duplicate_nodes.contains(&edge.target)
+                });
+            }
+            graph.edges.push(SerializedBorrowckMemoryEdge {
+                id: graph_id(
+                    "edge",
+                    &format!("{}:shares_allocation:{source_allocation}", event.event_id),
+                ),
+                source: destination_root,
+                target: source_allocation,
+                relation: BorrowckGraphEdgeRelation::SharesAllocation,
+                event_id: Some(event.event_id.clone()),
+                loan_id: event.loan_id,
+                span: Some(event_span.clone()),
+                provenance: BorrowckOwnershipProvenance::Exact,
+                path_marker: Some(format!("bb{}", event.basic_block)),
+            });
+        }
+        graph.snapshots.push(SerializedBorrowckOwnershipSnapshot {
+            id: graph_id("snapshot", &event.event_id),
+            event_id: event.event_id.clone(),
+            body_id: event.body_id,
+            basic_block: event.basic_block,
+            statement_index: event.statement_index,
+            kind: snapshot_kind(event.kind),
+            span: event_span,
+            place: event.place.clone(),
+            loan_id: event.loan_id,
+            path_marker: Some(format!("bb{}", event.basic_block)),
+            deltas: vec![SerializedBorrowckStateDelta {
+                node_id,
+                from: None,
+                to: event.state,
+                relation_added: relation,
+                relation_removed: if event.kind == BorrowckOwnershipEventKind::BorrowEnd {
+                    Some(BorrowckGraphEdgeRelation::BorrowShared)
+                } else {
+                    None
+                },
+            }],
+            provenance: BorrowckOwnershipProvenance::Exact,
+        });
+    }
+
+    graph.nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    graph.nodes.dedup_by(|left, right| left.id == right.id);
+    graph.edges.sort_by(|left, right| left.id.cmp(&right.id));
+    graph.edges.dedup_by(|left, right| left.id == right.id);
+    graph.snapshots.sort_by_key(|snapshot| {
+        (snapshot.body_id, snapshot.basic_block, snapshot.statement_index, snapshot.id.clone())
+    });
+    graph.access_paths.sort_by(|left, right| left.id.cmp(&right.id));
+    const MAX_GRAPH_NODES: usize = 512;
+    const MAX_GRAPH_EDGES: usize = 1024;
+    const MAX_GRAPH_SNAPSHOTS: usize = 1024;
+    const MAX_GRAPH_ACCESS_PATHS: usize = 256;
+    graph.truncated |= graph.nodes.len() > MAX_GRAPH_NODES
+        || graph.edges.len() > MAX_GRAPH_EDGES
+        || graph.snapshots.len() > MAX_GRAPH_SNAPSHOTS
+        || graph.access_paths.len() > MAX_GRAPH_ACCESS_PATHS;
+    graph.nodes.truncate(MAX_GRAPH_NODES);
+    let retained_nodes = graph.nodes.iter().map(|node| node.id.as_str()).collect::<BTreeSet<_>>();
+    graph.edges.retain(|edge| {
+        retained_nodes.contains(&edge.source.as_str())
+            && retained_nodes.contains(&edge.target.as_str())
+    });
+    graph.edges.truncate(MAX_GRAPH_EDGES);
+    graph.snapshots.truncate(MAX_GRAPH_SNAPSHOTS);
+    graph.access_paths.truncate(MAX_GRAPH_ACCESS_PATHS);
+    graph
+}
+
+fn remove_duplicate_allocation(graph: &mut SerializedBorrowckMemoryGraph, allocation: &str) {
+    let mut duplicate_nodes = vec![allocation.to_string()];
+    let mut cursor = 0;
+    while cursor < duplicate_nodes.len() {
+        let current = duplicate_nodes[cursor].clone();
+        cursor += 1;
+        let children = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == current)
+            .map(|edge| edge.target.clone())
+            .collect::<Vec<_>>();
+        for child in children {
+            if !duplicate_nodes.contains(&child) {
+                duplicate_nodes.push(child);
+            }
+        }
+    }
+    graph.nodes.retain(|node| !duplicate_nodes.contains(&node.id));
+    graph.edges.retain(|edge| {
+        !duplicate_nodes.contains(&edge.source) && !duplicate_nodes.contains(&edge.target)
+    });
+}
+
+fn shared_clone_source(
+    sources: &BTreeMap<PathBuf, SerializedBorrowckRepairSource>,
+    destination: &SerializedBorrowckOwnershipBinding,
+) -> Option<String> {
+    let source = sources.get(&destination.binding.path)?.source.as_deref()?;
+    if destination.binding.byte_start > source.len() {
+        return None;
+    }
+    let line_start = source[..destination.binding.byte_start].rfind('\n').map_or(0, |at| at + 1);
+    let line_end = source[destination.binding.byte_start..]
+        .find('\n')
+        .map_or(source.len(), |at| destination.binding.byte_start + at);
+    let line = &source[line_start..line_end];
+    for marker in ["Rc::clone(&", "Arc::clone(&"] {
+        if let Some(start) = line.find(marker) {
+            let candidate = &line[start + marker.len()..];
+            let end = candidate
+                .find(|character: char| !(character == '_' || character.is_alphanumeric()))
+                .unwrap_or(candidate.len());
+            return (end > 0).then(|| candidate[..end].to_string());
+        }
+    }
+    let assignment = line.split_once('=')?.1;
+    let clone_at = assignment.find(".clone()")?;
+    let before = assignment[..clone_at].trim_end();
+    let start = before
+        .rfind(|character: char| !(character == '_' || character.is_alphanumeric()))
+        .map_or(0, |at| at + 1);
+    (start < before.len()).then(|| before[start..].to_string())
 }
 
 fn stable_source_hash(source: &str) -> String {

@@ -58,6 +58,7 @@ fn main() {
         ],
     );
     test_ownership_events();
+    test_ownership_topology();
     test_editor_suggestions(
         "ref-cell.rs",
         &[
@@ -145,6 +146,125 @@ fn main() {
     assert!(rejected_manifest.contains(r#""wrapper_variants": []"#), "{rejected_manifest}");
 }
 
+fn test_ownership_topology() {
+    rfs::create_dir("ownership-model-topology");
+    rustc()
+        .input("ownership-model-topology.rs")
+        .output("ownership-model-topology-bin")
+        .arg("-Zborrowck-ownership-model=ownership-model-topology")
+        .run();
+    run("ownership-model-topology-bin");
+    let models = find_files(Path::new("ownership-model-topology"), "json");
+    assert_eq!(models.len(), 1, "unexpected ownership models: {models:?}");
+    let model = rfs::read_to_string(&models[0]);
+    for fact in [
+        r#""schema_version":6"#,
+        r#""target_triple":"x86_64-unknown-linux-gnu""#,
+        r#""kind":"box_allocation""#,
+        r#""kind":"rc_allocation""#,
+        r#""kind":"arc_allocation""#,
+        r#""kind":"weak_allocation""#,
+        r#""kind":"pin_constraint""#,
+        r#""kind":"cell_state""#,
+        r#""kind":"ref_cell_state""#,
+        r#""kind":"unsafe_cell_state""#,
+        r#""kind":"once_state""#,
+        r#""kind":"mutex_state""#,
+        r#""kind":"rw_lock_state""#,
+        r#""kind":"container_header""#,
+        r#""kind":"container_buffer""#,
+        r#""kind":"conditional_value""#,
+        r#""kind":"reference_handle""#,
+        r#""kind":"fat_pointer_metadata""#,
+        r#""kind":"raw_pointer""#,
+        r#""relation":"weak_reference""#,
+        r#""kind":"raw_pointer_deref""#,
+        r#""kind":"weak_upgrade""#,
+        r#""kind":"lock_acquire""#,
+        r#""kind":"wrapper_borrow_mut""#,
+        r#""kind":"option_extract""#,
+        r#""kind":"initialize""#,
+    ] {
+        assert!(model.contains(fact), "missing {fact}: {model}");
+    }
+    assert!(
+        model.contains("runtime length/capacity/node count is unknown"),
+        "container topology fabricated runtime data: {model}"
+    );
+    assert!(
+        model.contains("optimized machine placement may differ"),
+        "source storage must not claim optimized physical placement: {model}"
+    );
+    // `source` is intentionally used as the source-node ID on graph edges.  The
+    // persistent artifact must not, however, embed a copy of the source file.
+    for source_text_field in
+        [r#""source_text":"#, r#""sourceText":"#, r#""source_content":"#, r#""sourceContent":"#]
+    {
+        assert!(
+            !model.contains(source_text_field),
+            "persistent ownership artifacts must not duplicate source text in {source_text_field}: {model}"
+        );
+    }
+
+    let stable_source = r#"
+fn main() {
+    let kept: Box<Vec<i32>> = Box::new(vec![1, 2, 3]);
+    println!("{}", kept.len());
+}
+"#;
+    rfs::write("stable-ownership-ids.rs", stable_source);
+    rfs::create_dir("stable-ownership-model-a");
+    rustc()
+        .input("stable-ownership-ids.rs")
+        .crate_name("stable_ownership_ids")
+        .output("stable-ownership-ids-a")
+        .arg("-Zborrowck-ownership-model=stable-ownership-model-a")
+        .run();
+    let first = rfs::read_to_string(
+        find_files(Path::new("stable-ownership-model-a"), "json")
+            .first()
+            .expect("first stable-id model"),
+    );
+
+    rfs::write(
+        "stable-ownership-ids.rs",
+        stable_source.replace(
+            "fn main() {",
+            "fn main() {\n    let unrelated: String = String::from(\"unrelated\");\n    drop(unrelated);",
+        ),
+    );
+    rfs::create_dir("stable-ownership-model-b");
+    rustc()
+        .input("stable-ownership-ids.rs")
+        .crate_name("stable_ownership_ids")
+        .output("stable-ownership-ids-b")
+        .arg("-Zborrowck-ownership-model=stable-ownership-model-b")
+        .run();
+    let second = rfs::read_to_string(
+        find_files(Path::new("stable-ownership-model-b"), "json")
+            .first()
+            .expect("second stable-id model"),
+    );
+    assert_eq!(
+        graph_node_id_for_place(&first, "kept"),
+        graph_node_id_for_place(&second, "kept"),
+        "inserting an unrelated binding must not change the stable graph ID"
+    );
+}
+
+fn graph_node_id_for_place(model: &str, place: &str) -> String {
+    let marker = format!(r#""place":"{place}","kind":"binding""#);
+    let marker_start = model.find(&marker).unwrap_or_else(|| panic!("missing {marker}: {model}"));
+    let before = &model[..marker_start];
+    let id_start = before
+        .rfind(r#""id":"#)
+        .unwrap_or_else(|| panic!("missing node id before {marker}: {model}"))
+        + r#""id":"#.len();
+    let id_end =
+        model[id_start..].find('"').map(|offset| id_start + offset).expect("closing node id quote");
+    model[id_start..id_end].to_owned()
+}
+
 fn test_ownership_events() {
     let original = rfs::read_to_string("ownership-events.rs");
     let normal = rustc().input("ownership-events.rs").arg("--error-format=json").run();
@@ -192,7 +312,7 @@ fn test_ownership_events() {
     );
     let model = rfs::read_to_string(&models[0]);
     for field in [
-        r#""schema_version":5"#,
+        r#""schema_version":6"#,
         r#""ownership_bodies":"#,
         r#""ownership_bindings":"#,
         r#""ownership_loans":"#,
@@ -208,6 +328,12 @@ fn test_ownership_events() {
         r#""place":"#,
         r#""loan_id":"#,
         r#""destination":"#,
+        r#""memory_graph":"#,
+        r#""nodes":"#,
+        r#""edges":"#,
+        r#""snapshots":"#,
+        r#""access_paths":"#,
+        r#""physical_placement_note":"#,
     ] {
         assert!(model.contains(field), "missing {field}: {model}");
     }
@@ -218,6 +344,14 @@ fn test_ownership_events() {
     assert!(
         model.contains(r#""kind":"function_argument""#),
         "call-argument moves should preserve their destination role: {model}"
+    );
+    assert!(
+        model.contains(r#""relation":"moved_to""#),
+        "a move between bindings should produce a stable graph edge: {model}"
+    );
+    assert!(
+        model.contains(r#""kind":"move""#) && model.contains(r#""deltas":["#),
+        "ownership events should produce bounded state snapshots: {model}"
     );
 
     // Successful crates emit models too. In particular, formatting nested standard-library types
@@ -234,6 +368,12 @@ fn test_ownership_events() {
     for field in [r#""kind":"rc_allocation""#, r#""kind":"ref_cell_state""#] {
         assert!(success_model.contains(field), "missing {field}: {success_model}");
     }
+    assert!(success_model.contains(r#""kind":"clone""#), "{success_model}");
+    assert_eq!(
+        success_model.matches(r#""kind":"control_block""#).count(),
+        1,
+        "Rc::clone must produce two handles sharing one control block: {success_model}"
+    );
 }
 
 fn test_editor_suggestions(input: &str, suggestions: &[(&str, &str)]) {
