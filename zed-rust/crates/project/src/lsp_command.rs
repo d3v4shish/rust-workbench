@@ -334,7 +334,7 @@ mod rust_workbench_inlay_tests {
     #[test]
     fn unknown_metadata_versions_fall_back_to_normal_other_hints() {
         let future = serde_json::json!({
-            "rustWorkbench": { "version": 3, "category": "drop" }
+            "rustWorkbench": { "version": 4, "category": "drop" }
         });
         assert_eq!(rust_workbench_inlay_kind(Some(&future)), None);
     }
@@ -352,6 +352,25 @@ mod rust_workbench_inlay_tests {
             });
             assert_eq!(rust_workbench_inlay_kind(Some(&value)), Some(expected));
         }
+    }
+
+    #[test]
+    fn version_three_merged_mechanics_uses_the_first_known_segment() {
+        let value = serde_json::json!({
+            "rustWorkbench": {
+                "version": 3,
+                "category": "mechanics",
+                "segments": [
+                    { "category": "future-category", "label": "ignored" },
+                    { "category": "storage", "label": "handle → heap" },
+                    { "category": "wrapper", "label": "Rc → RefCell" }
+                ]
+            }
+        });
+        assert_eq!(
+            rust_workbench_inlay_kind(Some(&value)),
+            Some(InlayHintKind::MechanicsStorage)
+        );
     }
 }
 
@@ -3355,7 +3374,7 @@ impl LspCommand for OnTypeFormatting {
 
 fn rust_workbench_inlay_kind(data: Option<&lsp::LSPAny>) -> Option<InlayHintKind> {
     let metadata = data?.get("rustWorkbench")?;
-    if !matches!(metadata.get("version")?.as_u64()?, 1 | 2) {
+    if !matches!(metadata.get("version")?.as_u64()?, 1 | 2 | 3) {
         return None;
     }
     match metadata.get("category")?.as_str()? {
@@ -3366,6 +3385,21 @@ fn rust_workbench_inlay_kind(data: Option<&lsp::LSPAny>) -> Option<InlayHintKind
             _ => Some(InlayHintKind::OwnershipEstimated),
         },
         "drop" => Some(InlayHintKind::Drop),
+        "layout" => Some(InlayHintKind::MechanicsLayout),
+        "storage" => Some(InlayHintKind::MechanicsStorage),
+        "access" => Some(InlayHintKind::MechanicsAccess),
+        "wrapper" => Some(InlayHintKind::MechanicsWrapper),
+        "mechanics" => metadata
+            .get("segments")?
+            .as_array()?
+            .iter()
+            .find_map(|segment| mechanics_category_kind(segment.get("category")?.as_str()?)),
+        _ => None,
+    }
+}
+
+fn mechanics_category_kind(category: &str) -> Option<InlayHintKind> {
+    match category {
         "layout" => Some(InlayHintKind::MechanicsLayout),
         "storage" => Some(InlayHintKind::MechanicsStorage),
         "access" => Some(InlayHintKind::MechanicsAccess),

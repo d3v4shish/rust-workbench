@@ -1006,8 +1006,8 @@ impl Editor {
 
                 hints_deduplicated
             })
-            .filter(|(hint_id, lsp_hint)| {
-                (inlay_hints.allowed_hint_kinds.contains(&lsp_hint.kind)
+            .filter_map(|(hint_id, mut lsp_hint)| {
+                let enabled = inlay_hints.allowed_hint_kinds.contains(&lsp_hint.kind)
                     || rust_ownership_display.enabled
                         && matches!(
                             lsp_hint.kind,
@@ -1022,16 +1022,21 @@ impl Editor {
                                     | InlayHintKind::MechanicsAccess
                                     | InlayHintKind::MechanicsWrapper
                             )
-                        ))
-                    && rust_workbench_hint_allowed(
+                        );
+                if !enabled
+                    || !prepare_rust_workbench_hint(
                         &rust_ownership_display,
-                        lsp_hint,
+                        &mut lsp_hint,
                         &buffer_snapshot,
                     )
-                    && inlay_hints
+                    || inlay_hints
                         .added_hints
-                        .insert(*hint_id, lsp_hint.kind)
-                        .is_none()
+                        .insert(hint_id, lsp_hint.kind)
+                        .is_some()
+                {
+                    return None;
+                }
+                Some((hint_id, lsp_hint))
             })
             .sorted_by(|(_, a), (_, b)| a.position.cmp(&b.position, &buffer_snapshot))
             .collect::<Vec<_>>();
@@ -1109,6 +1114,75 @@ fn rust_workbench_hint_allowed(
             rust_mechanics_category_allowed(preferences, kind)
         }
     }
+}
+
+fn prepare_rust_workbench_hint(
+    preferences: &RustOwnershipDisplayPreferences,
+    hint: &mut InlayHint,
+    buffer_snapshot: &language::BufferSnapshot,
+) -> bool {
+    let Some(segments) = rust_workbench_mechanics_segments(hint) else {
+        return rust_workbench_hint_allowed(preferences, hint, buffer_snapshot);
+    };
+    if !preferences.enabled {
+        return true;
+    }
+    if preferences.mechanics_mode == RustMechanicsHintMode::Off
+        || !preferences.allows_row(hint.position.to_point(buffer_snapshot).row)
+    {
+        return false;
+    }
+    let visible = visible_rust_mechanics_segments(preferences, segments);
+    let Some((first_kind, _)) = visible.first() else {
+        return false;
+    };
+    hint.kind = Some(*first_kind);
+    hint.label = InlayHintLabel::String(visible.into_iter().map(|(_, label)| label).join(" · "));
+    true
+}
+
+fn rust_workbench_mechanics_segments(hint: &InlayHint) -> Option<Vec<(InlayHintKind, String)>> {
+    let ResolveState::CanResolve(_, Some(data)) = &hint.resolve_state else {
+        return None;
+    };
+    rust_workbench_mechanics_segments_from_data(data)
+}
+
+fn rust_workbench_mechanics_segments_from_data(
+    data: &lsp::LSPAny,
+) -> Option<Vec<(InlayHintKind, String)>> {
+    let metadata = data.get("rustWorkbench")?;
+    if metadata.get("version")?.as_u64()? != 3 || metadata.get("category")?.as_str()? != "mechanics"
+    {
+        return None;
+    }
+    Some(
+        metadata
+            .get("segments")?
+            .as_array()?
+            .iter()
+            .filter_map(|segment| {
+                let kind = match segment.get("category")?.as_str()? {
+                    "layout" => InlayHintKind::MechanicsLayout,
+                    "storage" => InlayHintKind::MechanicsStorage,
+                    "access" => InlayHintKind::MechanicsAccess,
+                    "wrapper" => InlayHintKind::MechanicsWrapper,
+                    _ => return None,
+                };
+                Some((kind, segment.get("label")?.as_str()?.to_owned()))
+            })
+            .collect(),
+    )
+}
+
+fn visible_rust_mechanics_segments(
+    preferences: &RustOwnershipDisplayPreferences,
+    segments: Vec<(InlayHintKind, String)>,
+) -> Vec<(InlayHintKind, String)> {
+    segments
+        .into_iter()
+        .filter(|(kind, _)| rust_mechanics_category_allowed(preferences, *kind))
+        .collect()
 }
 
 fn rust_mechanics_category_allowed(
@@ -1217,7 +1291,10 @@ fn spawn_editor_hints_refresh(
 
 #[cfg(test)]
 pub mod tests {
-    use super::{rust_mechanics_category_allowed, rust_ownership_event_allowed};
+    use super::{
+        rust_mechanics_category_allowed, rust_ownership_event_allowed,
+        rust_workbench_mechanics_segments_from_data, visible_rust_mechanics_segments,
+    };
     use crate::editor_tests::update_test_language_settings;
     use crate::inlays::inlay_hints::InlayHintRefreshReason;
     use crate::scroll::Autoscroll;
@@ -1294,28 +1371,61 @@ pub mod tests {
     }
 
     #[test]
+    fn merged_mechanics_hint_filters_segments_without_parsing_visible_text() {
+        let data = json!({
+            "rustWorkbench": {
+                "version": 3,
+                "category": "mechanics",
+                "segments": [
+                    { "category": "layout", "label": "8 B · align 8" },
+                    { "category": "storage", "label": "handle → heap" },
+                    { "category": "wrapper", "label": "Rc → RefCell" }
+                ]
+            }
+        });
+        let segments = rust_workbench_mechanics_segments_from_data(&data).unwrap();
+        let mut preferences = RustOwnershipDisplayPreferences::learn();
+        preferences.show_layout = false;
+        let visible = visible_rust_mechanics_segments(&preferences, segments);
+        assert_eq!(
+            visible,
+            vec![
+                (InlayHintKind::MechanicsStorage, "handle → heap".to_owned()),
+                (InlayHintKind::MechanicsWrapper, "Rc → RefCell".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn rust_mechanics_visible_range_filter_meets_latency_budget() {
         use std::time::Instant;
 
         let mut preferences = RustOwnershipDisplayPreferences::learn();
         preferences.focus_rows = vec![(10, 90), (120, 145)];
-        let kinds = [
-            InlayHintKind::MechanicsLayout,
-            InlayHintKind::MechanicsStorage,
-            InlayHintKind::MechanicsAccess,
-            InlayHintKind::MechanicsWrapper,
-        ];
+        let merged_data = json!({
+            "rustWorkbench": {
+                "version": 3,
+                "category": "mechanics",
+                "segments": [
+                    { "category": "layout", "label": "8 B · align 8" },
+                    { "category": "storage", "label": "handle → heap" },
+                    { "category": "access", "label": "borrow_mut → RefMut<Vec<i32>>" },
+                    { "category": "wrapper", "label": "Rc → RefCell → Vec" }
+                ]
+            }
+        });
         let mut samples = Vec::with_capacity(200);
         let mut kept = 0usize;
         for _ in 0..200 {
             let started = Instant::now();
             for index in 0..128u32 {
-                let allowed = preferences.allows_row(index)
-                    && rust_mechanics_category_allowed(
-                        &preferences,
-                        kinds[index as usize % kinds.len()],
+                if preferences.allows_row(index) {
+                    let segments =
+                        rust_workbench_mechanics_segments_from_data(&merged_data).unwrap();
+                    kept += std::hint::black_box(
+                        visible_rust_mechanics_segments(&preferences, segments).len(),
                     );
-                kept += usize::from(std::hint::black_box(allowed));
+                }
             }
             samples.push(started.elapsed().as_nanos());
         }
@@ -1327,7 +1437,7 @@ pub mod tests {
             "visible-range mechanics filtering p95 was {p95_ns} ns"
         );
         eprintln!(
-            "RUST_WORKBENCH_INLINE_BENCHMARK={{\"schemaVersion\":1,\"visibleRangeFilterP95Ns\":{p95_ns},\"hintsPerBatch\":128}}"
+            "RUST_WORKBENCH_INLINE_BENCHMARK={{\"schemaVersion\":2,\"visibleRangeFilterP95Ns\":{p95_ns},\"hintsPerBatch\":128}}"
         );
     }
     use text::{OffsetRangeExt, Point};

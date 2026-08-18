@@ -4497,7 +4497,16 @@ fn ownership_mechanics_hints(
     categories: OwnershipMechanicsCategories,
 ) -> Vec<InlayHint> {
     const MAX_MECHANICS_HINTS: usize = 128;
-    let mut result = Vec::new();
+    #[derive(Debug)]
+    struct MechanicsPart {
+        category: &'static str,
+        label: String,
+        tooltip: String,
+        binding_id: Option<String>,
+        graph_node_id: Option<String>,
+    }
+
+    let mut grouped: Vec<(Position, Vec<MechanicsPart>)> = Vec::new();
     let target_triple = if tutorial.target_triple.is_empty() {
         "unknown target".to_owned()
     } else {
@@ -4509,36 +4518,17 @@ fn ownership_mechanics_hints(
                     tooltip: String,
                     binding_id: Option<String>,
                     graph_node_id: Option<String>| {
-        if result.len() >= MAX_MECHANICS_HINTS {
-            return;
+        let part = MechanicsPart { category, label, tooltip, binding_id, graph_node_id };
+        if let Some((_, parts)) = grouped.iter_mut().find(|(anchor, _)| *anchor == position) {
+            if !parts
+                .iter()
+                .any(|existing| existing.category == part.category && existing.label == part.label)
+            {
+                parts.push(part);
+            }
+        } else if grouped.len() < MAX_MECHANICS_HINTS {
+            grouped.push((position, vec![part]));
         }
-        result.push(InlayHint {
-            position,
-            label: lsp_types::Label::String(label),
-            kind: None,
-            text_edits: None,
-            // Keep detailed mechanics prose out of the hot visible-range
-            // response. Clients request it through inlayHint/resolve only when
-            // the learner actually hovers the clue.
-            tooltip: None,
-            padding_left: Some(true),
-            padding_right: Some(false),
-            data: Some(json!({
-                "rustWorkbench": {
-                    "version": 2,
-                    "category": category,
-                    "precision": "compiler_exact",
-                    "problemId": null,
-                    "bindingId": binding_id,
-                    "graphNodeId": graph_node_id,
-                    "focusRange": {
-                        "start": position,
-                        "end": position,
-                    },
-                },
-                "rustWorkbenchTooltip": tooltip,
-            })),
-        });
     };
 
     for binding in tutorial
@@ -4664,7 +4654,49 @@ fn ownership_mechanics_hints(
             );
         }
     }
-    result
+    grouped
+        .into_iter()
+        .map(|(position, parts)| {
+            let label = parts.iter().map(|part| part.label.as_str()).join(" · ");
+            let tooltip = parts.iter().map(|part| part.tooltip.as_str()).join("\n\n---\n\n");
+            let categories = parts.iter().map(|part| part.category).collect::<Vec<_>>();
+            let segments = parts
+                .iter()
+                .map(|part| json!({ "category": part.category, "label": part.label }))
+                .collect::<Vec<_>>();
+            let binding_id = parts.iter().find_map(|part| part.binding_id.as_deref());
+            let graph_node_id = parts.iter().find_map(|part| part.graph_node_id.as_deref());
+            InlayHint {
+                position,
+                label: lsp_types::Label::String(label),
+                kind: None,
+                text_edits: None,
+                // Keep detailed mechanics prose out of the hot visible-range
+                // response. Clients request it through inlayHint/resolve only
+                // when the learner actually hovers the merged clue.
+                tooltip: None,
+                padding_left: Some(true),
+                padding_right: Some(false),
+                data: Some(json!({
+                    "rustWorkbench": {
+                        "version": 3,
+                        "category": "mechanics",
+                        "categories": categories,
+                        "segments": segments,
+                        "precision": "compiler_exact",
+                        "problemId": null,
+                        "bindingId": binding_id,
+                        "graphNodeId": graph_node_id,
+                        "focusRange": {
+                            "start": position,
+                            "end": position,
+                        },
+                    },
+                    "rustWorkbenchTooltip": tooltip,
+                })),
+            }
+        })
+        .collect()
 }
 
 fn lsp_ranges_overlap(left: Range, right: Range) -> bool {
@@ -6461,15 +6493,20 @@ fn ownership_mechanics_hints_are_bounded_and_semantically_categorized() {
         Range::new(Position::new(0, 0), Position::new(10, 0)),
         OwnershipMechanicsCategories { layout: true, storage: true, access: true, wrapper: true },
     );
-    let categories = hints
+    assert_eq!(hints.len(), 1, "all mechanics at one source anchor must merge");
+    let metadata = &hints[0].data.as_ref().unwrap()["rustWorkbench"];
+    assert_eq!(metadata["version"], 3);
+    assert_eq!(metadata["category"], "mechanics");
+    let categories = metadata["categories"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter_map(|hint| hint.data.as_ref())
-        .filter_map(|data| data["rustWorkbench"]["category"].as_str())
+        .filter_map(|category| category.as_str())
         .collect::<FxHashSet<_>>();
     assert!(categories.contains("layout"));
     assert!(categories.contains("storage"));
     assert!(categories.contains("wrapper"));
-    assert!(hints.iter().all(|hint| hint.data.as_ref().unwrap()["rustWorkbench"]["version"] == 2));
+    assert_eq!(metadata["segments"].as_array().unwrap().len(), 3);
     assert!(hints.iter().all(|hint| hint.tooltip.is_none()));
     assert!(hints.iter().all(|hint| {
         hint.data.as_ref().unwrap()["rustWorkbenchTooltip"]
@@ -6489,7 +6526,10 @@ fn ownership_mechanics_hints_are_bounded_and_semantically_categorized() {
         },
     );
     assert_eq!(layout_only.len(), 1);
-    assert_eq!(layout_only[0].data.as_ref().unwrap()["rustWorkbench"]["category"], "layout");
+    assert_eq!(
+        layout_only[0].data.as_ref().unwrap()["rustWorkbench"]["categories"],
+        serde_json::json!(["layout"])
+    );
 }
 
 #[test]
