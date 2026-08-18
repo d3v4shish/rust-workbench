@@ -784,6 +784,22 @@ config_data! {
         /// after a check; rust-analyzer keeps showing conservative estimates while editing.
         ownership_enable: bool = false,
 
+        /// Show compact compiler-backed type-mechanics inlay clues. Disabled by default so stock
+        /// clients do not gain extra visual noise unless they opt in.
+        ownership_mechanics_enable: bool = false,
+
+        /// Show size/alignment mechanics clues.
+        ownership_mechanics_layout: bool = true,
+
+        /// Show local-handle versus allocation/storage mechanics clues.
+        ownership_mechanics_storage: bool = true,
+
+        /// Show dereference, borrow, lock, and extraction access-path clues.
+        ownership_mechanics_access: bool = true,
+
+        /// Show wrapper/gate composition clues.
+        ownership_mechanics_wrappers: bool = true,
+
         /// Whether to warn when a rename will cause conflicts (change the meaning of the code).
         rename_showConflicts: bool = true,
     }
@@ -1888,6 +1904,24 @@ impl Config {
 
     pub(crate) fn ownership_enabled(&self, source_root: Option<SourceRootId>) -> bool {
         *self.ownership_enable(source_root)
+    }
+
+    pub(crate) fn ownership_mechanics_enabled(&self, source_root: Option<SourceRootId>) -> bool {
+        *self.ownership_enable(source_root) && *self.ownership_mechanics_enable(source_root)
+    }
+
+    pub(crate) fn ownership_mechanics_category_enabled(
+        &self,
+        source_root: Option<SourceRootId>,
+        category: &str,
+    ) -> bool {
+        match category {
+            "layout" => *self.ownership_mechanics_layout(source_root),
+            "storage" => *self.ownership_mechanics_storage(source_root),
+            "access" => *self.ownership_mechanics_access(source_root),
+            "wrapper" => *self.ownership_mechanics_wrappers(source_root),
+            _ => false,
+        }
     }
 
     pub fn rename(&self, source_root: Option<SourceRootId>) -> RenameConfig {
@@ -4477,6 +4511,27 @@ mod tests {
                 ..
             }
         ));
+        assert!(!config.ownership_mechanics_enabled(None));
+
+        let mut change = ConfigChange::default();
+        change.change_client_config(serde_json::json!({
+            "ownership": {
+                "enable": true,
+                "mechanics": {
+                    "enable": true,
+                    "layout": false,
+                    "storage": true,
+                    "access": true,
+                    "wrappers": false
+                }
+            }
+        }));
+        (config, _, _) = config.apply_change(change);
+        assert!(config.ownership_mechanics_enabled(None));
+        assert!(!config.ownership_mechanics_category_enabled(None, "layout"));
+        assert!(config.ownership_mechanics_category_enabled(None, "storage"));
+        assert!(config.ownership_mechanics_category_enabled(None, "access"));
+        assert!(!config.ownership_mechanics_category_enabled(None, "wrapper"));
     }
 
     #[test]

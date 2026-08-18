@@ -1478,6 +1478,10 @@ pub(crate) fn handle_ownership_model(
     const MAX_INTERACTIVE_BLOCKS: usize = 512;
     const MAX_INTERACTIVE_BINDINGS: usize = 64;
     const MAX_INTERACTIVE_LOANS: usize = 64;
+    const MAX_INTERACTIVE_MEMORY_NODES: usize = 128;
+    const MAX_INTERACTIVE_MEMORY_EDGES: usize = 256;
+    const MAX_INTERACTIVE_SNAPSHOTS: usize = 256;
+    const MAX_INTERACTIVE_ACCESS_PATHS: usize = 64;
     let mut events = all_events
         .iter()
         .filter(|event| {
@@ -1540,6 +1544,7 @@ pub(crate) fn handle_ownership_model(
                     "candidate".to_owned()
                 },
                 effects: ownership_language_repair_effects(&fix.action.title),
+                preview_graph: None,
             })
         })
         .collect::<Vec<_>>();
@@ -1558,6 +1563,12 @@ pub(crate) fn handle_ownership_model(
             compiler_validated: true,
             validation_state: "validated".to_owned(),
             effects: ownership_repair_effects(strategy),
+            preview_graph: ownership_repair_preview_graph(
+                strategy,
+                selected_name.as_deref().unwrap_or("value"),
+                request_range,
+                true,
+            ),
         })
     }));
     // A diagnostic often points at a later, invalid use while the assist must be
@@ -1624,6 +1635,12 @@ pub(crate) fn handle_ownership_model(
             compiler_validated: false,
             validation_state: "candidate".to_owned(),
             effects: ownership_repair_effects(strategy),
+            preview_graph: ownership_repair_preview_graph(
+                strategy,
+                selected_name.as_deref().unwrap_or("value"),
+                request_range,
+                false,
+            ),
         });
     }
     let exact_events = events.iter().any(|event| {
@@ -1722,7 +1739,221 @@ pub(crate) fn handle_ownership_model(
         .take(MAX_INTERACTIVE_LOANS)
         .map(ownership_loan_to_lsp)
         .collect::<Vec<_>>();
-    let has_tutorial_facts = !bodies.is_empty() || !bindings.is_empty() || !loans.is_empty();
+    // Start at the exact selected place, then retain its bounded connected component. Filtering
+    // every node by the selected spelling used to discard move destinations and sibling Rc/Arc
+    // handles, leaving the editor with a misleading one-node picture.
+    let mut relevant_memory_node_ids = tutorial
+        .memory_graph
+        .nodes
+        .iter()
+        .filter(|node| selected_body_id.is_none_or(|body_id| node.node.body_id == body_id))
+        .filter(|node| {
+            selected_name.as_deref().is_none_or(|name| {
+                ownership_name_refers_to_binding(name, &node.node.place)
+                    || ownership_name_refers_to_binding(&node.node.place, name)
+            })
+        })
+        .map(|node| node.node.id.clone())
+        .collect::<FxHashSet<_>>();
+    if selected_name.is_none() {
+        relevant_memory_node_ids.extend(
+            tutorial
+                .memory_graph
+                .nodes
+                .iter()
+                .filter(|node| selected_body_id.is_none_or(|body_id| node.node.body_id == body_id))
+                .map(|node| node.node.id.clone()),
+        );
+    } else {
+        for _ in 0..12 {
+            let before = relevant_memory_node_ids.len();
+            for edge in &tutorial.memory_graph.edges {
+                if relevant_memory_node_ids.contains(&edge.edge.source) {
+                    relevant_memory_node_ids.insert(edge.edge.target.clone());
+                }
+                if relevant_memory_node_ids.contains(&edge.edge.target) {
+                    relevant_memory_node_ids.insert(edge.edge.source.clone());
+                }
+            }
+            if relevant_memory_node_ids.len() == before {
+                break;
+            }
+        }
+    }
+    let memory_node_matches = |node: &crate::diagnostics::OwnershipTutorialMemoryNode| {
+        selected_body_id.is_none_or(|body_id| node.node.body_id == body_id)
+            && relevant_memory_node_ids.contains(&node.node.id)
+    };
+    let matching_memory_node_count =
+        tutorial.memory_graph.nodes.iter().filter(|node| memory_node_matches(node)).count();
+    response_truncated |= matching_memory_node_count > MAX_INTERACTIVE_MEMORY_NODES;
+    let memory_nodes = tutorial
+        .memory_graph
+        .nodes
+        .iter()
+        .filter(|node| memory_node_matches(node))
+        .take(MAX_INTERACTIVE_MEMORY_NODES)
+        .map(|tutorial_node| {
+            let node = &tutorial_node.node;
+            lsp_ext::OwnershipModelMemoryNode {
+                id: node.id.clone(),
+                body_id: node.body_id,
+                place: node.place.clone(),
+                kind: node.kind.clone(),
+                storage: node.storage.clone(),
+                label: node.label.clone(),
+                type_name: node.type_name.clone(),
+                size: node.size,
+                align: node.align,
+                range: tutorial_node.range,
+                state: ownership_state_code(node.state).to_owned(),
+                provenance: node.provenance.clone(),
+                physical_placement_note: node.physical_placement_note.clone(),
+                truncated: node.truncated,
+            }
+        })
+        .collect::<Vec<_>>();
+    let memory_node_is_present = |id: &str| memory_nodes.iter().any(|node| node.id == id);
+    let matching_memory_edge_count = tutorial
+        .memory_graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            memory_node_is_present(&edge.edge.source) && memory_node_is_present(&edge.edge.target)
+        })
+        .count();
+    response_truncated |= matching_memory_edge_count > MAX_INTERACTIVE_MEMORY_EDGES;
+    let memory_edges = tutorial
+        .memory_graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            memory_node_is_present(&edge.edge.source) && memory_node_is_present(&edge.edge.target)
+        })
+        .take(MAX_INTERACTIVE_MEMORY_EDGES)
+        .map(|tutorial_edge| {
+            let edge = &tutorial_edge.edge;
+            lsp_ext::OwnershipModelMemoryEdge {
+                id: edge.id.clone(),
+                source: edge.source.clone(),
+                target: edge.target.clone(),
+                relation: edge.relation.clone(),
+                event_id: edge.event_id.clone(),
+                loan_id: edge.loan_id,
+                range: tutorial_edge.range.or_else(|| {
+                    edge.event_id
+                        .as_deref()
+                        .and_then(|event_id| events.iter().find(|event| event.event_id == event_id))
+                        .map(|event| event.range)
+                }),
+                provenance: edge.provenance.clone(),
+                path_marker: edge.path_marker.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let matching_snapshot_count = tutorial
+        .memory_graph
+        .snapshots
+        .iter()
+        .filter(|snapshot| {
+            selected_body_id.is_none_or(|body_id| snapshot.snapshot.body_id == body_id)
+                && selected_name.as_deref().is_none_or(|name| {
+                    ownership_name_refers_to_binding(name, &snapshot.snapshot.place)
+                        || ownership_name_refers_to_binding(&snapshot.snapshot.place, name)
+                })
+        })
+        .count();
+    response_truncated |= matching_snapshot_count > MAX_INTERACTIVE_SNAPSHOTS;
+    let memory_snapshots = tutorial
+        .memory_graph
+        .snapshots
+        .iter()
+        .filter(|snapshot| {
+            selected_body_id.is_none_or(|body_id| snapshot.snapshot.body_id == body_id)
+                && selected_name.as_deref().is_none_or(|name| {
+                    ownership_name_refers_to_binding(name, &snapshot.snapshot.place)
+                        || ownership_name_refers_to_binding(&snapshot.snapshot.place, name)
+                })
+        })
+        .take(MAX_INTERACTIVE_SNAPSHOTS)
+        .map(|tutorial_snapshot| {
+            let snapshot = &tutorial_snapshot.snapshot;
+            lsp_ext::OwnershipModelSnapshot {
+                id: snapshot.id.clone(),
+                event_id: snapshot.event_id.clone(),
+                body_id: snapshot.body_id,
+                basic_block: snapshot.basic_block,
+                statement_index: snapshot.statement_index,
+                kind: snapshot.kind.clone(),
+                range: tutorial_snapshot.range,
+                place: snapshot.place.clone(),
+                loan_id: snapshot.loan_id,
+                path_marker: snapshot.path_marker.clone(),
+                deltas: snapshot
+                    .deltas
+                    .iter()
+                    .map(|delta| lsp_ext::OwnershipModelStateDelta {
+                        node_id: delta.node_id.clone(),
+                        from: delta.from.map(|state| ownership_state_code(state).to_owned()),
+                        to: ownership_state_code(delta.to).to_owned(),
+                        relation_added: delta.relation_added.clone(),
+                        relation_removed: delta.relation_removed.clone(),
+                    })
+                    .collect(),
+                provenance: snapshot.provenance.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let matching_access_path_count = tutorial
+        .memory_graph
+        .access_paths
+        .iter()
+        .filter(|path| memory_node_is_present(&path.node_id))
+        .count();
+    response_truncated |= matching_access_path_count > MAX_INTERACTIVE_ACCESS_PATHS;
+    let access_paths = tutorial
+        .memory_graph
+        .access_paths
+        .iter()
+        .filter(|path| memory_node_is_present(&path.node_id))
+        .take(MAX_INTERACTIVE_ACCESS_PATHS)
+        .map(|path| lsp_ext::OwnershipModelAccessPath {
+            id: path.id.clone(),
+            body_id: path.body_id,
+            node_id: path.node_id.clone(),
+            place: path.place.clone(),
+            purpose: path.purpose.clone(),
+            steps: path
+                .steps
+                .iter()
+                .map(|step| lsp_ext::OwnershipModelAccessStep {
+                    kind: step.kind.clone(),
+                    starting_type: step.starting_type.clone(),
+                    result_type: step.result_type.clone(),
+                    mutability: step.mutability.clone(),
+                    explicitness: step.explicitness.clone(),
+                    fallible: step.fallible,
+                    may_panic: step.may_panic,
+                    requires_unsafe: step.requires_unsafe,
+                    explanation: step.explanation.clone(),
+                    provenance: step.provenance.clone(),
+                })
+                .collect(),
+            provenance: path.provenance.clone(),
+        })
+        .collect::<Vec<_>>();
+    response_truncated |= tutorial.memory_graph.truncated;
+    let memory_graph = lsp_ext::OwnershipModelMemoryGraph {
+        nodes: memory_nodes,
+        edges: memory_edges,
+        snapshots: memory_snapshots,
+        access_paths,
+        truncated: tutorial.memory_graph.truncated,
+    };
+    let has_tutorial_facts = !bodies.is_empty()
+        || !bindings.is_empty()
+        || !loans.is_empty()
+        || !memory_graph.nodes.is_empty();
     let exact = exact_events || (tutorial.schema_version >= 3 && has_tutorial_facts);
     let c_sketch = ownership_c_sketch(selected_name.as_deref(), &bindings, &events, &repairs);
     // Explain every resolved call which appears on the selected ownership flow, not merely the
@@ -1832,7 +2063,8 @@ pub(crate) fn handle_ownership_model(
         .unwrap_or_else(|| ownership_value_trace(&events, &operations));
 
     Ok(lsp_ext::OwnershipModelResult {
-        schema_version: tutorial.schema_version.max(11),
+        schema_version: tutorial.schema_version.max(12),
+        target_triple: tutorial.target_triple.clone(),
         precision: if exact { "compiler_exact" } else { "estimated" }.to_owned(),
         status: if events.is_empty() && !has_tutorial_facts && selected_diagnostic.is_none() {
             "waiting_for_compiler"
@@ -1860,6 +2092,7 @@ pub(crate) fn handle_ownership_model(
         bodies,
         bindings,
         loans,
+        memory_graph,
         operations,
         mutation_requirement,
         conflict_graph,
@@ -2913,6 +3146,118 @@ fn ownership_repair_effects(strategy: OwnershipWrapperFix) -> lsp_ext::Ownership
     }
 }
 
+fn ownership_repair_preview_graph(
+    strategy: OwnershipWrapperFix,
+    place: &str,
+    range: Range,
+    compiler_validated: bool,
+) -> Option<lsp_ext::OwnershipModelMemoryGraph> {
+    if matches!(strategy, OwnershipWrapperFix::All) {
+        return None;
+    }
+    let provenance = if compiler_validated {
+        "derived_from_compiler_validated_rewrite"
+    } else {
+        "conceptual_candidate"
+    };
+    let node = |id: &str,
+                label: String,
+                type_name: String,
+                kind: &str,
+                storage: &str|
+     -> lsp_ext::OwnershipModelMemoryNode {
+        lsp_ext::OwnershipModelMemoryNode {
+            id: format!("preview-{id}"),
+            body_id: 0,
+            place: place.to_owned(),
+            kind: kind.to_owned(),
+            storage: storage.to_owned(),
+            label,
+            type_name,
+            size: None,
+            align: None,
+            range: Some(range),
+            state: "available_after_rewrite".to_owned(),
+            provenance: provenance.to_owned(),
+            physical_placement_note: "Counterfactual source-level topology; runtime addresses, counts, and lock/borrow state remain unknown."
+                .to_owned(),
+            truncated: false,
+        }
+    };
+    let edge =
+        |id: &str, source: &str, target: &str, relation: &str| lsp_ext::OwnershipModelMemoryEdge {
+            id: format!("preview-{id}"),
+            source: format!("preview-{source}"),
+            target: format!("preview-{target}"),
+            relation: relation.to_owned(),
+            event_id: None,
+            loan_id: None,
+            range: Some(range),
+            provenance: provenance.to_owned(),
+            path_marker: Some("counterfactual_rewrite".to_owned()),
+        };
+    let (handle_type, shared, gate) = match strategy {
+        OwnershipWrapperFix::Rc => ("Rc<T>", true, None),
+        OwnershipWrapperFix::Arc => ("Arc<T>", true, None),
+        OwnershipWrapperFix::RefCell => ("RefCell<T>", false, Some("runtime borrow flag")),
+        OwnershipWrapperFix::Mutex => ("Mutex<T>", false, Some("exclusive lock gate")),
+        OwnershipWrapperFix::RwLock => ("RwLock<T>", false, Some("reader/writer lock gate")),
+        OwnershipWrapperFix::RcRefCell => ("Rc<RefCell<T>>", true, Some("runtime borrow flag")),
+        OwnershipWrapperFix::ArcMutex => ("Arc<Mutex<T>>", true, Some("exclusive lock gate")),
+        OwnershipWrapperFix::ArcRwLock => ("Arc<RwLock<T>>", true, Some("reader/writer lock gate")),
+        OwnershipWrapperFix::All => unreachable!(),
+    };
+    let mut nodes = vec![node(
+        "handle",
+        format!("rewritten `{place}`"),
+        handle_type.to_owned(),
+        "binding",
+        "stack",
+    )];
+    let mut edges = Vec::new();
+    let parent = if shared {
+        nodes.push(node(
+            "allocation",
+            "shared control block and allocation".to_owned(),
+            "shared allocation; count is symbolic".to_owned(),
+            "control_block",
+            "heap",
+        ));
+        edges.push(edge("shares", "handle", "allocation", "shares_allocation"));
+        "allocation"
+    } else {
+        "handle"
+    };
+    let parent = if let Some(gate) = gate {
+        nodes.push(node(
+            "gate",
+            gate.to_owned(),
+            "runtime access state is not sampled".to_owned(),
+            if gate.contains("lock") { "lock_state" } else { "borrow_flag" },
+            "inline",
+        ));
+        edges.push(edge("gate", parent, "gate", "guards_access"));
+        "gate"
+    } else {
+        parent
+    };
+    nodes.push(node(
+        "value",
+        "inner value".to_owned(),
+        "T".to_owned(),
+        "inline_value",
+        if shared { "heap" } else { "inline" },
+    ));
+    edges.push(edge("value", parent, "value", "contains"));
+    Some(lsp_ext::OwnershipModelMemoryGraph {
+        nodes,
+        edges,
+        snapshots: Vec::new(),
+        access_paths: Vec::new(),
+        truncated: false,
+    })
+}
+
 fn ownership_c_sketch(
     selected_name: Option<&str>,
     bindings: &[lsp_ext::OwnershipModelBinding],
@@ -2957,6 +3302,7 @@ fn ownership_kind_code(kind: crate::diagnostics::OwnershipEventKind) -> &'static
         OwnershipEventKind::BorrowEnd => "borrow_end",
         OwnershipEventKind::BorrowMutable => "borrow_mutable",
         OwnershipEventKind::BorrowShared => "borrow_shared",
+        OwnershipEventKind::Clone => "clone",
         OwnershipEventKind::Copy => "copy",
         OwnershipEventKind::Drop => "drop",
         OwnershipEventKind::InvalidUse => "invalid_use",
@@ -2998,6 +3344,7 @@ fn ownership_value_trace(
             event.kind.as_str(),
             "move"
                 | "partial_move"
+                | "clone"
                 | "copy"
                 | "borrow_shared"
                 | "borrow_mutable"
@@ -3040,6 +3387,15 @@ fn ownership_value_trace(
                 "Copy duplicates the value representation; it does not create shared ownership.",
                 format!(
                     "`{}` implements Copy, so using it leaves the source available.",
+                    event.place
+                ),
+            ),
+            "clone" => (
+                "still available as one shared owner",
+                Some("new handle to the same allocation"),
+                "Clone duplicates the Rc/Arc handle and increments its symbolic strong count; the inner allocation is shared, not copied.",
+                format!(
+                    "`{}` remains usable while the destination becomes another owner of the same allocation.",
                     event.place
                 ),
             ),
@@ -4107,8 +4463,208 @@ pub(crate) fn handle_inlay_hints(
             })),
         });
     }
+    if snap.config.ownership_mechanics_enabled(None) {
+        let tutorial = crate::diagnostics::ownership_tutorial_for_file(
+            &snap.ownership_tutorial_models,
+            file_id,
+        );
+        hints.extend(ownership_mechanics_hints(
+            &tutorial,
+            requested_lsp_range,
+            OwnershipMechanicsCategories {
+                layout: snap.config.ownership_mechanics_category_enabled(None, "layout"),
+                storage: snap.config.ownership_mechanics_category_enabled(None, "storage"),
+                access: snap.config.ownership_mechanics_category_enabled(None, "access"),
+                wrapper: snap.config.ownership_mechanics_category_enabled(None, "wrapper"),
+            },
+        ));
+    }
     hints.sort_by_key(|hint| hint.position);
     Ok(Some(hints))
+}
+
+#[derive(Clone, Copy)]
+struct OwnershipMechanicsCategories {
+    layout: bool,
+    storage: bool,
+    access: bool,
+    wrapper: bool,
+}
+
+fn ownership_mechanics_hints(
+    tutorial: &crate::diagnostics::OwnershipTutorialModel,
+    requested_range: Range,
+    categories: OwnershipMechanicsCategories,
+) -> Vec<InlayHint> {
+    const MAX_MECHANICS_HINTS: usize = 128;
+    let mut result = Vec::new();
+    let target_triple = if tutorial.target_triple.is_empty() {
+        "unknown target".to_owned()
+    } else {
+        tutorial.target_triple.clone()
+    };
+    let mut push = |position: Position,
+                    category: &'static str,
+                    label: String,
+                    tooltip: String,
+                    binding_id: Option<String>,
+                    graph_node_id: Option<String>| {
+        if result.len() >= MAX_MECHANICS_HINTS {
+            return;
+        }
+        result.push(InlayHint {
+            position,
+            label: lsp_types::Label::String(label),
+            kind: None,
+            text_edits: None,
+            // Keep detailed mechanics prose out of the hot visible-range
+            // response. Clients request it through inlayHint/resolve only when
+            // the learner actually hovers the clue.
+            tooltip: None,
+            padding_left: Some(true),
+            padding_right: Some(false),
+            data: Some(json!({
+                "rustWorkbench": {
+                    "version": 2,
+                    "category": category,
+                    "precision": "compiler_exact",
+                    "problemId": null,
+                    "bindingId": binding_id,
+                    "graphNodeId": graph_node_id,
+                    "focusRange": {
+                        "start": position,
+                        "end": position,
+                    },
+                },
+                "rustWorkbenchTooltip": tooltip,
+            })),
+        });
+    };
+
+    for binding in tutorial
+        .bindings
+        .iter()
+        .filter(|binding| lsp_ranges_overlap(binding.range, requested_range))
+    {
+        let binding_id = format!("{:016x}-{}", binding.body_id, binding.name);
+        if categories.layout
+            && let (Some(size), Some(align)) = (binding.size, binding.align)
+        {
+            let inline = binding.memory_layers.iter().all(|layer| layer.storage != "heap");
+            push(
+                binding.range.end,
+                "layout",
+                format!("{size} B · align {align} · {}", if inline { "inline" } else { "handle" }),
+                format!(
+                    "**Layout of `{}`**\n\n- Type: `{}`\n- Handle/value size: **{size} bytes**\n- Alignment: **{align} bytes**\n- Target: `{target_triple}`\n- Precision: **compiler exact target layout**\n\nRuntime allocation sizes are kept separate.",
+                    binding.name, binding.type_name,
+                ),
+                Some(binding_id.clone()),
+                None,
+            );
+        }
+        let heap_layers = binding
+            .memory_layers
+            .iter()
+            .filter(|layer| layer.storage == "heap")
+            .map(|layer| layer.label.as_str())
+            .unique()
+            .take(2)
+            .join(" + ");
+        if categories.storage && !heap_layers.is_empty() {
+            push(
+                binding.range.end,
+                "storage",
+                format!("handle → {heap_layers}"),
+                format!(
+                    "**Storage reached from `{}`**\n\n`{}` is the local handle. It reaches **{heap_layers}**. Moving the handle does not copy the allocation. Runtime addresses, lengths, capacities, and reference counts are unknown.",
+                    binding.name, binding.type_name
+                ),
+                Some(binding_id.clone()),
+                None,
+            );
+        }
+        let wrappers = binding
+            .memory_layers
+            .iter()
+            .filter(|layer| layer.kind != "stack_binding")
+            .map(|layer| layer.kind.replace('_', " "))
+            .unique()
+            .take(3)
+            .join(" → ");
+        if categories.wrapper && !wrappers.is_empty() {
+            push(
+                binding.range.end,
+                "wrapper",
+                wrappers.clone(),
+                format!(
+                    "**Wrapper route for `{}`**\n\n`{}`\n\n{wrappers}\n\nThis is a source-level ownership model, not a sampled runtime memory address or counter.",
+                    binding.name, binding.type_name
+                ),
+                Some(binding_id),
+                None,
+            );
+        }
+    }
+
+    if categories.access {
+        for path in tutorial.memory_graph.access_paths.iter().take(MAX_MECHANICS_HINTS) {
+            let Some(node) =
+                tutorial.memory_graph.nodes.iter().find(|node| node.node.id == path.node_id)
+            else {
+                continue;
+            };
+            let Some(range) = node.range else { continue };
+            if !lsp_ranges_overlap(range, requested_range) || path.steps.is_empty() {
+                continue;
+            }
+            let label = path
+                .steps
+                .iter()
+                .map(|step| format!("{} → {}", step.kind.replace('_', " "), step.result_type))
+                .take(2)
+                .join(" · ");
+            let details = path
+                .steps
+                .iter()
+                .map(|step| {
+                    let mut constraints = Vec::new();
+                    if step.fallible {
+                        constraints.push("fallible");
+                    }
+                    if step.may_panic {
+                        constraints.push("may panic");
+                    }
+                    if step.requires_unsafe {
+                        constraints.push("requires unsafe");
+                    }
+                    format!(
+                        "- `{}` → `{}` via **{}** ({}, {}{}) — {}",
+                        step.starting_type,
+                        step.result_type,
+                        step.kind.replace('_', " "),
+                        step.mutability.replace('_', " "),
+                        step.explicitness.replace('_', " "),
+                        if constraints.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", constraints.join(", "))
+                        },
+                        step.explanation
+                    )
+                })
+                .join("\n");
+            push(
+                range.end,
+                "access",
+                label,
+                format!("**How `{}` becomes usable**\n\n{details}", path.place),
+                None,
+                Some(path.node_id.clone()),
+            );
+        }
+    }
+    result
 }
 
 fn lsp_ranges_overlap(left: Range, right: Range) -> bool {
@@ -4124,6 +4680,14 @@ pub(crate) fn handle_inlay_hints_resolve(
     let Some(data) = original_hint.data.take() else {
         return Ok(original_hint);
     };
+    if let Some(tooltip) = data.get("rustWorkbenchTooltip").and_then(|value| value.as_str()) {
+        original_hint.tooltip = Some(lsp_types::Tooltip::MarkupContent(lsp_types::MarkupContent {
+            kind: lsp_types::MarkupKind::Markdown,
+            value: tooltip.to_owned(),
+        }));
+        original_hint.data = Some(data);
+        return Ok(original_hint);
+    }
     if rust_workbench_metadata_only_inlay_data(&data) {
         original_hint.data = Some(data);
         return Ok(original_hint);
@@ -5563,6 +6127,7 @@ fn borrow_conflict_trace_keeps_borrower_referent_and_owner_distinct() {
 fn bounded_ownership_model_protocol_marks_large_responses() {
     let model = lsp_ext::OwnershipModelResult {
         schema_version: 5,
+        target_triple: "x86_64-unknown-linux-gnu".to_owned(),
         precision: "compiler_exact".to_owned(),
         status: "ready".to_owned(),
         truncated: true,
@@ -5575,6 +6140,7 @@ fn bounded_ownership_model_protocol_marks_large_responses() {
         bodies: Vec::new(),
         bindings: Vec::new(),
         loans: Vec::new(),
+        memory_graph: lsp_ext::OwnershipModelMemoryGraph::default(),
         operations: vec![lsp_ext::OwnershipOperationInsight {
             id: "operation-0".to_owned(),
             range: Range::new(Position::new(2, 4), Position::new(2, 18)),
@@ -5864,6 +6430,89 @@ fn ownership_metadata_only_inlay_data_does_not_require_resolution() {
         "rustWorkbench": { "version": 1, "category": "lifetime" }
     });
     assert!(!rust_workbench_metadata_only_inlay_data(&resolvable));
+}
+
+#[test]
+fn ownership_mechanics_hints_are_bounded_and_semantically_categorized() {
+    let range = Range::new(Position::new(1, 8), Position::new(1, 14));
+    let tutorial = crate::diagnostics::OwnershipTutorialModel {
+        schema_version: 6,
+        bindings: vec![crate::diagnostics::OwnershipTutorialBinding {
+            body_id: 7,
+            name: "values".to_owned(),
+            range,
+            type_name: "Box<Vec<i32>>".to_owned(),
+            size: Some(8),
+            align: Some(8),
+            memory_layers: vec![crate::diagnostics::OwnershipModelMemoryLayer {
+                kind: "box_allocation".to_owned(),
+                storage: "heap".to_owned(),
+                label: "Box allocation".to_owned(),
+                type_name: "Vec<i32>".to_owned(),
+                size: Some(24),
+                align: Some(8),
+                provenance: "compiler_exact".to_owned(),
+            }],
+        }],
+        ..Default::default()
+    };
+    let hints = ownership_mechanics_hints(
+        &tutorial,
+        Range::new(Position::new(0, 0), Position::new(10, 0)),
+        OwnershipMechanicsCategories { layout: true, storage: true, access: true, wrapper: true },
+    );
+    let categories = hints
+        .iter()
+        .filter_map(|hint| hint.data.as_ref())
+        .filter_map(|data| data["rustWorkbench"]["category"].as_str())
+        .collect::<FxHashSet<_>>();
+    assert!(categories.contains("layout"));
+    assert!(categories.contains("storage"));
+    assert!(categories.contains("wrapper"));
+    assert!(hints.iter().all(|hint| hint.data.as_ref().unwrap()["rustWorkbench"]["version"] == 2));
+    assert!(hints.iter().all(|hint| hint.tooltip.is_none()));
+    assert!(hints.iter().all(|hint| {
+        hint.data.as_ref().unwrap()["rustWorkbenchTooltip"]
+            .as_str()
+            .is_some_and(|tooltip| !tooltip.is_empty())
+    }));
+    assert!(hints.len() <= 128);
+
+    let layout_only = ownership_mechanics_hints(
+        &tutorial,
+        Range::new(Position::new(0, 0), Position::new(10, 0)),
+        OwnershipMechanicsCategories {
+            layout: true,
+            storage: false,
+            access: false,
+            wrapper: false,
+        },
+    );
+    assert_eq!(layout_only.len(), 1);
+    assert_eq!(layout_only[0].data.as_ref().unwrap()["rustWorkbench"]["category"], "layout");
+}
+
+#[test]
+fn ownership_repair_preview_graph_is_bounded_and_honest_about_provenance() {
+    let range = Range::new(Position::new(3, 8), Position::new(3, 14));
+    let candidate =
+        ownership_repair_preview_graph(OwnershipWrapperFix::ArcMutex, "values", range, false)
+            .unwrap();
+    assert!(candidate.nodes.len() <= 4);
+    assert!(candidate.edges.len() <= 3);
+    assert!(candidate.nodes.iter().any(|node| node.kind == "control_block"));
+    assert!(candidate.nodes.iter().any(|node| node.kind == "lock_state"));
+    assert!(candidate.nodes.iter().all(|node| node.provenance == "conceptual_candidate"));
+    assert!(candidate.nodes.iter().all(|node| node.size.is_none()));
+
+    let validated =
+        ownership_repair_preview_graph(OwnershipWrapperFix::Rc, "values", range, true).unwrap();
+    assert!(
+        validated
+            .nodes
+            .iter()
+            .all(|node| node.provenance == "derived_from_compiler_validated_rewrite")
+    );
 }
 
 #[test]

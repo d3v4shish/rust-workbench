@@ -27,7 +27,8 @@ use crate::{
         OwnershipDiagnostic, OwnershipEvent, OwnershipEventPayload, OwnershipModelArtifact,
         OwnershipModelLoanPoint, OwnershipModelPointer, OwnershipModelSource, OwnershipModelSpan,
         OwnershipState, OwnershipTutorialBinding, OwnershipTutorialBlock, OwnershipTutorialBody,
-        OwnershipTutorialLoan, OwnershipTutorialLoanPoint, OwnershipTutorialModel,
+        OwnershipTutorialLoan, OwnershipTutorialLoanPoint, OwnershipTutorialMemoryGraph,
+        OwnershipTutorialMemoryNode, OwnershipTutorialModel, OwnershipTutorialSnapshot,
         fetch_native_diagnostics, stable_source_hash,
     },
     discover::{DiscoverArgument, DiscoverCommand, DiscoverProjectMessage},
@@ -1820,7 +1821,7 @@ fn prepare_ownership_model_artifacts(
     let mut prepared = FxHashMap::<FileId, PreparedOwnershipFile>::default();
     for path in paths {
         let artifact = match read_ownership_model_artifact(&path) {
-            Ok(artifact) if matches!(artifact.schema_version, 2 | 3 | 4 | 5) => artifact,
+            Ok(artifact) if matches!(artifact.schema_version, 2 | 3 | 4 | 5 | 6) => artifact,
             Ok(artifact) => {
                 tracing::warn!(
                     version = artifact.schema_version,
@@ -1922,9 +1923,11 @@ fn prepare_ownership_model_artifacts(
                 .collect();
             let model =
                 ownership_tutorial_model_for_source(&line_index, source, source_text, &artifact);
-            let model =
-                (!model.bodies.is_empty() || !model.bindings.is_empty() || !model.loans.is_empty())
-                    .then_some(model);
+            let model = (!model.bodies.is_empty()
+                || !model.bindings.is_empty()
+                || !model.loans.is_empty()
+                || !model.memory_graph.nodes.is_empty())
+            .then_some(model);
             prepared.insert(
                 file_id,
                 PreparedOwnershipFile {
@@ -2021,7 +2024,61 @@ fn ownership_tutorial_model_for_source(
             })
         })
         .collect();
-    OwnershipTutorialModel { schema_version: artifact.schema_version, bodies, bindings, loans }
+    let nodes = artifact
+        .memory_graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let node_range = match node.span.as_ref() {
+                Some(span) => Some(range(span)?),
+                None => None,
+            };
+            Some(OwnershipTutorialMemoryNode { node: node.clone(), range: node_range })
+        })
+        .collect::<Vec<_>>();
+    let node_is_present = |id: &str| nodes.iter().any(|node| node.node.id == id);
+    let edges = artifact
+        .memory_graph
+        .edges
+        .iter()
+        .filter(|edge| node_is_present(&edge.source) && node_is_present(&edge.target))
+        .map(|edge| crate::diagnostics::OwnershipTutorialMemoryEdge {
+            range: edge.span.as_ref().and_then(&range),
+            edge: edge.clone(),
+        })
+        .collect();
+    let snapshots = artifact
+        .memory_graph
+        .snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            Some(OwnershipTutorialSnapshot {
+                snapshot: snapshot.clone(),
+                range: range(&snapshot.span)?,
+            })
+        })
+        .collect();
+    let access_paths = artifact
+        .memory_graph
+        .access_paths
+        .iter()
+        .filter(|path| node_is_present(&path.node_id))
+        .cloned()
+        .collect();
+    OwnershipTutorialModel {
+        schema_version: artifact.schema_version,
+        target_triple: artifact.target_triple.clone(),
+        bodies,
+        bindings,
+        loans,
+        memory_graph: OwnershipTutorialMemoryGraph {
+            nodes,
+            edges,
+            snapshots,
+            access_paths,
+            truncated: artifact.memory_graph.truncated,
+        },
+    }
 }
 
 fn ownership_model_span_range(
@@ -2087,7 +2144,7 @@ fn ownership_state_for_kind(kind: crate::diagnostics::OwnershipEventKind) -> Own
             OwnershipState::MutablyBorrowed
         }
         OwnershipEventKind::BorrowShared => OwnershipState::SharedBorrowed,
-        OwnershipEventKind::Copy => OwnershipState::Available,
+        OwnershipEventKind::Clone | OwnershipEventKind::Copy => OwnershipState::Available,
         OwnershipEventKind::Drop => OwnershipState::Dropped,
         OwnershipEventKind::InvalidUse | OwnershipEventKind::Move => OwnershipState::Moved,
         OwnershipEventKind::PartialMove => OwnershipState::PartiallyMoved,
@@ -2130,6 +2187,7 @@ fn is_teachable_rust_diagnostic(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{is_teachable_rust_diagnostic, should_record_invalid_use};
+    use crate::diagnostics::OwnershipModelArtifact;
 
     #[test]
     fn invalid_use_ignores_secondary_e0382_hints() {
@@ -2149,5 +2207,42 @@ mod tests {
         }
         assert!(!is_teachable_rust_diagnostic("unused_variables"));
         assert!(!is_teachable_rust_diagnostic("E9999"));
+    }
+
+    #[test]
+    fn schema_six_memory_graph_deserializes_and_unknown_state_fails_safely() {
+        let artifact = r#"{
+            "schema_version": 6,
+            "sources": [],
+            "ownership_events": [],
+            "memory_graph": {
+                "nodes": [{
+                    "id": "node-a",
+                    "body_id": 1,
+                    "place": "a",
+                    "kind": "binding",
+                    "storage": "stack",
+                    "label": "stack binding `a`",
+                    "type_name": "Box<i32>",
+                    "size": 8,
+                    "align": 8,
+                    "span": null,
+                    "state": "available",
+                    "provenance": "exact",
+                    "physical_placement_note": "source model",
+                    "truncated": false
+                }],
+                "edges": [],
+                "snapshots": [],
+                "access_paths": [],
+                "truncated": false
+            }
+        }"#;
+        let parsed: OwnershipModelArtifact = serde_json::from_str(artifact).unwrap();
+        assert_eq!(parsed.schema_version, 6);
+        assert_eq!(parsed.memory_graph.nodes[0].id, "node-a");
+
+        let invalid = artifact.replace("\"available\"", "\"future_state\"");
+        assert!(serde_json::from_str::<OwnershipModelArtifact>(&invalid).is_err());
     }
 }

@@ -57,6 +57,7 @@ pub(crate) enum OwnershipEventKind {
     BorrowEnd,
     BorrowMutable,
     BorrowShared,
+    Clone,
     Copy,
     Drop,
     InvalidUse,
@@ -84,6 +85,7 @@ impl OwnershipEventKind {
             Self::BorrowEnd => "borrow ends",
             Self::BorrowMutable => "&mut borrow",
             Self::BorrowShared => "shared borrow",
+            Self::Clone => "clone shared handle",
             Self::Copy => "copy",
             Self::Drop => "drop",
             Self::InvalidUse => "invalid use after move",
@@ -100,6 +102,7 @@ impl OwnershipEventKind {
             Self::BorrowEnd => "borrowEnd",
             Self::BorrowMutable => "borrowedMut",
             Self::BorrowShared => "borrowed",
+            Self::Clone => "clone",
             Self::Copy => "copy",
             Self::Drop => "dropped",
             Self::InvalidUse => "invalidUse",
@@ -130,6 +133,8 @@ pub(crate) struct OwnershipModelPointer {
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct OwnershipModelArtifact {
     pub(crate) schema_version: u32,
+    #[serde(default)]
+    pub(crate) target_triple: String,
     pub(crate) sources: Vec<OwnershipModelSource>,
     pub(crate) ownership_events: Vec<OwnershipModelEvent>,
     #[serde(default)]
@@ -138,6 +143,8 @@ pub(crate) struct OwnershipModelArtifact {
     pub(crate) ownership_bindings: Vec<OwnershipModelBindingFact>,
     #[serde(default)]
     pub(crate) ownership_loans: Vec<OwnershipModelLoan>,
+    #[serde(default)]
+    pub(crate) memory_graph: OwnershipModelMemoryGraph,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -189,6 +196,102 @@ pub(crate) struct OwnershipModelMemoryLayer {
     pub(crate) provenance: String,
 }
 
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct OwnershipModelMemoryGraph {
+    #[serde(default)]
+    pub(crate) nodes: Vec<OwnershipModelMemoryNode>,
+    #[serde(default)]
+    pub(crate) edges: Vec<OwnershipModelMemoryEdge>,
+    #[serde(default)]
+    pub(crate) snapshots: Vec<OwnershipModelSnapshot>,
+    #[serde(default)]
+    pub(crate) access_paths: Vec<OwnershipModelAccessPath>,
+    #[serde(default)]
+    pub(crate) truncated: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct OwnershipModelMemoryNode {
+    pub(crate) id: String,
+    pub(crate) body_id: u64,
+    pub(crate) place: String,
+    pub(crate) kind: String,
+    pub(crate) storage: String,
+    pub(crate) label: String,
+    pub(crate) type_name: String,
+    pub(crate) size: Option<u64>,
+    pub(crate) align: Option<u64>,
+    pub(crate) span: Option<OwnershipModelSpan>,
+    pub(crate) state: OwnershipState,
+    pub(crate) provenance: String,
+    pub(crate) physical_placement_note: String,
+    #[serde(default)]
+    pub(crate) truncated: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct OwnershipModelMemoryEdge {
+    pub(crate) id: String,
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) relation: String,
+    pub(crate) event_id: Option<String>,
+    pub(crate) loan_id: Option<u32>,
+    pub(crate) span: Option<OwnershipModelSpan>,
+    pub(crate) provenance: String,
+    pub(crate) path_marker: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct OwnershipModelStateDelta {
+    pub(crate) node_id: String,
+    pub(crate) from: Option<OwnershipState>,
+    pub(crate) to: OwnershipState,
+    pub(crate) relation_added: Option<String>,
+    pub(crate) relation_removed: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct OwnershipModelSnapshot {
+    pub(crate) id: String,
+    pub(crate) event_id: String,
+    pub(crate) body_id: u64,
+    pub(crate) basic_block: u32,
+    pub(crate) statement_index: u32,
+    pub(crate) kind: String,
+    pub(crate) span: OwnershipModelSpan,
+    pub(crate) place: String,
+    pub(crate) loan_id: Option<u32>,
+    pub(crate) path_marker: Option<String>,
+    pub(crate) deltas: Vec<OwnershipModelStateDelta>,
+    pub(crate) provenance: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct OwnershipModelAccessStep {
+    pub(crate) kind: String,
+    pub(crate) starting_type: String,
+    pub(crate) result_type: String,
+    pub(crate) mutability: String,
+    pub(crate) explicitness: String,
+    pub(crate) fallible: bool,
+    pub(crate) may_panic: bool,
+    pub(crate) requires_unsafe: bool,
+    pub(crate) explanation: String,
+    pub(crate) provenance: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct OwnershipModelAccessPath {
+    pub(crate) id: String,
+    pub(crate) body_id: u64,
+    pub(crate) node_id: String,
+    pub(crate) place: String,
+    pub(crate) purpose: String,
+    pub(crate) steps: Vec<OwnershipModelAccessStep>,
+    pub(crate) provenance: String,
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct OwnershipModelBindingFact {
     pub(crate) body_id: u64,
@@ -223,9 +326,38 @@ pub(crate) struct OwnershipModelLoan {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OwnershipTutorialModel {
     pub(crate) schema_version: u32,
+    pub(crate) target_triple: String,
     pub(crate) bodies: Vec<OwnershipTutorialBody>,
     pub(crate) bindings: Vec<OwnershipTutorialBinding>,
     pub(crate) loans: Vec<OwnershipTutorialLoan>,
+    pub(crate) memory_graph: OwnershipTutorialMemoryGraph,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OwnershipTutorialMemoryGraph {
+    pub(crate) nodes: Vec<OwnershipTutorialMemoryNode>,
+    pub(crate) edges: Vec<OwnershipTutorialMemoryEdge>,
+    pub(crate) snapshots: Vec<OwnershipTutorialSnapshot>,
+    pub(crate) access_paths: Vec<OwnershipModelAccessPath>,
+    pub(crate) truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnershipTutorialMemoryEdge {
+    pub(crate) edge: OwnershipModelMemoryEdge,
+    pub(crate) range: Option<lsp_types::Range>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnershipTutorialMemoryNode {
+    pub(crate) node: OwnershipModelMemoryNode,
+    pub(crate) range: Option<lsp_types::Range>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnershipTutorialSnapshot {
+    pub(crate) snapshot: OwnershipModelSnapshot,
+    pub(crate) range: lsp_types::Range,
 }
 
 #[derive(Clone, Debug)]
