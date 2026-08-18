@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+zed_source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+profile="${RUST_WORKBENCH_PROFILE:-release}"
+if [[ "${1:-}" == "--debug" ]]; then
+  profile="debug"
+  shift
+fi
+editor_binary="$zed_source_dir/target/$profile/rust-workbench"
+user_data_dir="$zed_source_dir/rust-workbench-data"
+local_sysroot="$zed_source_dir/.build-deps/sysroot"
+
+if [[ ! -x "$editor_binary" ]]; then
+  build_flag=""
+  if [[ "$profile" == "debug" ]]; then
+    build_flag=" --debug"
+  fi
+  echo "Rust Workbench ($profile) is not built. Run ./script/build-rust-workbench$build_flag first." >&2
+  exit 1
+fi
+
+export LD_LIBRARY_PATH="$local_sysroot/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ZED_UPDATE_EXPLANATION="Rust Workbench is updated by rebuilding this source tree."
+export ZED_RELEASE_CHANNEL="dev"
+export XDG_CACHE_HOME="$user_data_dir/cache"
+
+mkdir -p "$XDG_CACHE_HOME"
+
+exec "$editor_binary" --user-data-dir "$user_data_dir" "$@"

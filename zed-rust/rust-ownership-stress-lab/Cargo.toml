@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/move_cases",
+    "crates/borrow_cases",
+    "crates/mutation_cases",
+    "crates/valid_patterns",
+    "crates/unsupported_cases",
+    "crates/repair_rc",
+    "crates/repair_refcell",
+    "crates/repair_rc_refcell",
+    "crates/commerce_app",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unused = "allow"
+dead_code = "allow"

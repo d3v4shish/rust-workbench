@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Rust Workbench
+GenericName=Rust Editor
+Comment=Zed with compiler-exact Rust ownership tooling
+Exec=/home/d3v/Workspace/Temp/RustC/zed-rust/script/rust-workbench %F
+Icon=dev.rustworkbench.EditorDev
+Terminal=false
+StartupNotify=true
+StartupWMClass=dev.rustworkbench.EditorDev
+Categories=Development;IDE;TextEditor;
+Keywords=Rust;Zed;IDE;Ownership;Borrow Checker;

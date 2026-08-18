@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+zed_source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+local_sysroot="$zed_source_dir/.build-deps/sysroot"
+analyzer_source_dir="$zed_source_dir/../rust/src/tools/rust-analyzer"
+
+if [[ ! -x "$local_sysroot/usr/bin/cmake" \
+  || ! -f "$local_sysroot/usr/lib/x86_64-linux-gnu/pkgconfig/x11.pc" \
+  || ! -f "$local_sysroot/usr/lib/x86_64-linux-gnu/pkgconfig/alsa.pc" ]]; then
+  echo "Rust Workbench's workspace-local Linux build dependencies are missing." >&2
+  echo "Run ./script/bootstrap-rust-workbench-linux, then retry this command." >&2
+  exit 1
+fi
+
+export PATH="$local_sysroot/usr/bin:$PATH"
+export LD_LIBRARY_PATH="$local_sysroot/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBRARY_PATH="$local_sysroot/usr/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export PKG_CONFIG_PATH="$local_sysroot/usr/lib/x86_64-linux-gnu/pkgconfig:$local_sysroot/usr/share/pkgconfig"
+export PKG_CONFIG_SYSROOT_DIR="$local_sysroot"
+export ZED_UPDATE_EXPLANATION="Rust Workbench is updated by rebuilding this source tree."
+export ZED_RELEASE_CHANNEL="dev"
+
+# Reuse a previously downloaded pinned WebRTC bundle when available. The upstream build script
+# otherwise downloads the same large archive again whenever its build-script fingerprint changes,
+# which makes an otherwise local Rust Workbench rebuild fail while offline.
+if [[ -z "${LK_CUSTOM_WEBRTC:-}" ]]; then
+  for candidate in "$zed_source_dir"/target/release/build/webrtc-sys-*/out/webrtc-*/linux-x64-release; do
+    if [[ -f "$candidate/lib/libwebrtc.a" ]]; then
+      export LK_CUSTOM_WEBRTC="$candidate"
+      break
+    fi
+  done
+fi
+
+profile_args=(--release)
+binary_dir="release"
+if [[ "${1:-}" == "--debug" ]]; then
+  profile_args=()
+  binary_dir="debug"
+  shift
+fi
+
+echo "Building the compiler-backed rust-analyzer used by Rust Learning Debugger"
+cargo build --manifest-path "$analyzer_source_dir/Cargo.toml" -p rust-analyzer --release
+
+cargo build --manifest-path "$zed_source_dir/Cargo.toml" -p zed "${profile_args[@]}" "$@"
+
+# The release profile retains limited symbols for crash reports. Keep those in development
+# artifacts, but strip them from the daily editor to reduce executable I/O at startup.
+if [[ "$binary_dir" == "release" ]] && command -v strip >/dev/null; then
+  strip --strip-debug "$zed_source_dir/target/release/rust-workbench"
+fi

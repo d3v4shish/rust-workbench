@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+zed_source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+desktop_source="$zed_source_dir/crates/zed/resources/dev.rustworkbench.EditorDev.desktop"
+desktop_data_dir="${XDG_DATA_HOME:-${HOME}/.local/share}"
+applications_dir="$desktop_data_dir/applications"
+icons_dir="$desktop_data_dir/icons/hicolor/512x512/apps"
+
+mkdir -p "$applications_dir"
+mkdir -p "$icons_dir"
+install -m 0644 "$desktop_source" "$applications_dir/dev.rustworkbench.EditorDev.desktop"
+install -m 0644 \
+  "$zed_source_dir/crates/zed/resources/app-icon-rust-workbench.png" \
+  "$icons_dir/dev.rustworkbench.EditorDev.png"
+rm -f "$applications_dir/dev.rustworkbench.Editor-Dev.desktop"
+rm -f "$applications_dir/dev.rustworkbench.Editor.desktop"
+
+if command -v update-desktop-database >/dev/null; then
+  update-desktop-database "$applications_dir"
+fi
+
+if command -v gtk-update-icon-cache >/dev/null; then
+  gtk-update-icon-cache -f -t "$desktop_data_dir/icons/hicolor" >/dev/null 2>&1 || true
+fi
+
+echo "Rust Workbench is installed in the desktop application menu."

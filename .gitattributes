@@ -1,0 +1,3 @@
+# The rustc source tree normally sits at repository root. Preserve its macro
+# attribute now that it lives under rust/ in this combined repository.
+[attr]rust text eol=lf whitespace=tab-in-indent,trailing-space,tabwidth=4

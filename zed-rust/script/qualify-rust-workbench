@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+zed_source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+workspace_root="$(cd "$zed_source_dir/.." && pwd)"
+rust_source_dir="$workspace_root/rust"
+analyzer_source_dir="$rust_source_dir/src/tools/rust-analyzer"
+local_sysroot="$zed_source_dir/.build-deps/sysroot"
+mode="${1:---quick}"
+
+if [[ "$mode" != "--quick" && "$mode" != "--full" ]]; then
+  echo "usage: $0 [--quick|--full]" >&2
+  exit 2
+fi
+
+if [[ ! -d "$analyzer_source_dir" || ! -d "$local_sysroot" ]]; then
+  echo "Run this from the RustC workspace after bootstrapping Rust Workbench." >&2
+  exit 1
+fi
+
+export PATH="$local_sysroot/usr/bin:$PATH"
+export LD_LIBRARY_PATH="$local_sysroot/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBRARY_PATH="$local_sysroot/usr/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export PKG_CONFIG_PATH="$local_sysroot/usr/lib/x86_64-linux-gnu/pkgconfig:$local_sysroot/usr/share/pkgconfig"
+export PKG_CONFIG_SYSROOT_DIR="$local_sysroot"
+
+for candidate in "$zed_source_dir"/target/release/build/webrtc-sys-*/out/webrtc-*/linux-x64-release; do
+  if [[ -f "$candidate/lib/libwebrtc.a" ]]; then
+    export LK_CUSTOM_WEBRTC="$candidate"
+    break
+  fi
+done
+
+started_at="$(date +%s)"
+
+echo "[1/5] rust-analyzer learning diagnostics, ownership correctness, and bounded performance"
+cargo test --manifest-path "$analyzer_source_dir/Cargo.toml" -p rust-analyzer ownership_ --lib --bins
+cargo test --manifest-path "$analyzer_source_dir/Cargo.toml" -p rust-analyzer learning_problem --lib
+cargo test --manifest-path "$analyzer_source_dir/Cargo.toml" -p ide ownership_insight --lib
+
+echo "[2/5] Zed beginner flow, pointer models, repairs, and compiler-verified results"
+cargo test --manifest-path "$zed_source_dir/Cargo.toml" -p rust_workbench --lib
+
+echo "[3/5] Verify the stress lab still has many diagnostics per source file"
+stress_output="$(mktemp)"
+if cargo check --manifest-path "$zed_source_dir/rust-ownership-stress-lab/Cargo.toml" \
+  --message-format=short >"$stress_output" 2>&1; then
+  echo "The intentionally failing Rust learning stress lab unexpectedly compiled." >&2
+  exit 1
+fi
+test "$(rg -c 'error\[E[0-9]+\]' "$stress_output")" -ge 40
+test "$(rg -c 'unsupported_cases/src/lib.rs.*error\[E' "$stress_output")" -ge 5
+
+echo "[4/5] Compile all touched Zed integration crates"
+cargo check --manifest-path "$zed_source_dir/Cargo.toml" -p rust_workbench -p title_bar -p workspace
+
+if [[ "$mode" == "--full" ]]; then
+  echo "[5/5] Compiler rewrite suites and release editor"
+  (
+    cd "$rust_source_dir"
+    ./x test --force-rerun tests/run-make/borrowck-autofix
+  )
+  cargo_target="$(mktemp -d)"
+  cargo_output="$cargo_target/cargo-output.json"
+  cargo_source="$rust_source_dir/tests/run-make-cargo/borrowck-wrapper-suggestions/src/main.rs"
+  cargo_source_hash="$(sha256sum "$cargo_source")"
+  if RUSTC="$rust_source_dir/build/x86_64-unknown-linux-gnu/stage1/bin/rustc" \
+    RUSTFLAGS="-Zborrowck-wrapper-suggestions" \
+    CARGO_TARGET_DIR="$cargo_target/target" \
+    cargo check \
+      --manifest-path "$rust_source_dir/tests/run-make-cargo/borrowck-wrapper-suggestions/Cargo.toml" \
+      --message-format=json >"$cargo_output" 2>&1; then
+    echo "The intentionally failing Cargo suggestion fixture unexpectedly compiled." >&2
+    exit 1
+  fi
+  rg -q '"code":"borrowck_wrapper_ref_cell"' "$cargo_output"
+  rg -q 'Use RefCell for interior mutability \(compiler validated\)' "$cargo_output"
+  rg -q '"suggestion_applicability":"MaybeIncorrect"' "$cargo_output"
+  test "$cargo_source_hash" = "$(sha256sum "$cargo_source")"
+  "$zed_source_dir/script/build-rust-workbench"
+  "$zed_source_dir/script/benchmark-rust-ownership-check"
+  "$zed_source_dir/script/benchmark-rust-learning-context" \
+    --shutdown-timeout 60 \
+    --assert-trace-from prefix \
+    --assert-conflict-node prefix --assert-conflict-node '*current' \
+    --assert-conflict-node self.events
+  "$zed_source_dir/script/benchmark-rust-learning-context" \
+    --line 13 --character 8 --runs 100 --shutdown-timeout 60 --allow-empty-value-trace \
+    --assert-operation push --assert-selected-place self.events \
+    --assert-mutation-target self.events --assert-access-source '&self'
+  "$zed_source_dir/script/benchmark-rust-learning-context" \
+    --source "$zed_source_dir/rust-ownership-stress-lab/crates/repair_rc/src/main.rs" \
+    --line 7 --character 45 --runs 5 --shutdown-timeout 60 \
+    --assert-repair-candidates 1 --validate-first-candidate
+else
+  echo "[5/5] Skipped compiler run-make and release editor build (use --full)"
+fi
+
+finished_at="$(date +%s)"
+elapsed_seconds="$((finished_at - started_at))"
+echo "Rust Workbench qualification passed in ${elapsed_seconds}s."

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+zed_source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+debs_dir="$zed_source_dir/.build-deps/debs"
+local_sysroot="$zed_source_dir/.build-deps/sysroot"
+
+if ! command -v apt-get >/dev/null || ! command -v dpkg-deb >/dev/null; then
+  echo "This bootstrap currently supports Debian/Ubuntu hosts with apt-get and dpkg-deb." >&2
+  exit 1
+fi
+
+# Zed's Linux graphics, audio, font, TLS, SQLite, Wayland, and X11 build stack.
+# apt-get only downloads the archives; dpkg-deb extracts them into this source
+# tree. No sudo is used and no system package is installed or changed.
+packages=(
+  cmake
+  cmake-data
+  libasound2-dev
+  libasound2t64
+  libblkid-dev
+  libbrotli-dev
+  libbz2-dev
+  libexpat1-dev
+  libffi-dev
+  libfontconfig-dev
+  libfreetype-dev
+  libgio-2.0-dev
+  libglib2.0-0t64
+  libglib2.0-dev
+  libmount-dev
+  libpcre2-8-0
+  libpcre2-dev
+  libpng-dev
+  librhash1
+  libselinux-dev
+  libsepol-dev
+  libsqlite3-dev
+  libssl-dev
+  libsysprof-capture-4-dev
+  libva-dev
+  libwayland-dev
+  libx11-dev
+  libx11-xcb-dev
+  libxau-dev
+  libxau6
+  libxcb-randr0-dev
+  libxcb-render0-dev
+  libxcb-shape0-dev
+  libxcb-shm0-dev
+  libxcb-xfixes0-dev
+  libxcb-xkb-dev
+  libxcb1
+  libxcb1-dev
+  libxdmcp-dev
+  libxdmcp6
+  libxkbcommon-dev
+  libxkbcommon-x11-0
+  libxkbcommon-x11-dev
+  libxkbcommon0
+  libzstd-dev
+  x11proto-dev
+  xorg-sgml-doctools
+  xtrans-dev
+  zlib1g-dev
+)
+
+mkdir -p "$debs_dir" "$local_sysroot"
+cd "$debs_dir"
+apt-get download "${packages[@]}"
+
+shopt -s nullglob
+archives=("$debs_dir"/*.deb)
+if [[ ${#archives[@]} -eq 0 ]]; then
+  echo "apt-get completed without producing any package archives." >&2
+  exit 1
+fi
+
+for archive in "${archives[@]}"; do
+  dpkg-deb --extract "$archive" "$local_sysroot"
+done
+
+echo "Rust Workbench Linux dependencies are ready in $local_sysroot"
+echo "Build with: ./script/build-rust-workbench"

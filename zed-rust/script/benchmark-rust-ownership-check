@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+
+"""Regression gate for rustc's one-pass ownership-model transport."""
+
+import argparse
+import json
+import os
+import pathlib
+import statistics
+import subprocess
+import tempfile
+import time
+
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(len(ordered) * fraction) - 1))
+    return ordered[index]
+
+
+def run_check(cargo, project, rustc, analyzer, root, mode, run_id):
+    target = root / f"{mode}-target-{run_id}"
+    model_dir = root / f"models-{run_id}"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CARGO_TARGET_DIR": str(target),
+            "RUSTC": str(rustc),
+            "RUST_BACKTRACE": "0",
+        }
+    )
+    if mode == "model":
+        environment.update(
+            {
+                "RUSTC_WORKSPACE_WRAPPER": str(analyzer),
+                "RA_RUSTC_WRAPPER": "ownership",
+                "RA_OWNERSHIP_MODEL_DIR": str(model_dir),
+            }
+        )
+    started = time.perf_counter_ns()
+    completed = subprocess.run(
+        [str(cargo), "check", "--workspace", "--quiet"],
+        cwd=project,
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    if completed.returncode == 0:
+        raise RuntimeError("the intentionally failing stress workspace unexpectedly compiled")
+    if "error[E" not in stderr:
+        raise RuntimeError(f"cargo check did not reach Rust diagnostics:\n{stderr[-4000:]}")
+
+    artifacts = []
+    artifact_bytes = 0
+    if mode == "model":
+        if "borrowck_ownership_model" in stderr:
+            raise RuntimeError(
+                "legacy diagnostic transport was observed; the model check ran through the old outer compiler pass"
+            )
+        artifacts = sorted(model_dir.glob("*.json"))
+        if not artifacts:
+            raise RuntimeError("model check emitted no ownership artifacts")
+        for artifact_path in artifacts:
+            artifact_bytes += artifact_path.stat().st_size
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            if artifact.get("schema_version") != 5:
+                raise RuntimeError(f"unexpected schema in {artifact_path}")
+            if any(source.get("source") is not None for source in artifact.get("sources", [])):
+                raise RuntimeError(f"{artifact_path} retained duplicate source text")
+    return {
+        "elapsed_ms": elapsed_ms,
+        "artifacts": len(artifacts),
+        "artifact_bytes": artifact_bytes,
+    }
+
+
+def main():
+    script_dir = pathlib.Path(__file__).resolve().parent
+    zed_root = script_dir.parent
+    workspace_root = zed_root.parent
+    parser = argparse.ArgumentParser(
+        description="Compare cold baseline checks with one-pass ownership-model checks."
+    )
+    parser.add_argument(
+        "--project", type=pathlib.Path, default=zed_root / "rust-ownership-stress-lab"
+    )
+    parser.add_argument(
+        "--rustc",
+        type=pathlib.Path,
+        default=workspace_root
+        / "rust"
+        / "build"
+        / "x86_64-unknown-linux-gnu"
+        / "stage1"
+        / "bin"
+        / "rustc",
+    )
+    parser.add_argument(
+        "--analyzer",
+        type=pathlib.Path,
+        default=workspace_root
+        / "rust"
+        / "src"
+        / "tools"
+        / "rust-analyzer"
+        / "target"
+        / "release"
+        / "rust-analyzer",
+    )
+    parser.add_argument("--cargo", type=pathlib.Path, default=pathlib.Path("cargo"))
+    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--assert-median-delta-ms", type=float, default=750.0)
+    parser.add_argument("--assert-median-ratio", type=float, default=3.0)
+    parser.add_argument("--assert-artifact-bytes", type=int, default=8 * 1024 * 1024)
+    args = parser.parse_args()
+    if args.runs < 3:
+        raise SystemExit("--runs must be at least 3")
+    project = args.project.resolve()
+    rustc = args.rustc.resolve()
+    analyzer = args.analyzer.resolve()
+    if not (project / "Cargo.toml").is_file():
+        raise SystemExit(f"missing Cargo workspace: {project}")
+    if not rustc.is_file():
+        raise SystemExit(f"missing stage1 rustc: {rustc}")
+    if not analyzer.is_file():
+        raise SystemExit(f"missing release rust-analyzer: {analyzer}")
+
+    baseline = []
+    model = []
+    artifact_counts = []
+    artifact_bytes = []
+    with tempfile.TemporaryDirectory(prefix="rust-ownership-check-benchmark-") as temp:
+        root = pathlib.Path(temp)
+        for run_id in range(args.runs):
+            baseline.append(
+                run_check(args.cargo, project, rustc, analyzer, root, "baseline", run_id)[
+                    "elapsed_ms"
+                ]
+            )
+            measured = run_check(
+                args.cargo, project, rustc, analyzer, root, "model", run_id
+            )
+            model.append(measured["elapsed_ms"])
+            artifact_counts.append(measured["artifacts"])
+            artifact_bytes.append(measured["artifact_bytes"])
+
+    baseline_median = statistics.median(baseline)
+    model_median = statistics.median(model)
+    delta = model_median - baseline_median
+    ratio = model_median / max(baseline_median, 0.001)
+    result = {
+        "runs": args.runs,
+        "baseline_median_ms": round(baseline_median, 3),
+        "baseline_p95_ms": round(percentile(baseline, 0.95), 3),
+        "model_median_ms": round(model_median, 3),
+        "model_p95_ms": round(percentile(model, 0.95), 3),
+        "median_delta_ms": round(delta, 3),
+        "median_ratio": round(ratio, 3),
+        "artifact_count_median": int(statistics.median(artifact_counts)),
+        "artifact_bytes_max": max(artifact_bytes),
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if delta > args.assert_median_delta_ms:
+        raise RuntimeError(
+            f"ownership model median added {delta:.1f}ms; limit is {args.assert_median_delta_ms:.1f}ms"
+        )
+    if ratio > args.assert_median_ratio:
+        raise RuntimeError(
+            f"ownership model median ratio is {ratio:.2f}x; limit is {args.assert_median_ratio:.2f}x"
+        )
+    if max(artifact_bytes) > args.assert_artifact_bytes:
+        raise RuntimeError(
+            f"ownership artifacts reached {max(artifact_bytes)} bytes; limit is {args.assert_artifact_bytes}"
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import pathlib
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def write_message(stream, payload):
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    stream.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
+    stream.write(body)
+    stream.flush()
+
+
+def read_message(stream):
+    headers = {}
+    while True:
+        line = stream.readline()
+        if not line:
+            raise EOFError("rust-analyzer closed its output")
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode("ascii").split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    body = stream.read(length)
+    if len(body) != length:
+        raise EOFError("rust-analyzer returned a truncated LSP message")
+    return json.loads(body)
+
+
+class LspClient:
+    def __init__(self, process):
+        self.process = process
+        self.next_id = 1
+
+    def notify(self, method, params):
+        write_message(
+            self.process.stdin,
+            {"jsonrpc": "2.0", "method": method, "params": params},
+        )
+
+    def request(self, method, params):
+        request_id = self.next_id
+        self.next_id += 1
+        write_message(
+            self.process.stdin,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            },
+        )
+        while True:
+            message = read_message(self.process.stdout)
+            if message.get("id") == request_id and "method" not in message:
+                if "error" in message:
+                    error = message["error"]
+                    raise LspResponseError(method, error)
+                return message.get("result")
+            if "method" in message and "id" in message:
+                self._answer_server_request(message)
+
+    def _answer_server_request(self, message):
+        method = message["method"]
+        if method == "workspace/configuration":
+            items = message.get("params", {}).get("items", [])
+            result = [None for _ in items]
+        elif method == "workspace/workspaceFolders":
+            result = None
+        else:
+            result = None
+        write_message(
+            self.process.stdin,
+            {"jsonrpc": "2.0", "id": message["id"], "result": result},
+        )
+
+
+class LspResponseError(RuntimeError):
+    def __init__(self, method, error):
+        super().__init__(f"{method} failed: {error}")
+        self.code = error.get("code")
+
+
+def request_stable(client, method, params, deadline):
+    while True:
+        try:
+            return client.request(method, params)
+        except LspResponseError as error:
+            if error.code != -32801 or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.025)
+
+
+def percentile(values, percentile):
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(len(ordered) * percentile) - 1))
+    return ordered[index]
+
+
+def ownership_event_loop_stalls(log_text):
+    lines = log_text.splitlines()
+    return sum(
+        1
+        for index, line in enumerate(lines)
+        if "overly long loop turn took" in line
+        and any(
+            "OwnershipArtifact" in nearby
+            for nearby in lines[index : min(index + 6, len(lines))]
+        )
+    )
+
+
+def ownership_stall_details(log_text):
+    lines = log_text.splitlines()
+    details = []
+    for index, line in enumerate(lines):
+        window = lines[index : min(index + 6, len(lines))]
+        if "overly long loop turn took" in line and any(
+            "OwnershipArtifact" in nearby for nearby in window
+        ):
+            details.append("\n".join(window))
+    return "\n\n".join(details)
+
+
+def process_peak_rss_kib(pid):
+    try:
+        status = pathlib.Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    for line in status.splitlines():
+        if line.startswith("VmHWM:"):
+            return int(line.split()[1])
+    return None
+
+
+def main():
+    script_dir = pathlib.Path(__file__).resolve().parent
+    zed_root = script_dir.parent
+    workspace_root = zed_root.parent
+    default_analyzer = (
+        workspace_root
+        / "rust"
+        / "src"
+        / "tools"
+        / "rust-analyzer"
+        / "target"
+        / "release"
+        / "rust-analyzer"
+    )
+    default_project = zed_root / "rust-ownership-stress-lab"
+    default_source = default_project / "crates" / "commerce_app" / "src" / "analytics.rs"
+    parser = argparse.ArgumentParser(
+        description="Measure warm rust-analyzer learning-context latency on a real diagnostic."
+    )
+    parser.add_argument("--analyzer", type=pathlib.Path, default=default_analyzer)
+    parser.add_argument("--project", type=pathlib.Path, default=default_project)
+    parser.add_argument("--source", type=pathlib.Path, default=default_source)
+    parser.add_argument("--line", type=int, default=21, help="zero-based LSP line")
+    parser.add_argument("--character", type=int, default=9)
+    parser.add_argument("--runs", type=int, default=100)
+    parser.add_argument("--ready-timeout", type=float, default=60.0)
+    parser.add_argument("--assert-p95-ms", type=float, default=20.0)
+    parser.add_argument("--assert-max-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--target-dir",
+        type=pathlib.Path,
+        help="explicit Cargo target directory (isolated temporary cache by default)",
+    )
+    parser.add_argument(
+        "--reuse-cache",
+        action="store_true",
+        help="reuse zed-rust/rust-workbench-analysis-target instead of an isolated cache",
+    )
+    parser.add_argument("--shutdown-timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--inspect-actions",
+        action="store_true",
+        help="include code-action titles at the benchmark position",
+    )
+    parser.add_argument(
+        "--inspect-problems",
+        action="store_true",
+        help="include ownership problem bindings and model positions for the file",
+    )
+    parser.add_argument(
+        "--assert-repair-candidates",
+        type=int,
+        default=0,
+        help="require at least this many unvalidated repair previews",
+    )
+    parser.add_argument(
+        "--assert-trace-from",
+        action="append",
+        default=[],
+        help="require a guided value-trace step starting from this binding",
+    )
+    parser.add_argument(
+        "--assert-conflict-node",
+        action="append",
+        default=[],
+        help="require this label in the diagnostic-scoped borrow graph",
+    )
+    parser.add_argument(
+        "--allow-empty-value-trace",
+        action="store_true",
+        help="allow operation-driven models, such as E0596, to omit a move/borrow value trace",
+    )
+    parser.add_argument(
+        "--assert-operation",
+        action="append",
+        default=[],
+        help="require a resolved ownership operation with this name",
+    )
+    parser.add_argument(
+        "--assert-selected-place",
+        help="require the model to preserve this exact selected place",
+    )
+    parser.add_argument(
+        "--assert-mutation-target",
+        help="require the structured mutation requirement to target this exact place",
+    )
+    parser.add_argument(
+        "--assert-access-source",
+        help="require the structured mutation requirement to report this access source",
+    )
+    parser.add_argument(
+        "--validate-first-candidate",
+        action="store_true",
+        help="request compiler validation and wait for a validated repair",
+    )
+    args = parser.parse_args()
+
+    analyzer = args.analyzer.resolve()
+    project = args.project.resolve()
+    source = args.source.resolve()
+    if not analyzer.is_file():
+        raise SystemExit(f"missing release rust-analyzer: {analyzer}")
+    if not source.is_file():
+        raise SystemExit(f"missing benchmark source: {source}")
+    if args.runs < 5:
+        raise SystemExit("--runs must be at least 5")
+
+    root_uri = project.as_uri()
+    source_uri = source.as_uri()
+    stage1_rustc = workspace_root / "rust" / "build" / "x86_64-unknown-linux-gnu" / "stage1" / "bin" / "rustc"
+    temporary_target = None
+    if args.target_dir is not None:
+        analysis_target = args.target_dir.resolve()
+    elif args.reuse_cache:
+        analysis_target = zed_root / "rust-workbench-analysis-target"
+    else:
+        temporary_target = tempfile.TemporaryDirectory(
+            prefix="rust-learning-analysis-target-"
+        )
+        analysis_target = pathlib.Path(temporary_target.name) / "target"
+    environment = os.environ.copy()
+    environment["RUST_BACKTRACE"] = "0"
+    with tempfile.NamedTemporaryFile(prefix="rust-learning-benchmark-", suffix=".log") as log:
+        process = subprocess.Popen(
+            [str(analyzer)],
+            cwd=project,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=log,
+        )
+        if process.stdin is None or process.stdout is None:
+            raise SystemExit("failed to open rust-analyzer pipes")
+        client = LspClient(process)
+        result = None
+        benchmark_started = time.monotonic()
+        try:
+            client.request(
+                "initialize",
+                {
+                    "processId": os.getpid(),
+                    "rootUri": root_uri,
+                    "workspaceFolders": [{"uri": root_uri, "name": project.name}],
+                    "capabilities": {
+                        "workspace": {"configuration": True, "workspaceFolders": True},
+                        "textDocument": {
+                            "publishDiagnostics": {"relatedInformation": True},
+                            "codeAction": {
+                                "codeActionLiteralSupport": {
+                                    "codeActionKind": {
+                                        "valueSet": [
+                                            "quickfix",
+                                            "refactor",
+                                            "refactor.rewrite",
+                                        ]
+                                    }
+                                }
+                            },
+                        },
+                    },
+                    "initializationOptions": {
+                        "ownership": {"enable": True},
+                        "diagnostics": {
+                            "remapPrefix": {
+                                "library/": str(workspace_root / "rust" / "library") + "/"
+                            }
+                        },
+                        "assist": {"ownershipWrapperSuggestions": {"enable": True}},
+                        "check": {
+                            "extraEnv": {
+                                "RUSTC": str(stage1_rustc),
+                                "CARGO_TARGET_DIR": str(analysis_target),
+                            }
+                        },
+                        "checkOnSave": True,
+                    },
+                },
+            )
+            client.notify("initialized", {})
+            source_text = source.read_text(encoding="utf-8")
+            client.notify(
+                "textDocument/didOpen",
+                {
+                    "textDocument": {
+                        "uri": source_uri,
+                        "languageId": "rust",
+                        "version": 1,
+                        "text": source_text,
+                    }
+                },
+            )
+            params = {
+                "textDocument": {"uri": source_uri},
+                "position": {"line": args.line, "character": args.character},
+            }
+            deadline = time.monotonic() + args.ready_timeout
+            model = None
+            while time.monotonic() < deadline:
+                model = request_stable(
+                    client, "rust-analyzer/ownershipModel", params, deadline
+                )
+                if model and model.get("status") == "ready":
+                    break
+                time.sleep(0.25)
+            if not model or model.get("status") != "ready":
+                raise RuntimeError("learning context did not become ready before the timeout")
+            ready_ms = (time.monotonic() - benchmark_started) * 1000
+            if model.get("schemaVersion", 0) < 11:
+                raise RuntimeError("rust-analyzer returned a pre-locked-problem schema")
+            if not args.allow_empty_value_trace and not model.get("valueTrace"):
+                raise RuntimeError("ready ownership model did not contain a bounded value trace")
+            trace_sources = {
+                step.get("fromLabel") for step in model.get("valueTrace", [])
+            }
+            missing_trace_sources = set(args.assert_trace_from) - trace_sources
+            if missing_trace_sources:
+                raise RuntimeError(
+                    "guided trace omitted required bindings: "
+                    + ", ".join(sorted(missing_trace_sources))
+                )
+            conflict_labels = {
+                node.get("label")
+                for node in (model.get("conflictGraph") or {}).get("nodes", [])
+            }
+            missing_conflict_nodes = set(args.assert_conflict_node) - conflict_labels
+            if missing_conflict_nodes:
+                raise RuntimeError(
+                    "borrow graph omitted required nodes: "
+                    + ", ".join(sorted(missing_conflict_nodes))
+                )
+            operation_names = {
+                operation.get("name") for operation in model.get("operations", [])
+            }
+            missing_operations = set(args.assert_operation) - operation_names
+            if missing_operations:
+                raise RuntimeError(
+                    "ownership model omitted required operations: "
+                    + ", ".join(sorted(missing_operations))
+                )
+            if (
+                args.assert_selected_place is not None
+                and model.get("selectedPlace") != args.assert_selected_place
+            ):
+                raise RuntimeError(
+                    f"expected selected place {args.assert_selected_place!r}, "
+                    f"received {model.get('selectedPlace')!r}"
+                )
+            mutation_requirement = model.get("mutationRequirement") or {}
+            if (
+                args.assert_mutation_target is not None
+                and mutation_requirement.get("targetPlace")
+                != args.assert_mutation_target
+            ):
+                raise RuntimeError(
+                    f"expected mutation target {args.assert_mutation_target!r}, "
+                    f"received {mutation_requirement.get('targetPlace')!r}"
+                )
+            if (
+                args.assert_access_source is not None
+                and mutation_requirement.get("accessSource") != args.assert_access_source
+            ):
+                raise RuntimeError(
+                    f"expected access source {args.assert_access_source!r}, "
+                    f"received {mutation_requirement.get('accessSource')!r}"
+                )
+            candidates = [
+                repair
+                for repair in model.get("repairs", [])
+                if not repair.get("compilerValidated", False)
+            ]
+            if len(candidates) < args.assert_repair_candidates:
+                raise RuntimeError(
+                    f"expected at least {args.assert_repair_candidates} repair candidates, "
+                    f"received {len(candidates)}"
+                )
+
+            validation_status = None
+            validation_ms = None
+            if args.validate_first_candidate:
+                if not candidates:
+                    raise RuntimeError("no repair candidate was available for validation")
+                validation_started = time.monotonic()
+                validation = request_stable(
+                    client,
+                    "rust-analyzer/ownershipValidateRepair",
+                    {
+                        "textDocument": {"uri": source_uri},
+                        "position": params["position"],
+                        "repairId": candidates[0]["id"],
+                        "sourceHash": model["sourceHash"],
+                    },
+                    time.monotonic() + args.ready_timeout,
+                )
+                validation_status = validation.get("status")
+                if validation_status != "checking":
+                    raise RuntimeError(
+                        f"compiler validation did not start: {validation!r}"
+                    )
+                validation_deadline = time.monotonic() + args.ready_timeout
+                while time.monotonic() < validation_deadline:
+                    model = request_stable(
+                        client,
+                        "rust-analyzer/ownershipModel",
+                        params,
+                        validation_deadline,
+                    )
+                    if any(
+                        repair.get("compilerValidated", False)
+                        for repair in model.get("repairs", [])
+                    ):
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError(
+                        "compiler validation did not publish a validated repair before timeout"
+                    )
+                validation_ms = (time.monotonic() - validation_started) * 1000
+
+            action_titles = []
+            if args.inspect_actions:
+                actions = request_stable(
+                    client,
+                    "textDocument/codeAction",
+                    {
+                        "textDocument": {"uri": source_uri},
+                        "range": {
+                            "start": params["position"],
+                            "end": params["position"],
+                        },
+                        "context": {"diagnostics": []},
+                    },
+                    time.monotonic() + args.ready_timeout,
+                )
+                action_titles = [action.get("title", "") for action in actions or []]
+
+            problem_summaries = []
+            if args.inspect_problems:
+                problems = request_stable(
+                    client,
+                    "rust-analyzer/ownershipProblems",
+                    {"uri": source_uri},
+                    time.monotonic() + args.ready_timeout,
+                )
+                problem_summaries = [
+                    {
+                        "code": problem.get("diagnosticCode"),
+                        "binding": problem.get("bindingName"),
+                        "line": (problem.get("primaryRange") or {}).get("start", {}).get("line"),
+                        "model_line": (problem.get("modelPosition") or {}).get("line"),
+                    }
+                    for problem in (problems or {}).get("problems", [])
+                ]
+                problem_ids = {
+                    problem.get("id")
+                    for problem in (problems or {}).get("problems", [])
+                }
+                if model.get("selectedProblemId") not in problem_ids:
+                    raise RuntimeError(
+                        "ownershipModel did not echo an ID from ownershipProblems: "
+                        f"{model.get('selectedProblemId')!r}"
+                    )
+
+            warmup_deadline = time.monotonic() + min(args.ready_timeout, 30.0)
+            for _ in range(10):
+                request_stable(
+                    client,
+                    "rust-analyzer/ownershipModel",
+                    params,
+                    warmup_deadline,
+                )
+
+            durations = []
+            response_bytes = []
+            for _ in range(args.runs):
+                started = time.perf_counter_ns()
+                model = request_stable(
+                    client,
+                    "rust-analyzer/ownershipModel",
+                    params,
+                    time.monotonic() + args.ready_timeout,
+                )
+                durations.append((time.perf_counter_ns() - started) / 1_000_000)
+                response_bytes.append(len(json.dumps(model, separators=(",", ":"))))
+            result = {
+                "runs": args.runs,
+                "median_ms": round(statistics.median(durations), 3),
+                "p95_ms": round(percentile(durations, 0.95), 3),
+                "max_ms": round(max(durations), 3),
+                "median_response_bytes": int(statistics.median(response_bytes)),
+                "events": len(model.get("events", [])),
+                "selected_place": model.get("selectedPlace"),
+                "selected_problem_id": model.get("selectedProblemId"),
+                "value_trace_steps": len(model.get("valueTrace", [])),
+                "repair_candidates": sum(
+                    1
+                    for repair in model.get("repairs", [])
+                    if not repair.get("compilerValidated", False)
+                ),
+                "validated_repairs": sum(
+                    1
+                    for repair in model.get("repairs", [])
+                    if repair.get("compilerValidated", False)
+                ),
+                "repairs": [
+                    {
+                        "id": repair.get("id"),
+                        "title": repair.get("title"),
+                        "strategy": repair.get("strategy"),
+                        "validated": repair.get("compilerValidated", False),
+                        "state": repair.get("validationState"),
+                    }
+                    for repair in model.get("repairs", [])
+                ],
+                "operations": len(model.get("operations", [])),
+                "mutation_requirement": model.get("mutationRequirement"),
+                "context_breadcrumbs": len(
+                    (model.get("sourceContext") or {}).get("breadcrumbs", [])
+                ),
+                "truncated": bool(model.get("truncated")),
+                "cold_ready_ms": round(ready_ms, 3),
+                "peak_rss_kib": process_peak_rss_kib(process.pid),
+                "isolated_target": not args.reuse_cache and args.target_dir is None,
+                "action_titles": action_titles,
+                "problems": problem_summaries,
+                "value_trace": (
+                    [
+                        {
+                            "from": step.get("fromLabel"),
+                            "to": step.get("toLabel"),
+                            "kind": step.get("kind"),
+                            "explanation": step.get("explanation"),
+                        }
+                        for step in model.get("valueTrace", [])
+                    ]
+                    if args.inspect_problems
+                    else []
+                ),
+                "conflict_nodes": (
+                    [
+                        {
+                            "id": node.get("id"),
+                            "label": node.get("label"),
+                            "role": node.get("role"),
+                            "memory": node.get("memory"),
+                        }
+                        for node in (model.get("conflictGraph") or {}).get("nodes", [])
+                    ]
+                    if args.inspect_problems
+                    else []
+                ),
+                "validation_status": validation_status,
+                "validation_ms": (
+                    round(validation_ms, 3) if validation_ms is not None else None
+                ),
+            }
+            client.request("shutdown", None)
+            client.notify("exit", None)
+            process.wait(timeout=args.shutdown_timeout)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=args.shutdown_timeout)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=args.shutdown_timeout)
+            if process.returncode not in (0, None):
+                log.seek(0)
+                diagnostics = log.read().decode("utf-8", errors="replace")
+                if diagnostics:
+                    print(diagnostics[-8000:], file=sys.stderr)
+        log.seek(0)
+        analyzer_log = log.read().decode("utf-8", errors="replace")
+        stalls = ownership_event_loop_stalls(analyzer_log)
+        if result is None:
+            raise RuntimeError("benchmark completed without a result")
+        result["ownership_event_loop_stalls"] = stalls
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if stalls:
+            print(ownership_stall_details(analyzer_log), file=sys.stderr)
+            raise RuntimeError(f"observed {stalls} ownership artifact event-loop stalls")
+        if result["p95_ms"] > args.assert_p95_ms:
+            raise RuntimeError(f"p95 {result['p95_ms']}ms exceeds {args.assert_p95_ms}ms")
+        if result["max_ms"] > args.assert_max_ms:
+            raise RuntimeError(f"max {result['max_ms']}ms exceeds {args.assert_max_ms}ms")
+    if temporary_target is not None:
+        temporary_target.cleanup()
+
+
+if __name__ == "__main__":
+    main()
