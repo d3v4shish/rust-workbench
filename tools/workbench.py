@@ -75,6 +75,8 @@ RUSTDOC = STAGE1 / "bin" / "rustdoc"
 CARGO = STAGE0 / "bin" / "cargo"
 ANALYZER_BINARY = ANALYZER / "target" / "release" / "rust-analyzer"
 EDITOR_BINARY = ZED / "target" / "release" / "rust-workbench"
+PROC_MACRO_SERVER = STAGE1 / "libexec" / "rust-analyzer-proc-macro-srv"
+STAGE1_TARGET_LIB = STAGE1 / "lib" / "rustlib" / HOST / "lib"
 BUNDLE_TEMPLATES = ROOT / "tools" / "bundle"
 DIST = ROOT / "dist"
 
@@ -157,17 +159,36 @@ def doctor() -> int:
 
     artifacts = (
         ("custom rustc", RUSTC, ["-Vv"]),
+        ("custom rustdoc", RUSTDOC, ["-V"]),
         ("bundled Cargo source", CARGO, ["-V"]),
         ("custom rust-analyzer", ANALYZER_BINARY, ["--version"]),
+        ("stage1 proc-macro server", PROC_MACRO_SERVER, []),
         ("Rust Workbench editor", EDITOR_BINARY, []),
     )
     for label, path, arguments in artifacts:
         if not path.is_file():
             print(f"NOT BUILT artifact: {label} ({path.relative_to(ROOT)})")
+            # A partially-created stage1 sysroot is worse than a clearly
+            # unbuilt tree: the editor can start while rustdoc or proc-macro
+            # expansion fails later. Treat missing siblings as a doctor error
+            # once stage1 rustc itself exists.
+            if RUSTC.is_file():
+                failed = True
             continue
         size = human_size(path.stat().st_size)
         version = first_line([path, *arguments]) if arguments else "present"
         print(f"OK artifact: {label}: {version} ({size})")
+
+    stage1_std = sorted(STAGE1_TARGET_LIB.glob("libstd-*.rlib"))
+    if stage1_std:
+        print(f"OK artifact: stage1 standard library: {stage1_std[0].name}")
+    else:
+        print(
+            "NOT BUILT artifact: stage1 standard library "
+            f"({STAGE1_TARGET_LIB.relative_to(ROOT)}/libstd-*.rlib)"
+        )
+        if RUSTC.is_file():
+            failed = True
 
     if EDITOR_BINARY.is_file():
         dynamic = run(["readelf", "-d", EDITOR_BINARY], capture=True, check=False).stdout
@@ -185,7 +206,23 @@ def bootstrap() -> None:
 
 
 def build_compiler() -> None:
-    run([RUST / "x", "build", "--stage", "1", "compiler/rustc"], cwd=RUST)
+    # rust-analyzer selects its proc-macro server from the active rustc sysroot.
+    # Ask bootstrap for every promised stage1 tool in one invocation: separate
+    # invocations recreate the sysroot and can prune the tool built just before
+    # them. The analyzer target supplies the ABI-matched proc-macro server.
+    run(
+        [
+            RUST / "x",
+            "build",
+            "--stage",
+            "1",
+            "library/std",
+            "compiler/rustc",
+            "src/tools/rust-analyzer",
+            "src/tools/rustdoc",
+        ],
+        cwd=RUST,
+    )
 
 
 def build_analyzer() -> None:
@@ -806,9 +843,18 @@ def ensure_package_artifacts(*, skip_build: bool) -> None:
             raise SystemExit(f"missing custom compiler: {RUSTC}")
         build_compiler()
     if skip_build:
-        missing = [path for path in (EDITOR_BINARY, ANALYZER_BINARY, CARGO, RUSTDOC) if not path.is_file()]
+        missing = [
+            path
+            for path in (EDITOR_BINARY, ANALYZER_BINARY, CARGO, RUSTDOC, PROC_MACRO_SERVER)
+            if not path.is_file()
+        ]
         if missing:
             raise SystemExit("missing package artifacts:\n" + "\n".join(str(path) for path in missing))
+        if not any(STAGE1_TARGET_LIB.glob("libstd-*.rlib")):
+            raise SystemExit(
+                "missing stage1 standard library: "
+                f"{STAGE1_TARGET_LIB}/libstd-*.rlib"
+            )
     else:
         build_editor(portable=True)
 

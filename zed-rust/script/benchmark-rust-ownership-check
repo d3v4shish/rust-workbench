@@ -18,6 +18,28 @@ def percentile(values, fraction):
     return ordered[index]
 
 
+def compiler_baseline(path):
+    """Return the repeatable pre-feature model median/p95 from the evidence file."""
+    if path is None or not path.is_file():
+        return None
+    evidence = json.loads(path.read_text(encoding="utf-8"))
+    samples = [
+        run.get("compiler_transport", {})
+        for run in evidence.get("runs", [])
+        if run.get("source") == "./workbench test performance"
+    ]
+    medians = [sample.get("model_median_ms") for sample in samples]
+    p95s = [sample.get("model_p95_ms") for sample in samples]
+    medians = [value for value in medians if isinstance(value, (int, float))]
+    p95s = [value for value in p95s if isinstance(value, (int, float))]
+    if not medians or not p95s:
+        raise RuntimeError(f"baseline evidence has no compiler performance samples: {path}")
+    return {
+        "model_median_ms": statistics.median(medians),
+        "model_p95_ms": statistics.median(p95s),
+    }
+
+
 def run_check(cargo, project, rustc, analyzer, root, mode, run_id):
     target = root / f"{mode}-target-{run_id}"
     model_dir = root / f"models-{run_id}"
@@ -66,10 +88,18 @@ def run_check(cargo, project, rustc, analyzer, root, mode, run_id):
         for artifact_path in artifacts:
             artifact_bytes += artifact_path.stat().st_size
             artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-            if artifact.get("schema_version") != 5:
+            if artifact.get("schema_version") != 6:
                 raise RuntimeError(f"unexpected schema in {artifact_path}")
             if any(source.get("source") is not None for source in artifact.get("sources", [])):
                 raise RuntimeError(f"{artifact_path} retained duplicate source text")
+            graph = artifact.get("memory_graph")
+            if not isinstance(graph, dict):
+                raise RuntimeError(f"{artifact_path} omitted the schema-6 memory graph")
+            for field in ("nodes", "edges", "snapshots", "access_paths"):
+                if not isinstance(graph.get(field), list):
+                    raise RuntimeError(
+                        f"{artifact_path} has an invalid memory_graph.{field}"
+                    )
     return {
         "elapsed_ms": elapsed_ms,
         "artifacts": len(artifacts),
@@ -115,6 +145,16 @@ def main():
     parser.add_argument("--assert-median-delta-ms", type=float, default=750.0)
     parser.add_argument("--assert-median-ratio", type=float, default=3.0)
     parser.add_argument("--assert-artifact-bytes", type=int, default=8 * 1024 * 1024)
+    parser.add_argument(
+        "--baseline-json",
+        type=pathlib.Path,
+        default=workspace_root
+        / "evidence"
+        / "visual-workbench"
+        / "baseline-performance.json",
+        help="compare model median and p95 with the saved pre-feature evidence",
+    )
+    parser.add_argument("--assert-baseline-regression-percent", type=float, default=5.0)
     args = parser.parse_args()
     if args.runs < 3:
         raise SystemExit("--runs must be at least 3")
@@ -162,6 +202,26 @@ def main():
         "artifact_count_median": int(statistics.median(artifact_counts)),
         "artifact_bytes_max": max(artifact_bytes),
     }
+    saved_baseline = compiler_baseline(args.baseline_json)
+    if saved_baseline is not None:
+        median_regression = (
+            (model_median - saved_baseline["model_median_ms"])
+            / saved_baseline["model_median_ms"]
+            * 100.0
+        )
+        model_p95 = percentile(model, 0.95)
+        p95_regression = (
+            (model_p95 - saved_baseline["model_p95_ms"])
+            / saved_baseline["model_p95_ms"]
+            * 100.0
+        )
+        result["saved_baseline"] = {
+            "path": str(args.baseline_json),
+            "model_median_ms": round(saved_baseline["model_median_ms"], 3),
+            "model_p95_ms": round(saved_baseline["model_p95_ms"], 3),
+            "median_regression_percent": round(median_regression, 3),
+            "p95_regression_percent": round(p95_regression, 3),
+        }
     print(json.dumps(result, indent=2, sort_keys=True))
     if delta > args.assert_median_delta_ms:
         raise RuntimeError(
@@ -175,6 +235,13 @@ def main():
         raise RuntimeError(
             f"ownership artifacts reached {max(artifact_bytes)} bytes; limit is {args.assert_artifact_bytes}"
         )
+    if saved_baseline is not None:
+        limit = args.assert_baseline_regression_percent
+        if median_regression > limit or p95_regression > limit:
+            raise RuntimeError(
+                "ownership compiler transport regressed against saved baseline: "
+                f"median {median_regression:.1f}%, p95 {p95_regression:.1f}%; limit {limit:.1f}%"
+            )
 
 
 if __name__ == "__main__":

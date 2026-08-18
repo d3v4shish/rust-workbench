@@ -167,6 +167,7 @@
 - [Roc](./languages/roc.md)
 - [Ruby](./languages/ruby.md)
 - [Rust](./languages/rust.md)
+  - [Rust Learning Debugger](./languages/rust-learning-debugger.md)
 - [Scala](./languages/scala.md)
 - [Scheme](./languages/scheme.md)
 - [Shell Script](./languages/sh.md)

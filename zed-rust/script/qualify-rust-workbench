@@ -34,6 +34,13 @@ done
 
 started_at="$(date +%s)"
 
+stage1_root="$rust_source_dir/build/x86_64-unknown-linux-gnu/stage1"
+if [[ -x "$stage1_root/bin/rustc" ]]; then
+  test -x "$stage1_root/bin/rustdoc"
+  test -x "$stage1_root/libexec/rust-analyzer-proc-macro-srv"
+  compgen -G "$stage1_root/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib" >/dev/null
+fi
+
 echo "[1/5] rust-analyzer learning diagnostics, ownership correctness, and bounded performance"
 cargo test --manifest-path "$analyzer_source_dir/Cargo.toml" -p rust-analyzer ownership_ --lib --bins
 cargo test --manifest-path "$analyzer_source_dir/Cargo.toml" -p rust-analyzer learning_problem --lib
@@ -60,6 +67,10 @@ if [[ "$mode" == "--full" ]]; then
   (
     cd "$rust_source_dir"
     ./x test --force-rerun tests/run-make/borrowck-autofix
+    # Bootstrap recreates stage1 for the requested test suite and may prune
+    # rustdoc/proc-macro tools. Restore the coherent editor toolchain before
+    # the release/bundle gates use it.
+    ./x build --stage 1 library/std compiler/rustc src/tools/rust-analyzer src/tools/rustdoc
   )
   cargo_target="$(mktemp -d)"
   cargo_output="$cargo_target/cargo-output.json"

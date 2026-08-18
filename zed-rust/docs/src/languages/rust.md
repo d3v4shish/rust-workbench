@@ -11,6 +11,10 @@ Rust support is available natively in Zed.
 - Language Server: [rust-lang/rust-analyzer](https://github.com/rust-lang/rust-analyzer)
 - Debug Adapter: [CodeLLDB](https://github.com/vadimcn/codelldb) (primary), [GDB](https://sourceware.org/gdb/) (secondary, not available on Apple silicon)
 
+The custom Rust Workbench build also includes the
+[Rust Learning Debugger](./rust-learning-debugger.md), which connects its
+bundled rustc and rust-analyzer to a visual ownership and borrowing panel.
+
 <!--
 TBD: Polish Rust docs. Zed has strong Rust support, and the docs should reflect that clearly.
 TBD: Users may not know what inlayHints, don't start there.

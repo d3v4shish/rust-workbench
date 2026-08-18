@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 3,
+  "commitBaseline": "c5295eda49310c240b4a5a7d18b273148d576eb0",
+  "measuredAt": "2026-08-19",
+  "command": "cargo test --manifest-path zed-rust/Cargo.toml -p rust_workbench --lib compact_scene_and_issue_navigation_meet_ui_latency_budget -- --nocapture",
+  "iterations": {
+    "sceneDerivation": 1000,
+    "fullMapDerivation": 1000,
+    "scrubberState": 10000,
+    "cachedIssueSwitch": 10000
+  },
+  "p95Nanoseconds": {
+    "sceneDerivation": 198256,
+    "fullMapDerivation": 224545,
+    "scrubberState": 39615,
+    "cachedIssueSwitch": 30,
+    "repairPreviewSwap": 31,
+    "visibleRangeInlineFilter": 3376
+  },
+  "thresholdNanoseconds": {
+    "sceneDerivation": 2000000,
+    "fullMapDerivation": 8000000,
+    "scrubberState": 4000000,
+    "cachedIssueSwitch": 16000000,
+    "repairPreviewSwap": 4000000,
+    "visibleRangeInlineFilter": 4000000
+  },
+  "result": "pass"
+}

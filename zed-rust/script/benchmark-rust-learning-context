@@ -105,6 +105,36 @@ def percentile(values, percentile):
     return ordered[index]
 
 
+def request_baseline(path, selected_place):
+    if path is None or not path.is_file():
+        return None
+    evidence = json.loads(path.read_text(encoding="utf-8"))
+    if selected_place == "self.events":
+        samples = [
+            run.get("self_events_fixture", {})
+            for run in evidence.get("runs", [])
+            if run.get("self_events_fixture")
+        ]
+    elif selected_place == "measurements":
+        # The wrapper fixture records validation latency from one correctness
+        # run, not a repeatable warm-request baseline. Keep its existing
+        # absolute latency gate instead of pretending that sample is a 5% gate.
+        return None
+    else:
+        samples = [
+            run.get("learning_fixture", {})
+            for run in evidence.get("runs", [])
+            if run.get("source") == "./workbench test performance"
+        ]
+    medians = [sample.get("request_median_ms") for sample in samples]
+    p95s = [sample.get("request_p95_ms") for sample in samples]
+    medians = [value for value in medians if isinstance(value, (int, float))]
+    p95s = [value for value in p95s if isinstance(value, (int, float))]
+    if not medians or not p95s:
+        raise RuntimeError(f"baseline evidence has no analyzer request samples: {path}")
+    return {"median_ms": statistics.median(medians), "p95_ms": statistics.median(p95s)}
+
+
 def ownership_event_loop_stalls(log_text):
     lines = log_text.splitlines()
     return sum(
@@ -170,6 +200,16 @@ def main():
     parser.add_argument("--assert-p95-ms", type=float, default=20.0)
     parser.add_argument("--assert-max-ms", type=float, default=100.0)
     parser.add_argument(
+        "--baseline-json",
+        type=pathlib.Path,
+        default=workspace_root
+        / "evidence"
+        / "visual-workbench"
+        / "baseline-performance.json",
+        help="compare warm ownership requests with the saved pre-feature evidence",
+    )
+    parser.add_argument("--assert-baseline-regression-percent", type=float, default=5.0)
+    parser.add_argument(
         "--target-dir",
         type=pathlib.Path,
         help="explicit Cargo target directory (isolated temporary cache by default)",
@@ -207,6 +247,18 @@ def main():
         action="append",
         default=[],
         help="require this label in the diagnostic-scoped borrow graph",
+    )
+    parser.add_argument(
+        "--assert-memory-node",
+        action="append",
+        default=[],
+        help="require this label in the schema-12 ownership memory graph",
+    )
+    parser.add_argument(
+        "--assert-access-place",
+        action="append",
+        default=[],
+        help="require a typed access path for this exact place",
     )
     parser.add_argument(
         "--allow-empty-value-trace",
@@ -348,8 +400,30 @@ def main():
             if not model or model.get("status") != "ready":
                 raise RuntimeError("learning context did not become ready before the timeout")
             ready_ms = (time.monotonic() - benchmark_started) * 1000
-            if model.get("schemaVersion", 0) < 11:
-                raise RuntimeError("rust-analyzer returned a pre-locked-problem schema")
+            if model.get("schemaVersion", 0) < 12:
+                raise RuntimeError("rust-analyzer returned a pre-memory-graph schema")
+            memory_graph = model.get("memoryGraph") or {}
+            for field in ("nodes", "edges", "snapshots", "accessPaths"):
+                if not isinstance(memory_graph.get(field, []), list):
+                    raise RuntimeError(f"ownership memoryGraph.{field} is not a list")
+            memory_labels = {
+                node.get("label") for node in memory_graph.get("nodes", [])
+            }
+            missing_memory_nodes = set(args.assert_memory_node) - memory_labels
+            if missing_memory_nodes:
+                raise RuntimeError(
+                    "ownership graph omitted required nodes: "
+                    + ", ".join(sorted(missing_memory_nodes))
+                )
+            access_places = {
+                path.get("place") for path in memory_graph.get("accessPaths", [])
+            }
+            missing_access_places = set(args.assert_access_place) - access_places
+            if missing_access_places:
+                raise RuntimeError(
+                    "ownership graph omitted required access paths: "
+                    + ", ".join(sorted(missing_access_places))
+                )
             if not args.allow_empty_value_trace and not model.get("valueTrace"):
                 raise RuntimeError("ready ownership model did not contain a bounded value trace")
             trace_sources = {
@@ -596,6 +670,26 @@ def main():
                     round(validation_ms, 3) if validation_ms is not None else None
                 ),
             }
+            saved_baseline = request_baseline(args.baseline_json, model.get("selectedPlace"))
+            if saved_baseline is not None:
+                median_regression = (
+                    (statistics.median(durations) - saved_baseline["median_ms"])
+                    / saved_baseline["median_ms"]
+                    * 100.0
+                )
+                measured_p95 = percentile(durations, 0.95)
+                p95_regression = (
+                    (measured_p95 - saved_baseline["p95_ms"])
+                    / saved_baseline["p95_ms"]
+                    * 100.0
+                )
+                result["saved_baseline"] = {
+                    "path": str(args.baseline_json),
+                    "median_ms": round(saved_baseline["median_ms"], 3),
+                    "p95_ms": round(saved_baseline["p95_ms"], 3),
+                    "median_regression_percent": round(median_regression, 3),
+                    "p95_regression_percent": round(p95_regression, 3),
+                }
             client.request("shutdown", None)
             client.notify("exit", None)
             process.wait(timeout=args.shutdown_timeout)
@@ -626,6 +720,13 @@ def main():
             raise RuntimeError(f"p95 {result['p95_ms']}ms exceeds {args.assert_p95_ms}ms")
         if result["max_ms"] > args.assert_max_ms:
             raise RuntimeError(f"max {result['max_ms']}ms exceeds {args.assert_max_ms}ms")
+        if saved_baseline is not None:
+            limit = args.assert_baseline_regression_percent
+            if median_regression > limit or p95_regression > limit:
+                raise RuntimeError(
+                    "ownership request latency regressed against saved baseline: "
+                    f"median {median_regression:.1f}%, p95 {p95_regression:.1f}%; limit {limit:.1f}%"
+                )
     if temporary_target is not None:
         temporary_target.cleanup()
 

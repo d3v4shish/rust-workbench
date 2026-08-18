@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-19",
+  "baseline_commit": "c5295eda49310c240b4a5a7d18b273148d576eb0",
+  "compiler_analyzer_runs": [
+    {
+      "model_median_ms": 539.164,
+      "model_p95_ms": 540.612,
+      "artifact_bytes_max": 2438302,
+      "request_median_ms": 1.056,
+      "request_p95_ms": 1.341,
+      "request_max_ms": 1.795,
+      "analyzer_peak_rss_kib": 612236,
+      "ownership_event_loop_stalls": 0
+    },
+    {
+      "model_median_ms": 541.193,
+      "model_p95_ms": 545.803,
+      "artifact_bytes_max": 2438302,
+      "request_median_ms": 1.036,
+      "request_p95_ms": 1.638,
+      "request_max_ms": 1.781,
+      "analyzer_peak_rss_kib": 587712,
+      "ownership_event_loop_stalls": 0
+    },
+    {
+      "model_median_ms": 542.942,
+      "model_p95_ms": 549.977,
+      "artifact_bytes_max": 2438302,
+      "request_median_ms": 1.029,
+      "request_p95_ms": 1.311,
+      "request_max_ms": 1.673,
+      "analyzer_peak_rss_kib": 587368,
+      "ownership_event_loop_stalls": 0
+    }
+  ],
+  "saved_baseline_gate": {
+    "command": "./workbench test performance",
+    "model_median_ms": 541.193,
+    "model_p95_ms": 545.803,
+    "model_median_regression_percent": -18.144,
+    "model_p95_regression_percent": -20.293,
+    "request_median_ms": 1.036,
+    "request_p95_ms": 1.341,
+    "request_median_regression_percent": -25.839,
+    "request_p95_regression_percent": -62.037,
+    "analyzer_peak_rss_kib": 612236,
+    "ownership_event_loop_stalls": 0,
+    "result": "pass"
+  },
+  "ui_runs": [
+    {
+      "scene_derivation_p95_ns": 198256,
+      "full_map_derivation_p95_ns": 224545,
+      "scrubber_state_p95_ns": 39615,
+      "cached_issue_switch_p95_ns": 30,
+      "repair_preview_swap_p95_ns": 31
+    },
+    {
+      "scene_derivation_p95_ns": 192163,
+      "full_map_derivation_p95_ns": 218223,
+      "scrubber_state_p95_ns": 39545,
+      "cached_issue_switch_p95_ns": 30,
+      "repair_preview_swap_p95_ns": 30
+    },
+    {
+      "scene_derivation_p95_ns": 191743,
+      "full_map_derivation_p95_ns": 217011,
+      "scrubber_state_p95_ns": 42670,
+      "cached_issue_switch_p95_ns": 30,
+      "repair_preview_swap_p95_ns": 30
+    }
+  ],
+  "inline_filter_runs": [
+    { "visible_range_filter_p95_ns": 3376, "hints_per_batch": 128 },
+    { "visible_range_filter_p95_ns": 3417, "hints_per_batch": 128 },
+    { "visible_range_filter_p95_ns": 3958, "hints_per_batch": 128 }
+  ],
+  "thresholds_ns": {
+    "scene_derivation_p95": 2000000,
+    "full_map_derivation_p95": 8000000,
+    "scrubber_state_p95": 4000000,
+    "cached_issue_switch_p95": 16000000,
+    "repair_preview_swap_p95": 4000000,
+    "visible_range_filter_p95": 4000000
+  },
+  "live_session": {
+    "duration_minutes": 16,
+    "editor_rss_mib_samples": [372, 375, 296],
+    "final_analyzer_rss_mib": 35.2,
+    "final_proc_macro_worker_rss_mib": [20.7, 20.7],
+    "final_combined_rss_mib": 372.6,
+    "ownership_artifact_stalls_over_100_ms": 0,
+    "startup_only_stalls_ms": [146.804, 114.66],
+    "result": "plateau"
+  },
+  "artifact_growth_note": "Schema 6 adds bounded nodes, edges, snapshots, and typed access paths. The largest artifact grew from 1,290,521 to 2,438,302 bytes but remains below the 8 MiB gate; persistent artifacts still omit source text.",
+  "result": "pass"
+}
