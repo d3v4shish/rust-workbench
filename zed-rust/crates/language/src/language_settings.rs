@@ -462,6 +462,10 @@ impl InlayHintSettings {
                 Some(InlayHintKind::OwnershipEstimated),
                 Some(InlayHintKind::OwnershipExact),
                 Some(InlayHintKind::Drop),
+                Some(InlayHintKind::MechanicsLayout),
+                Some(InlayHintKind::MechanicsStorage),
+                Some(InlayHintKind::MechanicsAccess),
+                Some(InlayHintKind::MechanicsWrapper),
             ]);
         }
         kinds

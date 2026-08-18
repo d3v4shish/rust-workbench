@@ -26,8 +26,8 @@ use util::debug_panic;
 
 use super::{Inlay, InlayId};
 use crate::{
-    Editor, EditorSnapshot, PointForPosition, RustOwnershipDisplayPreferences, ToggleInlayHints,
-    ToggleInlineValues, debounce_value,
+    Editor, EditorSnapshot, PointForPosition, RustMechanicsHintMode,
+    RustOwnershipDisplayPreferences, ToggleInlayHints, ToggleInlineValues, debounce_value,
     display_map::{DisplayMap, InlayOffset},
     hover_links::{InlayHighlight, TriggerPoint, show_link_definition},
     hover_popover::{self, InlayHover},
@@ -607,6 +607,76 @@ impl Editor {
             .cloned()
     }
 
+    /// Returns true only when the pointer is over a semantic Rust mechanics
+    /// clue. The source anchor has already been selected by normal editor mouse
+    /// handling, so the workbench can use it to retain the exact field/place.
+    pub(crate) fn rust_mechanics_hint_at_point(
+        &mut self,
+        snapshot: &EditorSnapshot,
+        point_for_position: &PointForPosition,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if point_for_position.column_overshoot_after_line_end != 0 {
+            return false;
+        }
+        let Some(lsp_store) = self.project().map(|project| project.read(cx).lsp_store()) else {
+            return false;
+        };
+        let hovered_offset =
+            snapshot.display_point_to_inlay_offset(point_for_position.exact_unclipped, Bias::Left);
+        let buffer_snapshot = self.buffer().read(cx).snapshot(cx);
+        let previous_valid_anchor = buffer_snapshot.anchor_at(
+            point_for_position.previous_valid.to_point(snapshot),
+            Bias::Left,
+        );
+        let next_valid_anchor = buffer_snapshot.anchor_at(
+            point_for_position.next_valid.to_point(snapshot),
+            Bias::Right,
+        );
+
+        let hovered_hints = {
+            let display_map = self.display_map.read(cx);
+            Self::visible_inlay_hints(display_map)
+                .filter(|hint| snapshot.can_resolve(&hint.position))
+                .skip_while(|hint| {
+                    hint.position
+                        .cmp(&previous_valid_anchor, &buffer_snapshot)
+                        .is_lt()
+                })
+                .take_while(|hint| {
+                    hint.position
+                        .cmp(&next_valid_anchor, &buffer_snapshot)
+                        .is_le()
+                })
+                .filter(|hint| {
+                    let start = snapshot.anchor_to_inlay_offset(hint.position);
+                    hovered_offset >= start && hovered_offset.0 < start.0 + hint.text().len()
+                })
+                .collect::<Vec<_>>()
+        };
+        hovered_hints
+            .into_iter()
+            .filter_map(|hint| {
+                let anchor = buffer_snapshot.anchor_to_buffer_anchor(hint.position)?.0;
+                let resolved = lsp_store.update(cx, |store, cx| {
+                    store.resolved_hint(anchor.buffer_id, hint.id, cx)
+                })?;
+                match resolved {
+                    ResolvedHint::Resolved(hint) => hint.kind,
+                    ResolvedHint::Resolving(_) => None,
+                }
+            })
+            .any(|kind| {
+                matches!(
+                    kind,
+                    InlayHintKind::MechanicsLayout
+                        | InlayHintKind::MechanicsStorage
+                        | InlayHintKind::MechanicsAccess
+                        | InlayHintKind::MechanicsWrapper
+                )
+            })
+    }
+
     pub fn update_inlay_link_and_hover_points(
         &mut self,
         snapshot: &EditorSnapshot,
@@ -947,6 +1017,10 @@ impl Editor {
                                     | InlayHintKind::OwnershipEstimated
                                     | InlayHintKind::OwnershipExact
                                     | InlayHintKind::Drop
+                                    | InlayHintKind::MechanicsLayout
+                                    | InlayHintKind::MechanicsStorage
+                                    | InlayHintKind::MechanicsAccess
+                                    | InlayHintKind::MechanicsWrapper
                             )
                         ))
                     && rust_workbench_hint_allowed(
@@ -1023,6 +1097,33 @@ fn rust_workbench_hint_allowed(
             let label = hint.text().to_string();
             rust_ownership_event_allowed(preferences, &label)
         }
+        InlayHintKind::MechanicsLayout
+        | InlayHintKind::MechanicsStorage
+        | InlayHintKind::MechanicsAccess
+        | InlayHintKind::MechanicsWrapper => {
+            if preferences.mechanics_mode == RustMechanicsHintMode::Off
+                || !preferences.allows_row(hint.position.to_point(buffer_snapshot).row)
+            {
+                return false;
+            }
+            rust_mechanics_category_allowed(preferences, kind)
+        }
+    }
+}
+
+fn rust_mechanics_category_allowed(
+    preferences: &RustOwnershipDisplayPreferences,
+    kind: InlayHintKind,
+) -> bool {
+    if preferences.mechanics_mode == RustMechanicsHintMode::Off {
+        return false;
+    }
+    match kind {
+        InlayHintKind::MechanicsLayout => preferences.show_layout,
+        InlayHintKind::MechanicsStorage => preferences.show_storage,
+        InlayHintKind::MechanicsAccess => preferences.show_access,
+        InlayHintKind::MechanicsWrapper => preferences.show_wrappers,
+        _ => false,
     }
 }
 
@@ -1116,7 +1217,7 @@ fn spawn_editor_hints_refresh(
 
 #[cfg(test)]
 pub mod tests {
-    use super::rust_ownership_event_allowed;
+    use super::{rust_mechanics_category_allowed, rust_ownership_event_allowed};
     use crate::editor_tests::update_test_language_settings;
     use crate::inlays::inlay_hints::InlayHintRefreshReason;
     use crate::scroll::Autoscroll;
@@ -1162,6 +1263,72 @@ pub mod tests {
         let mut moves_only = focus;
         moves_only.show_borrows = false;
         assert!(!rust_ownership_event_allowed(&moves_only, "&mut?"));
+    }
+
+    #[test]
+    fn rust_mechanics_categories_are_semantic_and_independent() {
+        let focus = RustOwnershipDisplayPreferences::focus();
+        assert!(!rust_mechanics_category_allowed(
+            &focus,
+            InlayHintKind::MechanicsLayout
+        ));
+
+        let mut learn = RustOwnershipDisplayPreferences::learn();
+        for kind in [
+            InlayHintKind::MechanicsLayout,
+            InlayHintKind::MechanicsStorage,
+            InlayHintKind::MechanicsAccess,
+            InlayHintKind::MechanicsWrapper,
+        ] {
+            assert!(rust_mechanics_category_allowed(&learn, kind));
+        }
+        learn.show_layout = false;
+        assert!(!rust_mechanics_category_allowed(
+            &learn,
+            InlayHintKind::MechanicsLayout
+        ));
+        assert!(rust_mechanics_category_allowed(
+            &learn,
+            InlayHintKind::MechanicsStorage
+        ));
+    }
+
+    #[test]
+    fn rust_mechanics_visible_range_filter_meets_latency_budget() {
+        use std::time::Instant;
+
+        let mut preferences = RustOwnershipDisplayPreferences::learn();
+        preferences.focus_rows = vec![(10, 90), (120, 145)];
+        let kinds = [
+            InlayHintKind::MechanicsLayout,
+            InlayHintKind::MechanicsStorage,
+            InlayHintKind::MechanicsAccess,
+            InlayHintKind::MechanicsWrapper,
+        ];
+        let mut samples = Vec::with_capacity(200);
+        let mut kept = 0usize;
+        for _ in 0..200 {
+            let started = Instant::now();
+            for index in 0..128u32 {
+                let allowed = preferences.allows_row(index)
+                    && rust_mechanics_category_allowed(
+                        &preferences,
+                        kinds[index as usize % kinds.len()],
+                    );
+                kept += usize::from(std::hint::black_box(allowed));
+            }
+            samples.push(started.elapsed().as_nanos());
+        }
+        samples.sort_unstable();
+        let p95_ns = samples[samples.len() * 95 / 100];
+        assert!(kept > 0);
+        assert!(
+            p95_ns < 4_000_000,
+            "visible-range mechanics filtering p95 was {p95_ns} ns"
+        );
+        eprintln!(
+            "RUST_WORKBENCH_INLINE_BENCHMARK={{\"schemaVersion\":1,\"visibleRangeFilterP95Ns\":{p95_ns},\"hintsPerBatch\":128}}"
+        );
     }
     use text::{OffsetRangeExt, Point};
     use ui::App;

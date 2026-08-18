@@ -334,9 +334,24 @@ mod rust_workbench_inlay_tests {
     #[test]
     fn unknown_metadata_versions_fall_back_to_normal_other_hints() {
         let future = serde_json::json!({
-            "rustWorkbench": { "version": 2, "category": "drop" }
+            "rustWorkbench": { "version": 3, "category": "drop" }
         });
         assert_eq!(rust_workbench_inlay_kind(Some(&future)), None);
+    }
+
+    #[test]
+    fn version_two_mechanics_metadata_is_semantic() {
+        for (category, expected) in [
+            ("layout", InlayHintKind::MechanicsLayout),
+            ("storage", InlayHintKind::MechanicsStorage),
+            ("access", InlayHintKind::MechanicsAccess),
+            ("wrapper", InlayHintKind::MechanicsWrapper),
+        ] {
+            let value = serde_json::json!({
+                "rustWorkbench": { "version": 2, "category": category }
+            });
+            assert_eq!(rust_workbench_inlay_kind(Some(&value)), Some(expected));
+        }
     }
 }
 
@@ -3340,7 +3355,7 @@ impl LspCommand for OnTypeFormatting {
 
 fn rust_workbench_inlay_kind(data: Option<&lsp::LSPAny>) -> Option<InlayHintKind> {
     let metadata = data?.get("rustWorkbench")?;
-    if metadata.get("version")?.as_u64()? != 1 {
+    if !matches!(metadata.get("version")?.as_u64()?, 1 | 2) {
         return None;
     }
     match metadata.get("category")?.as_str()? {
@@ -3351,6 +3366,10 @@ fn rust_workbench_inlay_kind(data: Option<&lsp::LSPAny>) -> Option<InlayHintKind
             _ => Some(InlayHintKind::OwnershipEstimated),
         },
         "drop" => Some(InlayHintKind::Drop),
+        "layout" => Some(InlayHintKind::MechanicsLayout),
+        "storage" => Some(InlayHintKind::MechanicsStorage),
+        "access" => Some(InlayHintKind::MechanicsAccess),
+        "wrapper" => Some(InlayHintKind::MechanicsWrapper),
         _ => None,
     }
 }
@@ -3654,7 +3673,11 @@ impl InlayHints {
                 | InlayHintKind::Lifetime
                 | InlayHintKind::OwnershipEstimated
                 | InlayHintKind::OwnershipExact
-                | InlayHintKind::Drop => None,
+                | InlayHintKind::Drop
+                | InlayHintKind::MechanicsLayout
+                | InlayHintKind::MechanicsStorage
+                | InlayHintKind::MechanicsAccess
+                | InlayHintKind::MechanicsWrapper => None,
             }),
             text_edits: None,
             tooltip: hint.tooltip.and_then(|tooltip| {

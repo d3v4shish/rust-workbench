@@ -1701,4 +1701,14 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  {
+    "context": "RustOwnershipWorkbench",
+    "bindings": {
+      "up": "rust_workbench::PreviousIssue",
+      "down": "rust_workbench::NextIssue",
+      "left": "rust_workbench::PreviousVisualStep",
+      "right": "rust_workbench::NextVisualStep",
+      "enter": "rust_workbench::FocusVisualStepSource",
+    },
+  },
 ]

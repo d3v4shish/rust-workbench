@@ -822,6 +822,10 @@ pub enum InlayHintKind {
     OwnershipEstimated,
     OwnershipExact,
     Drop,
+    MechanicsLayout,
+    MechanicsStorage,
+    MechanicsAccess,
+    MechanicsWrapper,
 }
 
 impl InlayHintKind {
@@ -838,6 +842,10 @@ impl InlayHintKind {
             "ownership_estimated" => Some(InlayHintKind::OwnershipEstimated),
             "ownership_exact" => Some(InlayHintKind::OwnershipExact),
             "drop" => Some(InlayHintKind::Drop),
+            "mechanics_layout" => Some(InlayHintKind::MechanicsLayout),
+            "mechanics_storage" => Some(InlayHintKind::MechanicsStorage),
+            "mechanics_access" => Some(InlayHintKind::MechanicsAccess),
+            "mechanics_wrapper" => Some(InlayHintKind::MechanicsWrapper),
             _ => None,
         }
     }
@@ -852,6 +860,10 @@ impl InlayHintKind {
             InlayHintKind::OwnershipEstimated => "ownership_estimated",
             InlayHintKind::OwnershipExact => "ownership_exact",
             InlayHintKind::Drop => "drop",
+            InlayHintKind::MechanicsLayout => "mechanics_layout",
+            InlayHintKind::MechanicsStorage => "mechanics_storage",
+            InlayHintKind::MechanicsAccess => "mechanics_access",
+            InlayHintKind::MechanicsWrapper => "mechanics_wrapper",
         }
     }
 }

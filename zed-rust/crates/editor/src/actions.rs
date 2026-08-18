@@ -105,6 +105,16 @@ pub struct ToggleCodeActions {
     pub quick_launch: bool,
 }
 
+/// Opens the Rust Workbench at the source path represented by a mechanics hint.
+///
+/// This action is dispatched by the editor's inlay hit-testing and handled by
+/// the optional Rust Workbench crate, keeping the editor independent of that
+/// panel implementation.
+#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRustWorkbenchForClue;
+
 #[derive(PartialEq, Clone, Debug)]
 pub enum CodeActionSource {
     Indicator(DisplayRow),

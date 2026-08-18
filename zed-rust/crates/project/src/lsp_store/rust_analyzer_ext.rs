@@ -110,6 +110,8 @@ pub struct OwnershipProblemRelated {
 #[serde(rename_all = "camelCase")]
 pub struct OwnershipModel {
     pub schema_version: u32,
+    #[serde(default)]
+    pub target_triple: String,
     pub precision: String,
     pub status: String,
     #[serde(default)]
@@ -128,6 +130,8 @@ pub struct OwnershipModel {
     pub bindings: Vec<OwnershipBinding>,
     #[serde(default)]
     pub loans: Vec<OwnershipLoan>,
+    #[serde(default)]
+    pub memory_graph: OwnershipMemoryGraph,
     #[serde(default)]
     pub operations: Vec<OwnershipOperationInsight>,
     #[serde(default)]
@@ -307,6 +311,103 @@ pub struct OwnershipMemoryLayer {
     pub provenance: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipMemoryGraph {
+    pub nodes: Vec<OwnershipMemoryNode>,
+    pub edges: Vec<OwnershipMemoryEdge>,
+    pub snapshots: Vec<OwnershipMemorySnapshot>,
+    pub access_paths: Vec<OwnershipAccessPath>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipMemoryNode {
+    pub id: String,
+    pub body_id: u64,
+    pub place: String,
+    pub kind: String,
+    pub storage: String,
+    pub label: String,
+    pub type_name: String,
+    pub size: Option<u64>,
+    pub align: Option<u64>,
+    pub range: Option<lsp::Range>,
+    pub state: String,
+    pub provenance: String,
+    pub physical_placement_note: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipMemoryEdge {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+    pub event_id: Option<String>,
+    pub loan_id: Option<u32>,
+    pub range: Option<lsp::Range>,
+    pub provenance: String,
+    pub path_marker: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipStateDelta {
+    pub node_id: String,
+    pub from: Option<String>,
+    pub to: String,
+    pub relation_added: Option<String>,
+    pub relation_removed: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipMemorySnapshot {
+    pub id: String,
+    pub event_id: String,
+    pub body_id: u64,
+    pub basic_block: u32,
+    pub statement_index: u32,
+    pub kind: String,
+    pub range: lsp::Range,
+    pub place: String,
+    pub loan_id: Option<u32>,
+    pub path_marker: Option<String>,
+    pub deltas: Vec<OwnershipStateDelta>,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipAccessStep {
+    pub kind: String,
+    pub starting_type: String,
+    pub result_type: String,
+    pub mutability: String,
+    pub explicitness: String,
+    pub fallible: bool,
+    pub may_panic: bool,
+    pub requires_unsafe: bool,
+    pub explanation: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipAccessPath {
+    pub id: String,
+    pub body_id: u64,
+    pub node_id: String,
+    pub place: String,
+    pub purpose: String,
+    pub steps: Vec<OwnershipAccessStep>,
+    pub provenance: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnershipLoanPoint {
@@ -397,6 +498,8 @@ pub struct OwnershipRepair {
     pub validation_state: String,
     #[serde(default)]
     pub effects: OwnershipRepairEffects,
+    #[serde(default)]
+    pub preview_graph: Option<OwnershipMemoryGraph>,
 }
 
 fn candidate_validation_state() -> String {

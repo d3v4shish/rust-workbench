@@ -952,6 +952,23 @@ impl EditorElement {
 
         if let Some(mouse_position) = event.mouse_position()
             && !pending_nonempty_selections
+            && text_hitbox.is_hovered(window)
+            && !matches!(
+                editor.selection_drag_state,
+                SelectionDragState::Dragging { .. }
+            )
+        {
+            let point = position_map.point_for_position(mouse_position);
+            if editor.rust_mechanics_hint_at_point(&position_map.snapshot, &point, cx) {
+                window.dispatch_action(Box::new(crate::actions::OpenRustWorkbenchForClue), cx);
+                editor.selection_drag_state = SelectionDragState::None;
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        if let Some(mouse_position) = event.mouse_position()
+            && !pending_nonempty_selections
             && hovered_link_modifier
             && mouse_down_hovered_link_modifier
             && text_hitbox.is_hovered(window)

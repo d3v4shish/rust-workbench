@@ -137,7 +137,16 @@ impl RustWorkbenchToolchain {
         });
 
         json!({
-            "ownership": { "enable": true },
+            "ownership": {
+                "enable": true,
+                "mechanics": {
+                    "enable": true,
+                    "layout": true,
+                    "storage": true,
+                    "access": true,
+                    "wrappers": true,
+                },
+            },
             "assist": {
                 "ownershipWrapperSuggestions": { "enable": true },
             },
@@ -2538,6 +2547,26 @@ mod tests {
         let options = toolchain.initialization_options();
 
         assert_eq!(options.pointer("/ownership/enable"), Some(&json!(true)));
+        assert_eq!(
+            options.pointer("/ownership/mechanics/enable"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            options.pointer("/ownership/mechanics/layout"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            options.pointer("/ownership/mechanics/storage"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            options.pointer("/ownership/mechanics/access"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            options.pointer("/ownership/mechanics/wrappers"),
+            Some(&json!(true))
+        );
         assert_eq!(
             options.pointer("/assist/ownershipWrapperSuggestions/enable"),
             Some(&json!(true))

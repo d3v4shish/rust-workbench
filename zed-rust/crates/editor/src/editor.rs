@@ -932,6 +932,15 @@ pub enum RustOwnershipHintScope {
     File,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RustMechanicsHintMode {
+    #[default]
+    Off,
+    SelectedPath,
+    ConfiguredScope,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RustOwnershipDisplayPreferences {
     #[serde(skip)]
@@ -952,6 +961,16 @@ pub struct RustOwnershipDisplayPreferences {
     pub show_reinitializations: bool,
     pub show_drops: bool,
     pub show_ownership_coloring: bool,
+    #[serde(default)]
+    pub mechanics_mode: RustMechanicsHintMode,
+    #[serde(default)]
+    pub show_layout: bool,
+    #[serde(default)]
+    pub show_storage: bool,
+    #[serde(default)]
+    pub show_access: bool,
+    #[serde(default)]
+    pub show_wrappers: bool,
     #[serde(skip)]
     pub focus_rows: Vec<(u32, u32)>,
 }
@@ -982,6 +1001,11 @@ impl RustOwnershipDisplayPreferences {
             show_reinitializations: false,
             show_drops: false,
             show_ownership_coloring: false,
+            mechanics_mode: RustMechanicsHintMode::Off,
+            show_layout: false,
+            show_storage: false,
+            show_access: false,
+            show_wrappers: false,
             focus_rows: Vec::new(),
         }
     }
@@ -1005,6 +1029,11 @@ impl RustOwnershipDisplayPreferences {
             show_reinitializations: true,
             show_drops: false,
             show_ownership_coloring: true,
+            mechanics_mode: RustMechanicsHintMode::SelectedPath,
+            show_layout: true,
+            show_storage: true,
+            show_access: true,
+            show_wrappers: true,
             focus_rows: Vec::new(),
         }
     }
@@ -1028,6 +1057,11 @@ impl RustOwnershipDisplayPreferences {
             show_reinitializations: true,
             show_drops: true,
             show_ownership_coloring: true,
+            mechanics_mode: RustMechanicsHintMode::ConfiguredScope,
+            show_layout: true,
+            show_storage: true,
+            show_access: true,
+            show_wrappers: true,
             focus_rows: Vec::new(),
         }
     }
