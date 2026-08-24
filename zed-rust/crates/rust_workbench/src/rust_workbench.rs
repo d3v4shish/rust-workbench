@@ -1189,8 +1189,8 @@ impl RustWorkbenchPanel {
                         if panel.pending_problem_key.is_none() {
                             panel.schedule_problem_scan(cx);
                         }
-                    } else if panel.selected_problem_id.is_none()
-                        && let Some(index) = panel.problem_index_at_cursor(cx)
+                    } else if let Some(index) = panel.problem_index_at_cursor(cx)
+                        && panel.selected_problem_index() != Some(index)
                     {
                         panel.select_problem_index(index, false, cx);
                     }
