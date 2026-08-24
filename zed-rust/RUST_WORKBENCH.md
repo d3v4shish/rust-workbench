@@ -18,17 +18,8 @@ From the combined repository root (the directory containing `workbench.toml`):
 ./workbench run zed-rust/rust-workbench-example
 ```
 
-`bootstrap` also installs the pinned Generated C backend into the ignored
-workspace dependency cache. To repair only that component, run:
-
-```sh
-./workbench bootstrap generated-c
-./workbench doctor
-```
-
-The backend is rustc_codegen_c `release-1.94.1-2`; its downloaded archive is
-accepted only when its size and pinned SHA-256 match. It is not registered as a
-global rustup toolchain.
+`bootstrap` installs the rootless native build dependencies used by the editor
+and bundled Rust toolchain. Run `./workbench doctor` to verify the workspace.
 
 The normal build and desktop launcher use the optimized release binary. For
 debugging only, use `./script/build-rust-workbench --debug` followed by
@@ -52,11 +43,11 @@ The default panel is a compact guided path: **What went wrong**, **Follow the
 value**, **Why Rust stops this**, and **Fix it safely**. Only the selected value
 step is expanded. Repair diffs and runtime trade-offs appear only after
 Preview. **Explore deeper (optional)** contains resolved calls, timelines,
-lifetimes, memory layouts, MIR evidence, and the C comparison. Clicking a trace
+lifetimes, memory layouts, MIR evidence, and Conceptual C. Clicking a trace
 or loan item highlights and scrolls to its Rust source range.
 
-Above that local explanation, **Workspace cause and impact** shows one selected
-root in a vertical tree:
+After that local explanation, **Workspace cause and impact** shows one selected
+root in a vertical tree. Single-file impact stays collapsed until requested:
 
 - **ROOT** is the move, borrow, or rejected access that established the
   compiler constraint;
@@ -88,6 +79,12 @@ such as move, partial move, shared/mutable borrow, borrow end, reinitialization,
 invalid use, last use, and drop. rust-analyzer maps the compiler byte ranges to
 the editor and the native panel presents a cursor-scoped timeline.
 
+The primary memory map follows the compiler's explicit representation chain.
+For example, `values: Rc<RefCell<Vec<i32>>>` is shown as variable -> inline Rc
+handle -> shared heap allocation -> RefCell access gate -> inline Vec header ->
+heap element buffer. Moves reconnect the destination handle to the same
+allocation; `Rc::clone` keeps two handles converging on one allocation.
+
 Repairs are alternatives, not unconditional recommendations. Each displayed
 repair includes:
 
@@ -107,30 +104,12 @@ Compiler validation proves that the candidate type-checks; it does not decide
 whether runtime borrow checks, reference counting, locking, or thread-safe
 sharing are appropriate for the program's design.
 
-## Generated C
+## Conceptual C
 
-Generated C is an optional low-level companion to Conceptual C:
-
-1. Open a valid Cargo project and save the Rust file.
-2. Open the Workbench, expand **Explore deeper (optional)**, and open
-   **C intent**.
-3. Select **Generated C** and then **Generate**. Compilation remains outside
-   the editor event loop and can be cancelled.
-4. If rustc_codegen_c emits several project translation units, use
-   **Previous C file** and **Next C file**. **Open full artifact** opens the
-   selected exact `.rcgu.c` file.
-
-The portable application contains its own checksum-verified rustc_codegen_c
-Cargo, rustc, prebuilt standard library, and licenses. Generation targets only
-the Cargo target containing the active file; it does not rebuild `core` or
-`std`. Its stable per-project cache makes later saved edits incremental.
-External crate sources still follow normal Cargo cache/network rules.
-
-The view excludes backend `native_stubs.c`, standard-library sources, build
-scripts, dependency crates, and stale target hashes. It reports the selected
-Cargo target, translation-unit count, duration, source hash, backend identity,
-and exact artifact path. This remains compiler output rather than idiomatic C
-or an ABI-equivalent teaching translation.
+Open **Explore deeper (optional)** and then **C intent** to see the selected Rust
+ownership event expressed with C-like owner and pointer names. This view explains
+intent only. It is neither generated compiler output nor an ABI-equivalent
+translation, and it never runs an additional compiler backend.
 
 ## Quick tests
 

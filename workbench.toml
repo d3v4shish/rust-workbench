@@ -10,15 +10,6 @@ arch = "x86_64"
 glibc_min = "2.43"
 archive = "rust-workbench-linux-x86_64-glibc2.43.tar.zst"
 
-[generated_c]
-release = "release-1.94.1-2"
-rust_version = "1.94.1"
-asset = "rustic-toolchain-x86_64-unknown-linux-gnu-gcc.tar.gz"
-url = "https://github.com/rustic-compiler/rustc_codegen_c/releases/download/release-1.94.1-2/rustic-toolchain-x86_64-unknown-linux-gnu-gcc.tar.gz"
-sha256 = "c4bb8e55cf20972ef287a2b76c9e08a223f89f95933de79f76acfab073c964a2"
-archive_size = 238079559
-source = "https://github.com/rustic-compiler/rustc_codegen_c"
-
 [cleanup]
 debug_caches = [
   "zed-rust/target/debug",

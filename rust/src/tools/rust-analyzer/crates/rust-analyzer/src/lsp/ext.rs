@@ -243,6 +243,8 @@ pub struct OwnershipProblemRelated {
 pub struct OwnershipModelResult {
     pub schema_version: u32,
     #[serde(default)]
+    pub compiler_schema_version: u32,
+    #[serde(default)]
     pub target_triple: String,
     pub precision: String,
     pub status: String,

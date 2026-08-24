@@ -158,11 +158,15 @@ fn test_ownership_topology() {
     assert_eq!(models.len(), 1, "unexpected ownership models: {models:?}");
     let model = rfs::read_to_string(&models[0]);
     for fact in [
-        r#""schema_version":6"#,
+        r#""schema_version":7"#,
         r#""target_triple":"x86_64-unknown-linux-gnu""#,
+        r#""kind":"box_handle""#,
         r#""kind":"box_allocation""#,
+        r#""kind":"rc_handle""#,
         r#""kind":"rc_allocation""#,
+        r#""kind":"arc_handle""#,
         r#""kind":"arc_allocation""#,
+        r#""kind":"weak_handle""#,
         r#""kind":"weak_allocation""#,
         r#""kind":"pin_constraint""#,
         r#""kind":"cell_state""#,
@@ -177,6 +181,10 @@ fn test_ownership_topology() {
         r#""kind":"reference_handle""#,
         r#""kind":"fat_pointer_metadata""#,
         r#""kind":"raw_pointer""#,
+        r#""kind":"handle""#,
+        r#""kind":"wrapper""#,
+        r#""relation":"stores""#,
+        r#""relation":"wraps""#,
         r#""relation":"weak_reference""#,
         r#""kind":"raw_pointer_deref""#,
         r#""kind":"weak_upgrade""#,
@@ -312,7 +320,7 @@ fn test_ownership_events() {
     );
     let model = rfs::read_to_string(&models[0]);
     for field in [
-        r#""schema_version":6"#,
+        r#""schema_version":7"#,
         r#""ownership_bodies":"#,
         r#""ownership_bindings":"#,
         r#""ownership_loans":"#,
@@ -365,7 +373,13 @@ fn test_ownership_events() {
     let success_models = find_files(Path::new("ownership-model-success"), "json");
     assert_eq!(success_models.len(), 1, "unexpected ownership models: {success_models:?}");
     let success_model = rfs::read_to_string(&success_models[0]);
-    for field in [r#""kind":"rc_allocation""#, r#""kind":"ref_cell_state""#] {
+    for field in [
+        r#""kind":"rc_handle""#,
+        r#""kind":"rc_allocation""#,
+        r#""kind":"ref_cell_state""#,
+        r#""relation":"stores""#,
+        r#""relation":"shares_allocation""#,
+    ] {
         assert!(success_model.contains(field), "missing {field}: {success_model}");
     }
     assert!(success_model.contains(r#""kind":"clone""#), "{success_model}");
@@ -373,6 +387,35 @@ fn test_ownership_events() {
         success_model.matches(r#""kind":"control_block""#).count(),
         1,
         "Rc::clone must produce two handles sharing one control block: {success_model}"
+    );
+    assert_eq!(
+        success_model.matches(r#""kind":"handle""#).count(),
+        2,
+        "Rc::clone must retain one inline handle per binding: {success_model}"
+    );
+
+    rfs::create_dir("ownership-model-move-success");
+    rustc()
+        .input("ownership-model-move-success.rs")
+        .output("ownership-model-move-success-bin")
+        .arg("-Zborrowck-ownership-model=ownership-model-move-success")
+        .run();
+    let move_models = find_files(Path::new("ownership-model-move-success"), "json");
+    assert_eq!(move_models.len(), 1, "unexpected ownership models: {move_models:?}");
+    let move_model = rfs::read_to_string(&move_models[0]);
+    assert_eq!(
+        move_model.matches(r#""kind":"heap_allocation""#).count(),
+        1,
+        "a Box move must preserve one allocation identity: {move_model}"
+    );
+    assert_eq!(
+        move_model.matches(r#""kind":"handle""#).count(),
+        2,
+        "a Box move must retain the source and destination handles: {move_model}"
+    );
+    assert!(
+        move_model.contains(r#""relation_removed":"owns""#),
+        "a Box move must deactivate the source handle's ownership edge: {move_model}"
     );
 }
 

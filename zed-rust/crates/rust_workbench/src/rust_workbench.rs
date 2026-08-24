@@ -1,10 +1,17 @@
 mod learning_catalog;
+mod ownership_diagram;
+mod ownership_topology;
+
+use ownership_diagram::render_topology_scene;
+use ownership_topology::{
+    OwnershipTopologyScene, TopologyColumn, derive_ownership_topology_scene,
+    derive_ownership_topology_scene_with_limits, topology_column, topology_column_title,
+    topology_edge_active_at_step, topology_state_at_step,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read,
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use db::kvp::KeyValueStore;
@@ -31,7 +38,6 @@ use project::{
 };
 use text::{Bias, Point, PointUtf16, ToPointUtf16};
 use ui::{Button, Color, IconName, Label, LabelSize, prelude::*, utils::WithRemSize, v_flex};
-use util::ResultExt as _;
 use workspace::{
     ItemHandle, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -88,45 +94,10 @@ impl DetailDrawer {
             Self::Lifetimes => "Lifetimes",
             Self::Calls => "Calls",
             Self::Layout => "Layout",
-            Self::C => "C intent",
+            Self::C => "Conceptual C",
             Self::Evidence => "Evidence",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum CViewMode {
-    #[default]
-    Conceptual,
-    Generated,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-enum CGenerationState {
-    #[default]
-    NotStarted,
-    Waiting,
-    Running,
-    Ready,
-    Blocked(SharedString),
-    Failed(SharedString),
-    Stale(SharedString),
-}
-
-#[derive(Clone, Debug)]
-struct GeneratedCArtifact {
-    units: Vec<GeneratedCTranslationUnit>,
-    target: SharedString,
-    source_hash: String,
-    backend: SharedString,
-    duration: Duration,
-}
-
-#[derive(Clone, Debug)]
-struct GeneratedCTranslationUnit {
-    code: SharedString,
-    path: PathBuf,
-    label: SharedString,
 }
 
 #[cfg(test)]
@@ -291,11 +262,6 @@ pub struct RustWorkbenchPanel {
     repair_verification: Option<RepairVerification>,
     repair_validation_task: Task<()>,
     validating_repair_id: Option<String>,
-    c_view_mode: CViewMode,
-    c_generation_state: CGenerationState,
-    generated_c: Option<GeneratedCArtifact>,
-    generated_c_unit_index: usize,
-    generated_c_task: Task<()>,
     exact_mode: bool,
     visual_step: usize,
     topology_scene: Option<OwnershipTopologyScene>,
@@ -558,11 +524,6 @@ impl RustWorkbenchPanel {
                     repair_verification: None,
                     repair_validation_task: Task::ready(()),
                     validating_repair_id: None,
-                    c_view_mode: CViewMode::Conceptual,
-                    c_generation_state: CGenerationState::NotStarted,
-                    generated_c: None,
-                    generated_c_unit_index: 0,
-                    generated_c_task: Task::ready(()),
                     exact_mode: false,
                     visual_step: 0,
                     topology_scene: None,
@@ -647,15 +608,7 @@ impl RustWorkbenchPanel {
                     {
                         verification.state = RepairVerificationState::Checking;
                     }
-                    panel.mark_generated_c_stale("Source changed; save to regenerate.", cx);
                     panel.schedule_problem_scan(cx);
-                }
-                if panel.active
-                    && panel.c_view_mode == CViewMode::Generated
-                    && panel.active_detail_drawer == Some(DetailDrawer::C)
-                    && matches!(event, EditorEvent::Saved)
-                {
-                    panel.schedule_generated_c(cx);
                 }
                 if panel.active && matches!(event, EditorEvent::SelectionsChanged { local: true }) {
                     panel.schedule_cursor_problem_selection(cx);
@@ -1000,16 +953,10 @@ impl RustWorkbenchPanel {
     fn toggle_detail_drawer(&mut self, drawer: DetailDrawer, cx: &mut Context<Self>) {
         if self.active_detail_drawer == Some(drawer) {
             self.active_detail_drawer = None;
-            if drawer == DetailDrawer::C {
-                self.cancel_generated_c(cx);
-            }
         } else {
             self.active_detail_drawer = Some(drawer);
             if drawer == DetailDrawer::Variables && self.full_topology_scene.is_none() {
                 self.rebuild_full_topology_scene();
-            }
-            if drawer == DetailDrawer::C && self.c_view_mode == CViewMode::Generated {
-                self.schedule_generated_c(cx);
             }
         }
         cx.notify();
@@ -1180,141 +1127,6 @@ impl RustWorkbenchPanel {
         editor.update(cx, |editor, cx| {
             editor.set_rust_ownership_display_preferences(preferences, cx);
         });
-    }
-
-    fn mark_generated_c_stale(&mut self, reason: &'static str, cx: &mut Context<Self>) {
-        self.generated_c_task = Task::ready(());
-        if self.generated_c.is_some() {
-            self.c_generation_state = CGenerationState::Stale(reason.into());
-        } else if self.c_view_mode == CViewMode::Generated {
-            self.c_generation_state = CGenerationState::Waiting;
-        }
-        cx.notify();
-    }
-
-    fn schedule_generated_c(&mut self, cx: &mut Context<Self>) {
-        if self.c_view_mode != CViewMode::Generated
-            || self.active_detail_drawer != Some(DetailDrawer::C)
-        {
-            return;
-        }
-        let Some(buffer) = self.active_buffer.clone() else {
-            self.c_generation_state =
-                CGenerationState::Blocked("Open a saved Rust file first.".into());
-            cx.notify();
-            return;
-        };
-        if buffer.read(cx).is_dirty() {
-            self.c_generation_state = CGenerationState::Blocked(
-                "Generated C requires saved Rust. Save the file, then refresh.".into(),
-            );
-            cx.notify();
-            return;
-        }
-        let Some(source_path) = buffer
-            .read(cx)
-            .file()
-            .and_then(|file| file.as_local())
-            .map(|file| file.abs_path(cx))
-        else {
-            self.c_generation_state = CGenerationState::Blocked(
-                "Generated C is available for local Cargo projects only.".into(),
-            );
-            cx.notify();
-            return;
-        };
-        let source = buffer.read(cx).snapshot().text();
-        let source_hash = ownership_source_hash(&source);
-        let focus_label = self.model.source_context.as_ref().and_then(|context| {
-            context
-                .breadcrumbs
-                .iter()
-                .rev()
-                .find(|item| item.kind == "function" || item.kind == "method")
-                .map(|item| item.label.clone())
-        });
-        self.c_generation_state = CGenerationState::Waiting;
-        cx.notify();
-        self.generated_c_task = cx.spawn(async move |panel, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(1500))
-                .await;
-            panel
-                .update(cx, |panel, cx| {
-                    panel.c_generation_state = CGenerationState::Running;
-                    cx.notify();
-                })
-                .ok();
-            let generation =
-                cx.background_spawn(generate_c_artifact(source_path, source_hash, focus_label));
-            let result = generation.await;
-            panel
-                .update(cx, |panel, cx| {
-                    match result {
-                        Ok(artifact) => {
-                            let source_is_current =
-                                panel.active_buffer.as_ref().is_some_and(|buffer| {
-                                    ownership_source_hash(&buffer.read(cx).snapshot().text())
-                                        == artifact.source_hash
-                                });
-                            panel.c_generation_state = if source_is_current {
-                                CGenerationState::Ready
-                            } else {
-                                CGenerationState::Stale(
-                                    "Rust changed while C was being generated.".into(),
-                                )
-                            };
-                            panel.generated_c_unit_index = 0;
-                            panel.generated_c = Some(artifact);
-                        }
-                        Err(error) => {
-                            let message = error.to_string();
-                            panel.c_generation_state = if message.contains("toolchain")
-                                || message.contains("bootstrap generated-c")
-                            {
-                                CGenerationState::Blocked(message.into())
-                            } else {
-                                CGenerationState::Failed(message.into())
-                            };
-                        }
-                    }
-                    cx.notify();
-                })
-                .ok();
-        });
-    }
-
-    fn cancel_generated_c(&mut self, cx: &mut Context<Self>) {
-        self.generated_c_task = Task::ready(());
-        self.c_generation_state = if self.generated_c.is_some() {
-            CGenerationState::Stale("Generation cancelled; showing the previous artifact.".into())
-        } else {
-            CGenerationState::NotStarted
-        };
-        cx.notify();
-    }
-
-    fn open_generated_c(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self
-            .generated_c
-            .as_ref()
-            .and_then(|artifact| artifact.units.get(self.generated_c_unit_index))
-            .map(|unit| unit.path.clone())
-        else {
-            return;
-        };
-        let workspace = self.workspace.clone();
-        cx.spawn_in(window, async move |_panel, cx| {
-            let open = workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.open_abs_path(path, workspace::OpenOptions::default(), window, cx)
-                })
-                .ok();
-            if let Some(open) = open {
-                open.await.log_err();
-            }
-        })
-        .detach();
     }
 
     fn open_workspace_site(
@@ -2021,403 +1833,6 @@ fn ownership_model_matches_source(model: &OwnershipModel, source: &str) -> bool 
         || model.source_hash == ownership_source_hash(source)
 }
 
-#[derive(Debug)]
-struct RusticToolchain {
-    sysroot: PathBuf,
-    cargo: PathBuf,
-    rustc: PathBuf,
-    backend: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GeneratedCCargoMetadata {
-    packages: Vec<GeneratedCCargoPackage>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GeneratedCCargoPackage {
-    name: String,
-    manifest_path: PathBuf,
-    targets: Vec<GeneratedCCargoTarget>,
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct GeneratedCCargoTarget {
-    name: String,
-    kind: Vec<String>,
-    src_path: PathBuf,
-}
-
-async fn generate_c_artifact(
-    source_path: PathBuf,
-    source_hash: String,
-    focus_label: Option<String>,
-) -> anyhow::Result<GeneratedCArtifact> {
-    let manifest_path = source_path
-        .ancestors()
-        .map(|ancestor| ancestor.join("Cargo.toml"))
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| {
-            anyhow::anyhow!("No Cargo.toml was found above {}.", source_path.display())
-        })?;
-    let toolchain = resolve_rustic_toolchain().await?;
-    let package = generated_c_package_metadata(&toolchain, &manifest_path).await?;
-    let target = select_generated_c_target(&package, &source_path);
-    let target_names = target
-        .as_ref()
-        .map(|target| vec![target.name.clone()])
-        .unwrap_or_else(|| {
-            package
-                .targets
-                .iter()
-                .map(|target| target.name.clone())
-                .collect()
-        });
-    let target_description = target
-        .as_ref()
-        .map(|target| target.name.clone())
-        .unwrap_or_else(|| package.name.clone());
-    let cache_identity = format!(
-        "{}|{}|{}",
-        manifest_path.display(),
-        target_description,
-        toolchain.sysroot.display()
-    );
-    let target_dir = paths::temp_dir()
-        .join("generated-c")
-        .join(ownership_source_hash(&cache_identity));
-    std::fs::create_dir_all(&target_dir)?;
-    let started = Instant::now();
-    let mut command = async_process::Command::new(&toolchain.cargo);
-    command
-        .args(["build", "--manifest-path"])
-        .arg(&manifest_path);
-    if let Some(target) = target.as_ref() {
-        add_generated_c_target_argument(&mut command, target);
-    }
-    configure_rustic_command(&mut command, &toolchain)?;
-    command
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .env("CARGO_PROFILE_DEV_OPT_LEVEL", "0")
-        .env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1")
-        .env("CARGO_PROFILE_DEV_DEBUG", "1")
-        .env("CARGO_INCREMENTAL", "1")
-        .kill_on_drop(true);
-    let output = command.output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let diagnostic = stderr
-            .chars()
-            .rev()
-            .take(12_000)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
-        anyhow::bail!(
-            "Generated C is blocked because the experimental backend could not build this target:\n{diagnostic}"
-        );
-    }
-    let units = collect_generated_c_units(&target_dir, &target_names, focus_label.as_deref())?;
-    Ok(GeneratedCArtifact {
-        units,
-        target: target_description.into(),
-        source_hash,
-        backend: toolchain.backend.into(),
-        duration: started.elapsed(),
-    })
-}
-
-async fn resolve_rustic_toolchain() -> anyhow::Result<RusticToolchain> {
-    if let Some(sysroot) = std::env::var_os("RUST_WORKBENCH_RUSTIC_SYSROOT").map(PathBuf::from) {
-        return rustic_toolchain_from_sysroot(
-            sysroot,
-            "bundled, checksum-verified rustc_codegen_c",
-        );
-    }
-    if let Some(cargo) = std::env::var_os("RUST_WORKBENCH_RUSTIC_CARGO").map(PathBuf::from) {
-        let sysroot = cargo
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| anyhow::anyhow!("RUST_WORKBENCH_RUSTIC_CARGO has no toolchain root"))?;
-        return rustic_toolchain_from_sysroot(
-            sysroot.to_path_buf(),
-            "custom rustc_codegen_c toolchain",
-        );
-    }
-
-    let cargo = rustup_rustic_which("cargo").await?;
-    let rustc = rustup_rustic_which("rustc").await?;
-    let sysroot = cargo
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| anyhow::anyhow!("rustup returned an invalid rustic Cargo path"))?
-        .to_path_buf();
-    if !rustc.is_file() {
-        anyhow::bail!("rustup's rustic rustc is missing: {}", rustc.display());
-    }
-    Ok(RusticToolchain {
-        sysroot,
-        cargo,
-        rustc,
-        backend: "rustc_codegen_c via rustup toolchain `rustic`".to_owned(),
-    })
-}
-
-fn rustic_toolchain_from_sysroot(
-    sysroot: PathBuf,
-    backend: &str,
-) -> anyhow::Result<RusticToolchain> {
-    let sysroot = std::fs::canonicalize(&sysroot).unwrap_or(sysroot);
-    let cargo = sysroot.join("bin/cargo");
-    let rustc = sysroot.join("bin/rustc");
-    for (name, path) in [("Cargo", &cargo), ("rustc", &rustc)] {
-        if !path.is_file() {
-            anyhow::bail!(
-                "The generated-C {name} executable is missing at {}. Run `./workbench bootstrap generated-c` and rebuild the bundle.",
-                path.display()
-            );
-        }
-    }
-    Ok(RusticToolchain {
-        sysroot,
-        cargo,
-        rustc,
-        backend: backend.to_owned(),
-    })
-}
-
-async fn rustup_rustic_which(tool: &str) -> anyhow::Result<PathBuf> {
-    let mut locate = async_process::Command::new("rustup");
-    locate
-        .args(["which", "--toolchain", "rustic", tool])
-        .kill_on_drop(true);
-    let located = locate.output().await?;
-    if !located.status.success() {
-        anyhow::bail!(
-            "The bundled generated-C toolchain is unavailable and rustup toolchain `rustic` is not installed. Run `./workbench bootstrap generated-c`; Conceptual C remains available."
-        );
-    }
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&located.stdout).trim(),
-    ))
-}
-
-fn configure_rustic_command(
-    command: &mut async_process::Command,
-    toolchain: &RusticToolchain,
-) -> anyhow::Result<()> {
-    let mut search_path = vec![toolchain.sysroot.join("bin")];
-    if let Some(existing) = std::env::var_os("PATH") {
-        search_path.extend(std::env::split_paths(&existing));
-    }
-    command
-        .env("RUSTC", &toolchain.rustc)
-        .env("PATH", std::env::join_paths(search_path)?)
-        .env_remove("RUSTDOC")
-        .env_remove("RUSTUP_TOOLCHAIN")
-        .env_remove("RUSTC_BOOTSTRAP");
-    Ok(())
-}
-
-async fn generated_c_package_metadata(
-    toolchain: &RusticToolchain,
-    manifest_path: &Path,
-) -> anyhow::Result<GeneratedCCargoPackage> {
-    let mut command = async_process::Command::new(&toolchain.cargo);
-    command
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--manifest-path",
-        ])
-        .arg(manifest_path)
-        .kill_on_drop(true);
-    configure_rustic_command(&mut command, toolchain)?;
-    let output = command.output().await?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "Cargo metadata failed before C generation:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let metadata: GeneratedCCargoMetadata = serde_json::from_slice(&output.stdout)?;
-    let expected_manifest =
-        std::fs::canonicalize(manifest_path).unwrap_or_else(|_| manifest_path.to_path_buf());
-    metadata
-        .packages
-        .into_iter()
-        .find(|package| {
-            std::fs::canonicalize(&package.manifest_path)
-                .unwrap_or_else(|_| package.manifest_path.clone())
-                == expected_manifest
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!("Cargo metadata did not contain {}", manifest_path.display())
-        })
-}
-
-fn select_generated_c_target(
-    package: &GeneratedCCargoPackage,
-    source_path: &Path,
-) -> Option<GeneratedCCargoTarget> {
-    if let Some(exact) = package
-        .targets
-        .iter()
-        .find(|target| target.src_path == source_path)
-    {
-        return Some(exact.clone());
-    }
-    if let Some((_, containing)) = package
-        .targets
-        .iter()
-        .filter_map(|target| {
-            let root = match target.src_path.file_name().and_then(|name| name.to_str()) {
-                Some("lib.rs" | "main.rs" | "mod.rs") => target.src_path.parent()?.to_path_buf(),
-                _ => target.src_path.with_extension(""),
-            };
-            source_path
-                .starts_with(&root)
-                .then(|| (root.components().count(), target))
-        })
-        .max_by_key(|(depth, _)| *depth)
-    {
-        return Some(containing.clone());
-    }
-    if let Some(library) = package.targets.iter().find(|target| {
-        target
-            .kind
-            .iter()
-            .any(|kind| kind == "lib" || kind == "rlib")
-            && target
-                .src_path
-                .parent()
-                .is_some_and(|root| source_path.starts_with(root))
-    }) {
-        return Some(library.clone());
-    }
-    (package.targets.len() == 1).then(|| package.targets[0].clone())
-}
-
-fn add_generated_c_target_argument(
-    command: &mut async_process::Command,
-    target: &GeneratedCCargoTarget,
-) {
-    let kind = target.kind.first().map(String::as_str).unwrap_or("bin");
-    match kind {
-        "lib" | "rlib" | "cdylib" | "dylib" | "staticlib" | "proc-macro" => {
-            command.arg("--lib");
-        }
-        "example" => {
-            command.args(["--example", target.name.as_str()]);
-        }
-        "test" => {
-            command.args(["--test", target.name.as_str()]);
-        }
-        "bench" => {
-            command.args(["--bench", target.name.as_str()]);
-        }
-        _ => {
-            command.args(["--bin", target.name.as_str()]);
-        }
-    }
-}
-
-fn collect_generated_c_units(
-    target_dir: &Path,
-    target_names: &[String],
-    focus_label: Option<&str>,
-) -> anyhow::Result<Vec<GeneratedCTranslationUnit>> {
-    let deps = target_dir.join("debug/deps");
-    let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    for entry in std::fs::read_dir(&deps)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "cannot read generated C directory {}: {error}",
-                deps.display()
-            )
-        })?
-        .flatten()
-    {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let belongs_to_target = target_names.iter().any(|target| {
-            let normalized = target.replace('-', "_");
-            name.starts_with(&format!("{normalized}-"))
-        });
-        if !belongs_to_target || !name.ends_with(".rcgu.c") || name == "native_stubs.c" {
-            continue;
-        }
-        let group = name.split('.').next().unwrap_or(name).to_owned();
-        groups.entry(group).or_default().push(path);
-    }
-
-    let Some((_, paths)) = groups.into_iter().max_by_key(|(_, paths)| {
-        paths
-            .iter()
-            .filter_map(|path| {
-                path.metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-            })
-            .max()
-    }) else {
-        anyhow::bail!(
-            "The backend completed but produced no project-target C translation units under {}.",
-            deps.display()
-        );
-    };
-
-    let mut units = paths
-        .into_iter()
-        .map(|path| {
-            let code = read_generated_c_preview(&path, 400_000)?;
-            let label = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("translation-unit.c")
-                .to_owned();
-            Ok(GeneratedCTranslationUnit {
-                code: code.into(),
-                path,
-                label: label.into(),
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    units.sort_by(|left, right| {
-        let left_has_focus = focus_label.is_some_and(|focus| left.code.contains(focus));
-        let right_has_focus = focus_label.is_some_and(|focus| right.code.contains(focus));
-        right_has_focus
-            .cmp(&left_has_focus)
-            .then_with(|| left.label.cmp(&right.label))
-    });
-    Ok(units)
-}
-
-fn read_generated_c_preview(path: &Path, byte_limit: usize) -> anyhow::Result<String> {
-    let file = std::fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let mut bytes = Vec::with_capacity(byte_limit.min(file_len as usize));
-    file.take(byte_limit as u64).read_to_end(&mut bytes)?;
-    let valid_len = std::str::from_utf8(&bytes)
-        .map(|_| bytes.len())
-        .unwrap_or_else(|error| error.valid_up_to());
-    bytes.truncate(valid_len);
-    let code = String::from_utf8(bytes).expect("validated generated C preview");
-    if file_len <= byte_limit as u64 {
-        Ok(code)
-    } else {
-        Ok(format!(
-            "{code}\n\n/* Rust Workbench truncated this preview. Open the full artifact at {}. */",
-            path.display()
-        ))
-    }
-}
-
 fn ownership_problems_match_source(problems: &OwnershipProblems, source: &str) -> bool {
     problems.status == "rust_analyzer_unavailable"
         || problems.source_hash == ownership_source_hash(source)
@@ -2695,7 +2110,6 @@ impl Panel for RustWorkbenchPanel {
                     panel.schedule_cursor_problem_selection(cx);
                 }
             } else {
-                panel.cancel_generated_c(cx);
                 panel.clear_editor_cue(cx);
             }
         });
@@ -2711,10 +2125,6 @@ impl Render for RustWorkbenchPanel {
         let active_detail_drawer = self.active_detail_drawer;
         let expanded_operations = self.expanded_operations.clone();
         let repair_verification = self.repair_verification.clone();
-        let c_view_mode = self.c_view_mode;
-        let c_generation_state = self.c_generation_state.clone();
-        let generated_c = self.generated_c.clone();
-        let generated_c_unit_index = self.generated_c_unit_index;
         let exact_mode = self.exact_mode;
         let visual_step = self.visual_step;
         let topology_scene = self.topology_scene.clone();
@@ -2971,16 +2381,6 @@ impl Render for RustWorkbenchPanel {
                         .child(
                             v_flex()
                                 .gap_2()
-                                .child(render_workspace_impact_tree(
-                                    &workspace_guide,
-                                    show_workspace_roots,
-                                    cx,
-                                ))
-                                .child(render_workspace_intent_question(
-                                    &workspace_guide,
-                                    selected_intent_choice_id.as_deref(),
-                                    cx,
-                                ))
                                 .child(render_beginner_flow(
                                     problem.as_ref(),
                                     &self.problems,
@@ -2995,6 +2395,16 @@ impl Render for RustWorkbenchPanel {
                                     exact_mode,
                                     cx,
                                 ))
+                                .child(render_workspace_impact_tree(
+                                    &workspace_guide,
+                                    show_workspace_roots,
+                                    cx,
+                                ))
+                                .child(render_workspace_intent_question(
+                                    &workspace_guide,
+                                    selected_intent_choice_id.as_deref(),
+                                    cx,
+                                ))
                                 .child(render_detail_drawers(
                                     active_detail_drawer,
                                     problem.as_ref(),
@@ -3003,10 +2413,6 @@ impl Render for RustWorkbenchPanel {
                                     selected_topology_element.as_deref(),
                                     &expanded_operations,
                                     exact_mode,
-                                    c_view_mode,
-                                    c_generation_state,
-                                    generated_c,
-                                    generated_c_unit_index,
                                     cx,
                                 ))
                                 .into_any_element(),
@@ -3193,6 +2599,27 @@ fn render_workspace_impact_tree(
     let Some(cluster) = cluster else {
         return div().into_any_element();
     };
+    if cluster.affected_files <= 1 && !show_workspace_roots {
+        return h_flex()
+            .p_2()
+            .justify_between()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Label::new("Workspace impact · this issue stays in the current file")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Button::new("show-local-workspace-impact", "Show")
+                    .aria_expanded(false)
+                    .on_click(cx.listener(|panel, _, _window, cx| {
+                        panel.show_workspace_roots = true;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element();
+    }
     let impact_count = cluster.impacts.len();
     let caller_count = cluster.related_constraints.len();
     let mut card = v_flex()
@@ -4537,889 +3964,6 @@ fn visual_state_color(state: &str, cx: &App) -> gpui::Hsla {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum TopologyColumn {
-    Local,
-    Wrapper,
-    Target,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct TopologyRect {
-    x: u16,
-    y: u16,
-    width: u16,
-    height: u16,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TopologyNode {
-    id: String,
-    label: String,
-    type_name: String,
-    detail: String,
-    kind: String,
-    state: String,
-    provenance: String,
-    column: TopologyColumn,
-    range: Option<lsp::Range>,
-    rect: TopologyRect,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TopologyEdge {
-    id: String,
-    source: String,
-    target: String,
-    label: String,
-    provenance: String,
-    active: bool,
-    range: Option<lsp::Range>,
-    route: Vec<(u16, u16)>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TopologyMoment {
-    title: String,
-    explanation: String,
-    range: lsp::Range,
-    path_marker: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct OwnershipTopologyScene {
-    nodes: Vec<TopologyNode>,
-    edges: Vec<TopologyEdge>,
-    moments: Vec<TopologyMoment>,
-    selected_step: usize,
-    access_lines: Vec<String>,
-    canvas_height: u16,
-    expanded: bool,
-    truncated: bool,
-}
-
-fn topology_column(kind: &str, storage: &str) -> TopologyColumn {
-    if matches!(
-        kind,
-        "wrapper_state"
-            | "control_block"
-            | "borrow_flag"
-            | "lock_state"
-            | "gate"
-            | "guard"
-            | "field"
-            | "metadata"
-    ) {
-        TopologyColumn::Wrapper
-    } else if matches!(storage, "heap" | "static" | "borrowed")
-        || matches!(kind, "allocation" | "buffer" | "borrowed_view" | "pointee")
-    {
-        TopologyColumn::Target
-    } else if matches!(storage, "inline") {
-        TopologyColumn::Wrapper
-    } else {
-        TopologyColumn::Local
-    }
-}
-
-fn topology_state_at_step(
-    model: &OwnershipModel,
-    selected_step: usize,
-) -> BTreeMap<String, String> {
-    let mut states = model
-        .memory_graph
-        .nodes
-        .iter()
-        .map(|node| (node.id.clone(), "available".to_owned()))
-        .collect::<BTreeMap<_, _>>();
-    for snapshot in model.memory_graph.snapshots.iter().take(selected_step + 1) {
-        for delta in &snapshot.deltas {
-            states.insert(delta.node_id.clone(), delta.to.clone());
-        }
-    }
-    states
-}
-
-fn topology_edge_active_at_step(
-    edge: &rust_analyzer_ext::OwnershipMemoryEdge,
-    model: &OwnershipModel,
-    selected_step: usize,
-) -> bool {
-    let snapshots = model.memory_graph.snapshots.iter().take(selected_step + 1);
-    let created = edge.event_id.as_deref().is_none_or(|event_id| {
-        snapshots
-            .clone()
-            .any(|snapshot| snapshot.event_id == event_id)
-    });
-    let removed = snapshots.clone().any(|snapshot| {
-        snapshot.deltas.iter().any(|delta| {
-            delta.relation_removed.as_deref() == Some(edge.relation.as_str())
-                && (delta.node_id == edge.source || delta.node_id == edge.target)
-        })
-    });
-    created && !removed
-}
-
-fn topology_detail(node: &rust_analyzer_ext::OwnershipMemoryNode) -> String {
-    let layout = match (node.size, node.align) {
-        (Some(size), Some(align)) => format!("{size} B · align {align}"),
-        (Some(size), None) => format!("{size} B"),
-        _ => "runtime/unsized layout unknown".to_owned(),
-    };
-    format!("{} · {layout}", node.storage.replace('_', " "))
-}
-
-fn topology_moment_explanation(kind: &str, place: &str) -> String {
-    match kind {
-        "move" | "partial_move" => {
-            format!("Ownership leaves `{place}` here; its destination becomes the usable owner.")
-        }
-        "clone" => format!(
-            "A new shared handle is created from `{place}`; the allocation is shared, not duplicated."
-        ),
-        "borrow_shared" => format!("A read-only loan from `{place}` starts here."),
-        "borrow_mutable" | "borrow_activate" => {
-            format!("An exclusive mutable loan from `{place}` becomes active here.")
-        }
-        "borrow_end" => format!("The loan from `{place}` is no longer needed after this point."),
-        "invalid_use" | "conflict" => {
-            format!("Rust rejects this operation because `{place}` lacks the required access.")
-        }
-        "reinitialize" => format!("A new value makes `{place}` usable again."),
-        "drop" => format!("The value owned through `{place}` is destroyed here."),
-        _ => format!("The ownership state of `{place}` changes here."),
-    }
-}
-
-const TOPOLOGY_CANVAS_WIDTH: u16 = 420;
-const TOPOLOGY_NODE_WIDTH: u16 = 124;
-const TOPOLOGY_NODE_HEIGHT: u16 = 68;
-const TOPOLOGY_COLUMN_X: [u16; 3] = [2, 148, 294];
-const TOPOLOGY_ROW_START: u16 = 4;
-const TOPOLOGY_ROW_STRIDE: u16 = 76;
-
-fn layout_topology_scene(nodes: &mut [TopologyNode], edges: &mut [TopologyEdge]) -> u16 {
-    let mut rows = [0_u16; 3];
-    for node in nodes.iter_mut() {
-        let column = match node.column {
-            TopologyColumn::Local => 0,
-            TopologyColumn::Wrapper => 1,
-            TopologyColumn::Target => 2,
-        };
-        node.rect = TopologyRect {
-            x: TOPOLOGY_COLUMN_X[column],
-            y: TOPOLOGY_ROW_START + rows[column] * TOPOLOGY_ROW_STRIDE,
-            width: TOPOLOGY_NODE_WIDTH,
-            height: TOPOLOGY_NODE_HEIGHT,
-        };
-        rows[column] += 1;
-    }
-
-    let rects = nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node.rect))
-        .collect::<BTreeMap<_, _>>();
-    for edge in edges {
-        let (Some(source), Some(target)) = (
-            rects.get(edge.source.as_str()),
-            rects.get(edge.target.as_str()),
-        ) else {
-            continue;
-        };
-        let source_center_y = source.y + source.height / 2;
-        let target_center_y = target.y + target.height / 2;
-        if source.x <= target.x {
-            let start = (source.x + source.width, source_center_y);
-            let end = (target.x, target_center_y);
-            let middle_x = start.0 + end.0.saturating_sub(start.0) / 2;
-            edge.route = vec![start, (middle_x, start.1), (middle_x, end.1), end];
-        } else {
-            let start = (source.x, source_center_y);
-            let end = (target.x + target.width, target_center_y);
-            let middle_x = end.0 + start.0.saturating_sub(end.0) / 2;
-            edge.route = vec![start, (middle_x, start.1), (middle_x, end.1), end];
-        }
-    }
-
-    TOPOLOGY_ROW_START + rows.into_iter().max().unwrap_or(1).max(1) * TOPOLOGY_ROW_STRIDE
-}
-
-fn derive_ownership_topology_scene(
-    problem: Option<&OwnershipProblem>,
-    model: &OwnershipModel,
-    selected_step: usize,
-) -> Option<OwnershipTopologyScene> {
-    derive_ownership_topology_scene_with_limits(problem, model, selected_step, 8, 10, false)
-}
-
-fn derive_ownership_topology_scene_with_limits(
-    problem: Option<&OwnershipProblem>,
-    model: &OwnershipModel,
-    selected_step: usize,
-    node_limit: usize,
-    edge_limit: usize,
-    expanded: bool,
-) -> Option<OwnershipTopologyScene> {
-    if model.memory_graph.nodes.is_empty()
-        && model
-            .conflict_graph
-            .as_ref()
-            .is_none_or(|graph| graph.nodes.is_empty())
-        && model.mutation_requirement.is_none()
-    {
-        return None;
-    }
-
-    let selected_step = selected_step.min(
-        model
-            .memory_graph
-            .snapshots
-            .len()
-            .max(
-                model
-                    .conflict_graph
-                    .as_ref()
-                    .map_or(0, |graph| graph.snapshots.len()),
-            )
-            .saturating_sub(1),
-    );
-    let states = topology_state_at_step(model, selected_step);
-    let mut nodes = model
-        .memory_graph
-        .nodes
-        .iter()
-        .map(|node| TopologyNode {
-            id: node.id.clone(),
-            label: node.label.clone(),
-            type_name: node.type_name.clone(),
-            detail: topology_detail(node),
-            kind: node.kind.clone(),
-            state: states
-                .get(&node.id)
-                .cloned()
-                .unwrap_or_else(|| node.state.clone()),
-            provenance: node.provenance.clone(),
-            column: topology_column(&node.kind, &node.storage),
-            range: node.range,
-            rect: TopologyRect::default(),
-        })
-        .collect::<Vec<_>>();
-    let mut edges = model
-        .memory_graph
-        .edges
-        .iter()
-        .map(|edge| TopologyEdge {
-            id: edge.id.clone(),
-            source: edge.source.clone(),
-            target: edge.target.clone(),
-            label: edge.relation.replace('_', " "),
-            provenance: edge.provenance.clone(),
-            active: topology_edge_active_at_step(edge, model, selected_step),
-            range: edge.range,
-            route: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-
-    if let Some(graph) = &model.conflict_graph {
-        let snapshot = graph
-            .snapshots
-            .get(selected_step)
-            .or_else(|| graph.snapshots.last());
-        for node in &graph.nodes {
-            let id = format!("conflict:{}", node.id);
-            if nodes.iter().any(|existing| existing.label == node.label) {
-                continue;
-            }
-            let state = snapshot
-                .and_then(|snapshot| {
-                    snapshot
-                        .states
-                        .iter()
-                        .find(|state| state.node_id == node.id)
-                })
-                .map(|state| state.state.clone())
-                .unwrap_or_else(|| "alive".to_owned());
-            nodes.push(TopologyNode {
-                id,
-                label: node.label.clone(),
-                type_name: node
-                    .type_name
-                    .clone()
-                    .unwrap_or_else(|| "type unknown".to_owned()),
-                detail: node.memory.clone(),
-                kind: node.role.clone(),
-                state,
-                provenance: graph.provenance.clone(),
-                column: if node.role.contains("reference") {
-                    TopologyColumn::Local
-                } else if node.role.contains("owner") {
-                    TopologyColumn::Wrapper
-                } else {
-                    TopologyColumn::Target
-                },
-                range: node.range,
-                rect: TopologyRect::default(),
-            });
-        }
-        for edge in &graph.edges {
-            let source_label = graph
-                .nodes
-                .iter()
-                .find(|node| node.id == edge.from)
-                .map(|node| node.label.as_str());
-            let target_label = graph
-                .nodes
-                .iter()
-                .find(|node| node.id == edge.to)
-                .map(|node| node.label.as_str());
-            let source = source_label.and_then(|label| {
-                nodes
-                    .iter()
-                    .find(|node| node.label == label)
-                    .map(|node| node.id.clone())
-            });
-            let target = target_label.and_then(|label| {
-                nodes
-                    .iter()
-                    .find(|node| node.label == label)
-                    .map(|node| node.id.clone())
-            });
-            if let (Some(source), Some(target)) = (source, target) {
-                edges.push(TopologyEdge {
-                    id: format!("conflict:{}:{}:{}", edge.from, edge.to, edge.label),
-                    source,
-                    target,
-                    label: edge.label.clone(),
-                    provenance: edge.provenance.clone(),
-                    active: true,
-                    range: None,
-                    route: Vec::new(),
-                });
-            }
-        }
-    }
-
-    if let Some(requirement) = &model.mutation_requirement {
-        let target_id = nodes
-            .iter()
-            .find(|node| {
-                node.label == requirement.target_place || node.id == requirement.target_place
-            })
-            .map(|node| node.id.clone())
-            .unwrap_or_else(|| {
-                let id = format!("target:{}", requirement.target_place);
-                nodes.push(TopologyNode {
-                    id: id.clone(),
-                    label: requirement.target_place.clone(),
-                    type_name: selected_mutation_operation(model)
-                        .and_then(|operation| operation.receiver_type.clone())
-                        .unwrap_or_else(|| "resolved field type".to_owned()),
-                    detail: "the field rustc rejected writing through".to_owned(),
-                    kind: "field".to_owned(),
-                    state: "alive · write blocked".to_owned(),
-                    provenance: requirement.provenance.clone(),
-                    column: TopologyColumn::Target,
-                    range: problem.map(|problem| problem.primary_range),
-                    rect: TopologyRect::default(),
-                });
-                id
-            });
-        let access_id = format!("access:{}", requirement.access_source);
-        if !nodes.iter().any(|node| node.id == access_id) {
-            nodes.push(TopologyNode {
-                id: access_id.clone(),
-                label: requirement.access_source.clone(),
-                type_name: readable_available_access(&requirement.available_access).to_owned(),
-                detail: "access available at the function boundary".to_owned(),
-                kind: "reference_handle".to_owned(),
-                state: "read-only access".to_owned(),
-                provenance: requirement.provenance.clone(),
-                column: TopologyColumn::Local,
-                range: problem.map(|problem| problem.binding_range),
-                rect: TopologyRect::default(),
-            });
-        }
-        edges.push(TopologyEdge {
-            id: format!("mutation-access:{}", requirement.target_place),
-            source: access_id,
-            target: target_id,
-            label: format!(
-                "has {}; operation needs {}",
-                readable_available_access(&requirement.available_access),
-                readable_access(&requirement.required_access)
-            ),
-            provenance: requirement.provenance.clone(),
-            active: true,
-            range: problem.map(|problem| problem.primary_range),
-            route: Vec::new(),
-        });
-    }
-
-    nodes.sort_by(|left, right| {
-        (left.column, &left.label, &left.kind, &left.id).cmp(&(
-            right.column,
-            &right.label,
-            &right.kind,
-            &right.id,
-        ))
-    });
-    nodes.dedup_by(|left, right| left.id == right.id);
-    let truncated =
-        model.memory_graph.truncated || nodes.len() > node_limit || edges.len() > edge_limit;
-    nodes.truncate(node_limit);
-    let retained_ids = nodes
-        .iter()
-        .map(|node| node.id.as_str())
-        .collect::<BTreeSet<_>>();
-    edges.retain(|edge| {
-        retained_ids.contains(edge.source.as_str()) && retained_ids.contains(edge.target.as_str())
-    });
-    edges.sort_by(|left, right| {
-        (&left.source, &left.target, &left.label).cmp(&(&right.source, &right.target, &right.label))
-    });
-    edges.dedup_by(|left, right| {
-        left.source == right.source && left.target == right.target && left.label == right.label
-    });
-    edges.truncate(edge_limit);
-    let canvas_height = layout_topology_scene(&mut nodes, &mut edges);
-
-    let moments = if !model.memory_graph.snapshots.is_empty() {
-        model
-            .memory_graph
-            .snapshots
-            .iter()
-            .take(12)
-            .map(|snapshot| TopologyMoment {
-                title: snapshot.kind.replace('_', " "),
-                explanation: topology_moment_explanation(&snapshot.kind, &snapshot.place),
-                range: snapshot.range,
-                path_marker: snapshot.path_marker.clone(),
-            })
-            .collect()
-    } else {
-        model
-            .conflict_graph
-            .as_ref()
-            .map(|graph| {
-                graph
-                    .snapshots
-                    .iter()
-                    .take(12)
-                    .map(|snapshot| TopologyMoment {
-                        title: snapshot.title.clone(),
-                        explanation: snapshot.explanation.clone(),
-                        range: snapshot.range,
-                        path_marker: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let access_lines = model
-        .memory_graph
-        .access_paths
-        .iter()
-        .take(3)
-        .map(|path| {
-            let chain = path
-                .steps
-                .iter()
-                .map(|step| {
-                    format!(
-                        "{} → {} ({})",
-                        step.starting_type,
-                        step.result_type,
-                        step.kind.replace('_', " ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" → ");
-            if chain.is_empty() {
-                format!("`{}`: direct access", path.place)
-            } else {
-                format!("`{}`: {chain}", path.place)
-            }
-        })
-        .collect();
-
-    Some(OwnershipTopologyScene {
-        nodes,
-        edges,
-        moments,
-        selected_step,
-        access_lines,
-        canvas_height,
-        expanded,
-        truncated,
-    })
-}
-
-fn topology_node_color(state: &str) -> Color {
-    if state.contains("blocked") || state.contains("reject") || state.contains("invalid") {
-        Color::Error
-    } else if state.contains("borrow") || state.contains("read-only") {
-        Color::Info
-    } else if state.contains("move") || state.contains("drop") {
-        Color::Warning
-    } else {
-        Color::Success
-    }
-}
-
-fn topology_column_title(column: TopologyColumn) -> &'static str {
-    match column {
-        TopologyColumn::Local => "LOCAL / HANDLE",
-        TopologyColumn::Wrapper => "INLINE / GATE",
-        TopologyColumn::Target => "POINTEE / HEAP",
-    }
-}
-
-fn render_topology_node(
-    node: TopologyNode,
-    selected_element: Option<&str>,
-    cx: &mut Context<RustWorkbenchPanel>,
-) -> AnyElement {
-    let color = topology_node_color(&node.state);
-    let rect = node.rect;
-    let selected = selected_element == Some(node.id.as_str());
-    let node_id = node.id.clone();
-    let range = node.range;
-    let accessible_name = format!(
-        "{}; type {}; state {}; {}; {}",
-        node.label, node.type_name, node.state, node.detail, node.provenance
-    );
-    let inspection_summary = format!(
-        "Inspecting `{}`: {}. This does not change the selected compiler issue.",
-        node.label, node.state
-    );
-    v_flex()
-        .absolute()
-        .left(px(f32::from(rect.x)))
-        .top(px(f32::from(rect.y)))
-        .w(px(f32::from(rect.width)))
-        .h(px(f32::from(rect.height)))
-        .overflow_hidden()
-        .p_1()
-        .gap_0p5()
-        .rounded_md()
-        .border_1()
-        .border_color(match color {
-            Color::Error => cx.theme().status().error,
-            Color::Warning => cx.theme().status().warning,
-            Color::Info => cx.theme().status().info,
-            _ => cx.theme().status().success,
-        })
-        .child(
-            Button::new(
-                SharedString::from(format!("topology-node-{}", node.id)),
-                format!("{} `{}`", visual_state_symbol(&node.state), node.label),
-            )
-            .toggle_state(selected)
-            .aria_label(accessible_name.clone())
-            .aria_description("Select this memory node and reveal its related source range")
-            .tooltip(ui::Tooltip::text(accessible_name))
-            .on_click(cx.listener(move |panel, _, _window, cx| {
-                panel.inspect_topology_element(
-                    node_id.clone(),
-                    inspection_summary.clone(),
-                    range,
-                    cx,
-                )
-            })),
-        )
-        .child(
-            Label::new(node.type_name)
-                .size(LabelSize::XSmall)
-                .buffer_font(cx),
-        )
-        .child(
-            Label::new(node.detail)
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        )
-        .child(
-            Label::new(format!(
-                "{} · {}",
-                node.state,
-                node.provenance.replace('_', " ")
-            ))
-            .size(LabelSize::XSmall)
-            .color(color),
-        )
-        .into_any_element()
-}
-
-fn render_topology_edge_canvas(edges: Vec<TopologyEdge>) -> AnyElement {
-    canvas(
-        |_, _, _| {},
-        move |bounds, _, window, cx| {
-            for edge in edges {
-                if edge.route.len() < 2 {
-                    continue;
-                }
-                let mut builder = if !edge.active
-                    || edge.label.contains("weak")
-                    || edge.label.contains("conditional")
-                {
-                    PathBuilder::stroke(px(1.)).dash_array(&[px(4.), px(3.)])
-                } else {
-                    PathBuilder::stroke(px(1.5))
-                };
-                for (index, (x, y)) in edge.route.iter().copied().enumerate() {
-                    let point = point(
-                        bounds.origin.x + px(f32::from(x)),
-                        bounds.origin.y + px(f32::from(y)),
-                    );
-                    if index == 0 {
-                        builder.move_to(point);
-                    } else {
-                        builder.line_to(point);
-                    }
-                }
-                let (end_x, end_y) = edge.route[edge.route.len() - 1];
-                let (before_x, before_y) = edge.route[edge.route.len() - 2];
-                let end = point(
-                    bounds.origin.x + px(f32::from(end_x)),
-                    bounds.origin.y + px(f32::from(end_y)),
-                );
-                let arrow = 5.0;
-                if before_x < end_x {
-                    builder.move_to(point(end.x - px(arrow), end.y - px(arrow)));
-                    builder.line_to(end);
-                    builder.line_to(point(end.x - px(arrow), end.y + px(arrow)));
-                } else if before_x > end_x {
-                    builder.move_to(point(end.x + px(arrow), end.y - px(arrow)));
-                    builder.line_to(end);
-                    builder.line_to(point(end.x + px(arrow), end.y + px(arrow)));
-                } else if before_y <= end_y {
-                    builder.move_to(point(end.x - px(arrow), end.y - px(arrow)));
-                    builder.line_to(end);
-                    builder.line_to(point(end.x + px(arrow), end.y - px(arrow)));
-                } else {
-                    builder.move_to(point(end.x - px(arrow), end.y + px(arrow)));
-                    builder.line_to(end);
-                    builder.line_to(point(end.x + px(arrow), end.y + px(arrow)));
-                }
-                if let Ok(path) = builder.build() {
-                    let color =
-                        if edge.label.contains("mutable") || edge.label.contains("exclusive") {
-                            cx.theme().status().warning
-                        } else if edge.label.contains("borrow") {
-                            cx.theme().status().info
-                        } else if edge.label.contains("owns") || edge.label.contains("shares") {
-                            cx.theme().status().success
-                        } else {
-                            cx.theme().colors().text_muted
-                        };
-                    window.paint_path(
-                        path,
-                        if edge.active {
-                            color
-                        } else {
-                            color.opacity(0.35)
-                        },
-                    );
-                }
-            }
-        },
-    )
-    .absolute()
-    .inset_0()
-    .into_any_element()
-}
-
-fn render_topology_scene(
-    scene: OwnershipTopologyScene,
-    selected_element: Option<&str>,
-    cx: &mut Context<RustWorkbenchPanel>,
-) -> AnyElement {
-    let selected_moment = scene.moments.get(scene.selected_step).cloned();
-    let canvas_edges = scene.edges.clone();
-    v_flex()
-        .p_2()
-        .gap_1()
-        .rounded_md()
-        .border_1()
-        .border_color(cx.theme().colors().border_variant)
-        .child(
-            h_flex()
-                .justify_between()
-                .child(
-                    Label::new(if scene.expanded {
-                        "All ownership values in this function"
-                    } else {
-                        "3 · Flow and memory"
-                    })
-                    .size(LabelSize::Small),
-                )
-                .child(
-                    Label::new("● usable  ◇ borrowed  → moved  ! blocked")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-        )
-        .child(
-            h_flex()
-                .w(px(f32::from(TOPOLOGY_CANVAS_WIDTH)))
-                .justify_between()
-                .children(
-                    [TopologyColumn::Local, TopologyColumn::Wrapper, TopologyColumn::Target]
-                        .into_iter()
-                        .map(|column| {
-                            Label::new(topology_column_title(column))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                        }),
-                ),
-        )
-        .child(
-            gpui::div()
-                .relative()
-                .w(px(f32::from(TOPOLOGY_CANVAS_WIDTH)))
-                .max_w_full()
-                .h(px(f32::from(scene.canvas_height)))
-                .child(render_topology_edge_canvas(canvas_edges))
-                .children(
-                    scene
-                        .nodes
-                        .iter()
-                        .cloned()
-                        .map(|node| render_topology_node(node, selected_element, cx)),
-                ),
-        )
-        .when(!scene.edges.is_empty(), |this| {
-            this.child(Label::new("Connections").size(LabelSize::Small)).child(
-                h_flex().gap_1().flex_wrap().children(scene.edges.iter().map(|edge| {
-                    let source = scene
-                        .nodes
-                        .iter()
-                        .find(|node| node.id == edge.source)
-                        .map(|node| node.label.as_str())
-                        .unwrap_or("?");
-                    let target = scene
-                        .nodes
-                        .iter()
-                        .find(|node| node.id == edge.target)
-                        .map(|node| node.label.as_str())
-                        .unwrap_or("?");
-                    let edge_id = edge.id.clone();
-                    let range = edge.range;
-                    let summary = format!(
-                        "`{source}` {} `{target}`. Provenance: {}.",
-                        edge.label,
-                        edge.provenance.replace('_', " ")
-                    );
-                    Button::new(
-                        SharedString::from(format!("topology-edge-{}", edge.id)),
-                        format!(
-                            "{} `{source}` ─{}→ `{target}`",
-                            if edge.active { "●" } else { "○" },
-                            edge.label,
-                        ),
-                    )
-                    .toggle_state(selected_element == Some(edge.id.as_str()))
-                    .aria_label(summary.clone())
-                    .aria_description("Select this ownership relation and reveal its source")
-                    .tooltip(ui::Tooltip::text(summary.clone()))
-                    .on_click(cx.listener(move |panel, _, _window, cx| {
-                        panel.inspect_topology_element(
-                            edge_id.clone(),
-                            summary.clone(),
-                            range,
-                            cx,
-                        )
-                    }))
-                })),
-            )
-        })
-        .when(!scene.moments.is_empty(), |this| {
-            let last = scene.moments.len().saturating_sub(1);
-            this.child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("topology-previous-step", "←")
-                            .aria_label("Previous ownership event; Left Arrow")
-                            .disabled(scene.selected_step == 0)
-                            .on_click(cx.listener(move |panel, _, _window, cx| {
-                                panel.select_visual_step(scene.selected_step.saturating_sub(1), cx)
-                            })),
-                    )
-                    .children(scene.moments.iter().enumerate().map(|(index, moment)| {
-                        let tooltip = moment.title.clone();
-                        Button::new(
-                            SharedString::from(format!("topology-step-{index}")),
-                            if index == scene.selected_step {
-                                format!("● {}", index + 1)
-                            } else {
-                                format!("○ {}", index + 1)
-                            },
-                        )
-                        .aria_label(format!(
-                            "Ownership event {} of {}: {}",
-                            index + 1,
-                            scene.moments.len(),
-                            moment.title
-                        ))
-                        .tooltip(ui::Tooltip::text(tooltip))
-                        .on_click(cx.listener(move |panel, _, _window, cx| {
-                            panel.select_visual_step(index, cx)
-                        }))
-                    }))
-                    .child(
-                        Button::new("topology-next-step", "→")
-                            .aria_label("Next ownership event; Right Arrow")
-                            .disabled(scene.selected_step >= last)
-                            .on_click(cx.listener(move |panel, _, _window, cx| {
-                                panel.select_visual_step((scene.selected_step + 1).min(last), cx)
-                            })),
-                    ),
-            )
-        })
-        .when_some(selected_moment, |this, moment| {
-            this.child(
-                v_flex()
-                    .p_2()
-                    .gap_0p5()
-                    .rounded_md()
-                    .bg(cx.theme().status().info_background.opacity(0.1))
-                    .child(
-                        Label::new(format!(
-                            "Step {} · {} · line {}{}",
-                            scene.selected_step + 1,
-                            moment.title,
-                            moment.range.start.line + 1,
-                            moment
-                                .path_marker
-                                .as_deref()
-                                .map(|path| format!(" · path {path}"))
-                                .unwrap_or_default()
-                        ))
-                        .size(LabelSize::Small),
-                    )
-                    .child(Label::new(moment.explanation).size(LabelSize::Small)),
-            )
-        })
-        .when(!scene.access_lines.is_empty(), |this| {
-            this.child(Label::new("How Rust reaches the value").size(LabelSize::Small))
-                .children(scene.access_lines.into_iter().map(|line| {
-                    Label::new(line).size(LabelSize::XSmall).color(Color::Muted)
-                }))
-        })
-        .when(scene.truncated, |this| {
-            this.child(
-                Label::new(if scene.expanded {
-                    "This full-function view is bounded to 64 nodes and 96 connections; omitted topology is marked explicitly."
-                } else {
-                    "This compact view is bounded to 8 nodes and 10 connections; omitted topology is marked explicitly."
-                })
-                    .size(LabelSize::XSmall)
-                    .color(Color::Warning),
-            )
-        })
-        .into_any_element()
-}
-
 fn render_visual_memory_map(
     topology_scene: Option<&OwnershipTopologyScene>,
     selected_topology_element: Option<&str>,
@@ -5477,7 +4021,7 @@ fn render_visual_memory_map(
                 )
             }))
             .children(model.bindings.iter().take(2).map(|binding| {
-                render_smart_pointer_shape(&binding.name, &binding.type_name, cx)
+                render_structured_memory_chain(binding, cx)
             }))
             .child(
                 Label::new("A reference and the value it points to are separate nodes. Borrowed values remain alive; the map marks only the access that is restricted.")
@@ -5517,11 +4061,6 @@ fn render_visual_memory_map(
                 .size(LabelSize::Small)
                 .buffer_font(cx),
             )
-            .child(render_smart_pointer_shape(
-                &requirement.target_place,
-                receiver_type,
-                cx,
-            ))
             .child(
                 Label::new(format!(
                     "`{}` requires {}, so the field and its storage remain alive while this write is rejected.",
@@ -5551,133 +4090,106 @@ fn render_visual_memory_map(
                 .size(LabelSize::XSmall)
                 .color(Color::Success),
         )
-        .children(model.bindings.clone().into_iter().map(|binding| {
-            v_flex()
-                .p_2()
-                .gap_1()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(
-                    Button::new(
-                        SharedString::from(format!("visual-binding-{}", binding.id)),
-                        format!("▣ stack binding `{}`: {}", binding.name, binding.type_name),
-                    )
-                    .on_click(cx.listener({
-                        let range = binding.range;
-                        move |panel, _, _window, cx| panel.cue_range(range, cx)
-                    })),
-                )
-                .child(render_smart_pointer_shape(&binding.name, &binding.type_name, cx))
-                .children(binding.memory_layers.into_iter().map(|layer| {
-                    Label::new(format!(
-                        "{} ─► {} · {}",
-                        memory_symbol(&layer.storage),
-                        layer.label,
-                        beginner_memory_explanation(&layer.kind)
-                    ))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                }))
-        }))
+        .children(
+            model
+                .bindings
+                .iter()
+                .map(|binding| render_structured_memory_chain(binding, cx)),
+        )
         .into_any_element()
 }
 
-fn render_smart_pointer_shape(name: &str, type_name: &str, cx: &App) -> AnyElement {
-    let nodes = smart_pointer_nodes(name, type_name);
+fn memory_layer_role(kind: &str, storage: &str) -> &'static str {
+    if kind == "stack_binding" {
+        "VARIABLE"
+    } else if kind.ends_with("_handle") || matches!(kind, "raw_pointer") {
+        "HANDLE"
+    } else if storage == "heap" {
+        "HEAP"
+    } else if matches!(
+        kind,
+        "vec_header" | "string_header" | "container_header" | "pin_constraint"
+    ) {
+        "WRAPPER"
+    } else {
+        "INLINE"
+    }
+}
 
+fn memory_layer_relation(source_kind: &str, target_kind: &str) -> &'static str {
+    if source_kind == "stack_binding" {
+        "stores"
+    } else if source_kind == "pin_constraint" {
+        "wraps"
+    } else if matches!(
+        source_kind,
+        "cell_state"
+            | "ref_cell_state"
+            | "unsafe_cell_state"
+            | "mutex_state"
+            | "rw_lock_state"
+            | "once_state"
+            | "guard_state"
+    ) {
+        "guards access to"
+    } else if target_kind == "box_allocation" {
+        "owns"
+    } else if matches!(target_kind, "rc_allocation" | "arc_allocation") {
+        "shares allocation"
+    } else if target_kind == "weak_allocation" {
+        "weakly references"
+    } else if target_kind.ends_with("_buffer") {
+        "owns buffer"
+    } else {
+        "contains"
+    }
+}
+
+fn render_structured_memory_chain(binding: &OwnershipBinding, cx: &App) -> AnyElement {
+    let mut previous_kind = "stack_binding";
+    let mut rows = vec![
+        Label::new(format!(
+            "[VARIABLE] `{}`: {}",
+            binding.name, binding.type_name
+        ))
+        .size(LabelSize::XSmall)
+        .buffer_font(cx)
+        .into_any_element(),
+    ];
+    for layer in binding
+        .memory_layers
+        .iter()
+        .filter(|layer| layer.kind != "stack_binding")
+    {
+        rows.push(
+            Label::new(format!(
+                "    ↓ {}",
+                memory_layer_relation(previous_kind, &layer.kind)
+            ))
+            .size(LabelSize::XSmall)
+            .color(Color::Muted)
+            .into_any_element(),
+        );
+        rows.push(
+            Label::new(format!(
+                "[{}] {} · {}",
+                memory_layer_role(&layer.kind, &layer.storage),
+                layer.label,
+                layer.type_name
+            ))
+            .size(LabelSize::XSmall)
+            .buffer_font(cx)
+            .into_any_element(),
+        );
+        previous_kind = &layer.kind;
+    }
     v_flex()
         .p_2()
-        .gap_1()
-        .rounded_md()
-        .bg(cx.theme().status().info_background.opacity(0.08))
-        .children(nodes.into_iter().enumerate().flat_map(|(index, node)| {
-            let arrow = (index > 0).then(|| {
-                Label::new("             ↓ points to / contains")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .into_any_element()
-            });
-            arrow.into_iter().chain(std::iter::once(
-                Label::new(format!("[ {node} ]"))
-                    .size(LabelSize::XSmall)
-                    .buffer_font(cx)
-                    .into_any_element(),
-            ))
-        }))
+        .gap_0p5()
+        .border_1()
+        .border_color(cx.theme().colors().border_variant)
+        .children(rows)
         .into_any_element()
-}
-
-fn smart_pointer_nodes(name: &str, type_name: &str) -> Vec<String> {
-    if type_name.contains("Rc<RefCell<") {
-        vec![
-            format!("stack · Rc handle `{name}`"),
-            "shared heap allocation · strong count = symbolic N".to_owned(),
-            "RefCell · runtime borrow flag".to_owned(),
-            "inner value T".to_owned(),
-        ]
-    } else if type_name.contains("Arc<Mutex<") {
-        vec![
-            format!("stack/thread · Arc handle `{name}`"),
-            "shared heap allocation · atomic strong count = symbolic N".to_owned(),
-            "Mutex · one lock holder at a time".to_owned(),
-            "inner value T".to_owned(),
-        ]
-    } else if type_name.contains("Arc<RwLock<") {
-        vec![
-            format!("stack/thread · Arc handle `{name}`"),
-            "shared heap allocation · atomic strong count = symbolic N".to_owned(),
-            "RwLock · many readers or one writer".to_owned(),
-            "inner value T".to_owned(),
-        ]
-    } else if type_name.contains("Rc<") {
-        vec![
-            format!("stack · Rc handle `{name}`"),
-            "shared heap allocation · strong count = symbolic N".to_owned(),
-            "inner value T · Rc move: N unchanged; Rc::clone: N + 1".to_owned(),
-        ]
-    } else if type_name.contains("Arc<") {
-        vec![
-            format!("stack/thread · Arc handle `{name}`"),
-            "shared heap allocation · atomic strong count = symbolic N".to_owned(),
-            "inner value T · Arc move: N unchanged; Arc::clone: N + 1".to_owned(),
-        ]
-    } else if type_name.contains("RefCell<") {
-        vec![
-            format!("stack/owner · RefCell `{name}`"),
-            "runtime borrow flag · 0, readers, or one writer".to_owned(),
-            "inner value T · conflicting borrow can panic".to_owned(),
-        ]
-    } else if type_name.starts_with("&mut ") {
-        vec![
-            format!("reference `{name}` · non-owning pointer"),
-            "exclusive access for this loan".to_owned(),
-            "borrowed value remains alive at its owner".to_owned(),
-        ]
-    } else if type_name.starts_with('&') {
-        vec![
-            format!("reference `{name}` · non-owning pointer"),
-            "shared read access for this loan".to_owned(),
-            "borrowed value remains alive at its owner".to_owned(),
-        ]
-    } else if type_name.contains("Box<") {
-        vec![
-            format!("stack · unique Box handle `{name}`"),
-            "heap · one owned allocation".to_owned(),
-            "inner value T · moving Box transfers the handle, not the allocation".to_owned(),
-        ]
-    } else if type_name.contains("Vec<") || type_name == "String" {
-        vec![
-            format!("stack · `{name}` handle (pointer, length, capacity)"),
-            "heap · element buffer".to_owned(),
-            "moving the handle leaves the buffer in place".to_owned(),
-        ]
-    } else {
-        vec![
-            format!("binding `{name}` · {type_name}"),
-            "value representation tracked by rustc".to_owned(),
-        ]
-    }
 }
 
 fn render_visual_memory_node(
@@ -6157,7 +4669,6 @@ fn render_concept_lesson(
         .into_any_element()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_detail_drawers(
     active: Option<DetailDrawer>,
     problem: Option<&OwnershipProblem>,
@@ -6166,10 +4677,6 @@ fn render_detail_drawers(
     selected_topology_element: Option<&str>,
     expanded_operations: &BTreeSet<String>,
     exact_mode: bool,
-    c_view_mode: CViewMode,
-    c_generation_state: CGenerationState,
-    generated_c: Option<GeneratedCArtifact>,
-    generated_c_unit_index: usize,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     let content = active.map(|drawer| match drawer {
@@ -6192,15 +4699,7 @@ fn render_detail_drawers(
             .into_any_element(),
         DetailDrawer::Calls => render_operation_insights(model, expanded_operations, cx),
         DetailDrawer::Layout => render_memory(model, exact_mode, cx),
-        DetailDrawer::C => render_c_view(
-            model,
-            exact_mode,
-            c_view_mode,
-            c_generation_state,
-            generated_c,
-            generated_c_unit_index,
-            cx,
-        ),
+        DetailDrawer::C => render_conceptual_c_sketch(model, exact_mode, cx),
         DetailDrawer::Evidence => v_flex()
             .gap_2()
             .child(render_timeline(model, true, cx))
@@ -8224,6 +6723,7 @@ fn render_repairs(
             let repair_id = repair.id.clone();
             let source_hash = source_hash.clone();
             let is_previewed = preview_repair_id == Some(repair.id.as_str());
+            let current_id = repair.id.clone();
             let preview_id = repair.id.clone();
             let affected_files = if repair.affected_files.is_empty() {
                 "unknown file scope".to_owned()
@@ -8273,20 +6773,32 @@ fn render_repairs(
                         .gap_1()
                         .child(
                             Button::new(
-                                SharedString::from(format!("preview-{}", repair.id)),
-                                if is_previewed {
-                                    "Hide semantic preview"
-                                } else if validated {
-                                    "Preview validated result"
-                                } else {
-                                    "Preview & compiler-check"
-                                },
+                                SharedString::from(format!("current-{}", repair.id)),
+                                "Current",
                             )
-                            .on_click(cx.listener(
-                                move |panel, _, _window, cx| {
+                            .toggle_state(!is_previewed)
+                            .on_click(cx.listener(move |panel, _, _window, cx| {
+                                if is_previewed {
+                                    panel.preview_repair(current_id.clone(), cx);
+                                }
+                            })),
+                        )
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("preview-{}", repair.id)),
+                                "Preview",
+                            )
+                            .toggle_state(is_previewed)
+                            .tooltip(ui::Tooltip::text(if validated {
+                                "Show the compiler-validated result"
+                            } else {
+                                "Show the proposed result and start a compiler check"
+                            }))
+                            .on_click(cx.listener(move |panel, _, _window, cx| {
+                                if !is_previewed {
                                     panel.preview_repair(preview_id.clone(), cx);
-                                },
-                            )),
+                                }
+                            })),
                         )
                         .when(validated, |this| this.child(
                             Button::new(
@@ -8472,177 +6984,6 @@ fn render_conceptual_c_sketch(
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
             )
-        })
-        .into_any_element()
-}
-
-fn render_c_view(
-    model: &OwnershipModel,
-    exact_mode: bool,
-    mode: CViewMode,
-    state: CGenerationState,
-    artifact: Option<GeneratedCArtifact>,
-    generated_c_unit_index: usize,
-    cx: &mut Context<RustWorkbenchPanel>,
-) -> AnyElement {
-    v_flex()
-        .gap_2()
-        .child(
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new(
-                        "c-view-conceptual",
-                        selected_button_label(mode == CViewMode::Conceptual, "Conceptual"),
-                    )
-                    .on_click(cx.listener(|panel, _, _window, cx| {
-                        panel.c_view_mode = CViewMode::Conceptual;
-                        panel.cancel_generated_c(cx);
-                    })),
-                )
-                .child(
-                    Button::new(
-                        "c-view-generated",
-                        selected_button_label(mode == CViewMode::Generated, "Generated C"),
-                    )
-                    .on_click(cx.listener(|panel, _, _window, cx| {
-                        panel.c_view_mode = CViewMode::Generated;
-                        panel.schedule_generated_c(cx);
-                    })),
-                ),
-        )
-        .child(if mode == CViewMode::Conceptual {
-            render_conceptual_c_sketch(model, exact_mode, cx)
-        } else {
-            render_generated_c(state, artifact, generated_c_unit_index, cx)
-        })
-        .into_any_element()
-}
-
-fn render_generated_c(
-    state: CGenerationState,
-    artifact: Option<GeneratedCArtifact>,
-    generated_c_unit_index: usize,
-    cx: &mut Context<RustWorkbenchPanel>,
-) -> AnyElement {
-    let (status, color) = match &state {
-        CGenerationState::NotStarted => ("Ready to generate after save".into(), Color::Muted),
-        CGenerationState::Waiting => ("Waiting for 1.5 seconds of idle time…".into(), Color::Muted),
-        CGenerationState::Running => ("Generating C outside the UI thread…".into(), Color::Info),
-        CGenerationState::Ready => (
-            "Generated artifact matches the saved Rust source".into(),
-            Color::Success,
-        ),
-        CGenerationState::Blocked(message) => (message.clone(), Color::Warning),
-        CGenerationState::Failed(message) => (message.clone(), Color::Error),
-        CGenerationState::Stale(message) => (message.clone(), Color::Warning),
-    };
-    v_flex()
-        .p_3()
-        .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(cx.theme().colors().border_variant)
-        .child(Label::new("Actual generated C (experimental)").size(LabelSize::Large))
-        .child(Label::new(status).size(LabelSize::Small).color(color))
-        .child(
-            Label::new("This is low-level rustc_codegen_c output for the selected Cargo target. Prebuilt std and dependency implementations are not expanded here. It is not idiomatic C or an ABI-equivalent teaching translation; use Conceptual for intent.")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        )
-        .child(
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new(
-                        "generate-c-refresh",
-                        if artifact.is_some() { "Refresh" } else { "Generate" },
-                    )
-                    .on_click(cx.listener(|panel, _, _window, cx| {
-                        panel.schedule_generated_c(cx);
-                    })),
-                )
-                .when(matches!(state, CGenerationState::Waiting | CGenerationState::Running), |this| {
-                    this.child(
-                        Button::new("generate-c-cancel", "Cancel").on_click(cx.listener(
-                            |panel, _, _window, cx| panel.cancel_generated_c(cx),
-                        )),
-                    )
-                })
-                .when(artifact.is_some(), |this| {
-                    this.child(
-                        Button::new("open-generated-c", "Open full artifact").on_click(
-                            cx.listener(|panel, _, window, cx| {
-                                panel.open_generated_c(window, cx);
-                            }),
-                        ),
-                    )
-                }),
-        )
-        .when_some(artifact, |this, artifact| {
-            let unit_count = artifact.units.len();
-            let selected_index = generated_c_unit_index.min(unit_count.saturating_sub(1));
-            let selected_unit = artifact.units.get(selected_index).cloned();
-            this.child(
-                Label::new(format!(
-                    "Backend: {}\nCargo target: {}\nTranslation units: {}\nGeneration: {:.2?}\nSource hash: {}",
-                    artifact.backend,
-                    artifact.target,
-                    unit_count,
-                    artifact.duration,
-                    artifact.source_hash,
-                ))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-            )
-            .when(unit_count > 1, |this| {
-                this.child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new("generated-c-unit-previous", "Previous C file").on_click(
-                                cx.listener(|panel, _, _window, cx| {
-                                    let count = panel
-                                        .generated_c
-                                        .as_ref()
-                                        .map_or(0, |artifact| artifact.units.len());
-                                    if count > 0 {
-                                        panel.generated_c_unit_index =
-                                            (panel.generated_c_unit_index + count - 1) % count;
-                                        cx.notify();
-                                    }
-                                }),
-                            ),
-                        )
-                        .child(
-                            Label::new(format!("C file {} of {}", selected_index + 1, unit_count))
-                                .size(LabelSize::XSmall),
-                        )
-                        .child(
-                            Button::new("generated-c-unit-next", "Next C file").on_click(
-                                cx.listener(|panel, _, _window, cx| {
-                                    let count = panel
-                                        .generated_c
-                                        .as_ref()
-                                        .map_or(0, |artifact| artifact.units.len());
-                                    if count > 0 {
-                                        panel.generated_c_unit_index =
-                                            (panel.generated_c_unit_index + 1) % count;
-                                        cx.notify();
-                                    }
-                                }),
-                            ),
-                        ),
-                )
-            })
-            .when_some(selected_unit, |this, unit| {
-                this.child(
-                    Label::new(format!("Selected generated file: {}", unit.path.display()))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(Label::new(unit.code).size(LabelSize::XSmall).buffer_font(cx))
-            })
         })
         .into_any_element()
 }
@@ -9245,24 +7586,40 @@ mod tests {
     #[test]
     fn compiler_graph_scene_is_deterministic_and_keeps_shared_allocation() {
         let model: OwnershipModel = serde_json::from_value(serde_json::json!({
-            "schemaVersion": 12,
+            "schemaVersion": 14,
+            "compilerSchemaVersion": 7,
             "precision": "compiler_exact",
             "status": "ready",
             "sourceHash": "abc",
+            "selectedPlace": "values",
             "events": [],
             "repairs": [],
             "memoryGraph": {
                 "nodes": [
                     {
-                        "id": "handle-values", "bodyId": 1, "place": "values",
-                        "kind": "handle", "storage": "stack", "label": "values",
+                        "id": "binding-values", "bodyId": 1, "place": "values",
+                        "kind": "binding", "storage": "stack", "label": "variable values",
                         "typeName": "Rc<Vec<i32>>", "size": 8, "align": 8,
                         "range": null, "state": "available", "provenance": "compiler_exact",
                         "physicalPlacementNote": "source-level placement", "truncated": false
                     },
                     {
+                        "id": "handle-values", "bodyId": 1, "place": "values",
+                        "kind": "handle", "storage": "inline", "label": "Rc handle",
+                        "typeName": "Rc<Vec<i32>>", "size": 8, "align": 8,
+                        "range": null, "state": "available", "provenance": "compiler_exact",
+                        "physicalPlacementNote": "source-level placement", "truncated": false
+                    },
+                    {
+                        "id": "binding-shared", "bodyId": 1, "place": "shared",
+                        "kind": "binding", "storage": "stack", "label": "variable shared",
+                        "typeName": "Rc<Vec<i32>>", "size": 8, "align": 8,
+                        "range": null, "state": "available", "provenance": "derived",
+                        "physicalPlacementNote": "source-level placement", "truncated": false
+                    },
+                    {
                         "id": "handle-shared", "bodyId": 1, "place": "shared",
-                        "kind": "handle", "storage": "stack", "label": "shared",
+                        "kind": "handle", "storage": "inline", "label": "Rc handle",
                         "typeName": "Rc<Vec<i32>>", "size": 8, "align": 8,
                         "range": null, "state": "available", "provenance": "derived",
                         "physicalPlacementNote": "source-level placement", "truncated": false
@@ -9276,6 +7633,8 @@ mod tests {
                     }
                 ],
                 "edges": [
+                    {"id":"store-values", "source":"binding-values", "target":"handle-values", "relation":"stores", "eventId":null, "loanId":null, "range":null, "provenance":"compiler_exact", "pathMarker":null},
+                    {"id":"store-shared", "source":"binding-shared", "target":"handle-shared", "relation":"stores", "eventId":null, "loanId":null, "range":null, "provenance":"derived", "pathMarker":null},
                     {"id":"a", "source":"handle-values", "target":"control", "relation":"shares_allocation", "eventId":null, "loanId":null, "range":null, "provenance":"conceptual", "pathMarker":null},
                     {"id":"b", "source":"handle-shared", "target":"control", "relation":"shares_allocation", "eventId":"clone", "loanId":null, "range":null, "provenance":"derived", "pathMarker":null}
                 ],
@@ -9304,12 +7663,25 @@ mod tests {
             first
                 .edges
                 .iter()
-                .filter(|edge| edge.target == "control" && edge.label == "shares allocation")
+                .filter(|edge| edge.target == "control" && edge.label == "shares_allocation")
                 .count(),
             2
         );
-        assert!(first.nodes.len() <= 8);
-        assert!(first.edges.len() <= 10);
+        let ordered_ids = first
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            ordered_ids.iter().position(|id| *id == "binding-values")
+                < ordered_ids.iter().position(|id| *id == "handle-values")
+        );
+        assert!(
+            ordered_ids.iter().position(|id| *id == "handle-values")
+                < ordered_ids.iter().position(|id| *id == "control")
+        );
+        assert!(first.nodes.len() <= 12);
+        assert!(first.edges.len() <= 20);
 
         let after_drop = derive_ownership_topology_scene(None, &model, 1).unwrap();
         assert_eq!(
@@ -9338,6 +7710,118 @@ mod tests {
                 .iter()
                 .find(|edge| edge.id == "b")
                 .is_some_and(|edge| !edge.active)
+        );
+    }
+
+    #[test]
+    fn compiler_graph_scene_preserves_the_full_nested_wrapper_chain() {
+        let node = |id: &str, kind: &str, storage: &str, label: &str, type_name: &str| {
+            serde_json::json!({
+                "id": id,
+                "bodyId": 1,
+                "place": "value",
+                "kind": kind,
+                "storage": storage,
+                "label": label,
+                "typeName": type_name,
+                "size": null,
+                "align": null,
+                "range": null,
+                "state": "available",
+                "provenance": "compiler_exact",
+                "physicalPlacementNote": "source-level placement",
+                "truncated": false
+            })
+        };
+        let edge = |id: &str, source: &str, target: &str, relation: &str| {
+            serde_json::json!({
+                "id": id,
+                "source": source,
+                "target": target,
+                "relation": relation,
+                "eventId": null,
+                "loanId": null,
+                "range": null,
+                "provenance": "compiler_exact",
+                "pathMarker": null
+            })
+        };
+        let model: OwnershipModel = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 14,
+            "compilerSchemaVersion": 7,
+            "precision": "compiler_exact",
+            "status": "ready",
+            "sourceHash": "nested",
+            "selectedPlace": "value",
+            "events": [],
+            "repairs": [],
+            "memoryGraph": {
+                "nodes": [
+                    node("binding", "binding", "stack", "variable value", "Rc<RefCell<Vec<i32>>>") ,
+                    node("rc-handle", "handle", "inline", "Rc handle", "Rc<RefCell<Vec<i32>>>") ,
+                    node("rc-allocation", "control_block", "heap", "Rc allocation", "RefCell<Vec<i32>>") ,
+                    node("refcell", "borrow_flag", "inline", "RefCell borrow gate", "RefCell<Vec<i32>>") ,
+                    node("vec-header", "wrapper", "inline", "Vec header", "Vec<i32>") ,
+                    node("vec-buffer", "buffer", "heap", "Vec element buffer", "i32")
+                ],
+                "edges": [
+                    edge("e1", "binding", "rc-handle", "stores"),
+                    edge("e2", "rc-handle", "rc-allocation", "shares_allocation"),
+                    edge("e3", "rc-allocation", "refcell", "contains"),
+                    edge("e4", "refcell", "vec-header", "guards_access"),
+                    edge("e5", "vec-header", "vec-buffer", "owns_buffer")
+                ],
+                "snapshots": [],
+                "accessPaths": [],
+                "truncated": false
+            }
+        }))
+        .unwrap();
+
+        let scene = derive_ownership_topology_scene(None, &model, 0).unwrap();
+        assert_eq!(
+            scene
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "binding",
+                "rc-handle",
+                "rc-allocation",
+                "refcell",
+                "vec-header",
+                "vec-buffer"
+            ]
+        );
+        assert_eq!(
+            scene
+                .edges
+                .iter()
+                .map(|edge| edge.label.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "contains",
+                "guards_access",
+                "owns_buffer",
+                "shares_allocation",
+                "stores"
+            ])
+        );
+        assert!(
+            scene
+                .nodes
+                .windows(2)
+                .all(|pair| pair[0].rect.y < pair[1].rect.y)
+        );
+        assert!(!scene.legacy_limited);
+
+        let mut legacy = model;
+        legacy.compiler_schema_version = 6;
+        assert!(
+            derive_ownership_topology_scene(None, &legacy, 0)
+                .unwrap()
+                .legacy_limited
         );
     }
 
@@ -9879,123 +8363,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_c_preview_truncates_on_a_utf8_boundary() {
-        let temporary = tempfile::tempdir().unwrap();
-        let artifact = temporary.path().join("artifact.c");
-        std::fs::write(&artifact, "abc€def").unwrap();
-        let preview = read_generated_c_preview(&artifact, 4).unwrap();
-        assert!(preview.starts_with("abc"));
-        assert!(!preview.starts_with("abc€"));
-        assert!(preview.contains("artifact.c"));
-    }
-
-    #[test]
-    fn generated_c_target_selection_prefers_exact_target_then_library_module() {
-        let package = GeneratedCCargoPackage {
-            name: "demo".to_owned(),
-            manifest_path: PathBuf::from("/demo/Cargo.toml"),
-            targets: vec![
-                GeneratedCCargoTarget {
-                    name: "demo".to_owned(),
-                    kind: vec!["lib".to_owned()],
-                    src_path: PathBuf::from("/demo/src/lib.rs"),
-                },
-                GeneratedCCargoTarget {
-                    name: "tool".to_owned(),
-                    kind: vec!["bin".to_owned()],
-                    src_path: PathBuf::from("/demo/src/bin/tool.rs"),
-                },
-            ],
-        };
-
-        let exact = select_generated_c_target(&package, Path::new("/demo/src/bin/tool.rs"))
-            .expect("exact bin target");
-        assert_eq!(exact.name, "tool");
-        let module = select_generated_c_target(&package, Path::new("/demo/src/analytics.rs"))
-            .expect("library module target");
-        assert_eq!(module.name, "demo");
-
-        let nested_package = GeneratedCCargoPackage {
-            name: "tools".to_owned(),
-            manifest_path: PathBuf::from("/tools/Cargo.toml"),
-            targets: vec![
-                GeneratedCCargoTarget {
-                    name: "alpha".to_owned(),
-                    kind: vec!["bin".to_owned()],
-                    src_path: PathBuf::from("/tools/src/bin/alpha/main.rs"),
-                },
-                GeneratedCCargoTarget {
-                    name: "beta".to_owned(),
-                    kind: vec!["bin".to_owned()],
-                    src_path: PathBuf::from("/tools/src/bin/beta/main.rs"),
-                },
-            ],
-        };
-        let nested =
-            select_generated_c_target(&nested_package, Path::new("/tools/src/bin/beta/worker.rs"))
-                .expect("nested bin module target");
-        assert_eq!(nested.name, "beta");
-    }
-
-    #[test]
-    fn generated_c_units_exclude_stubs_dependencies_and_stale_builds() {
-        let temporary = tempfile::tempdir().unwrap();
-        let deps = temporary.path().join("debug/deps");
-        std::fs::create_dir_all(&deps).unwrap();
-        std::fs::write(deps.join("demo-old.dead.rcgu.c"), "void stale(void) {}").unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(deps.join("demo-new.first.rcgu.c"), "void helper(void) {}").unwrap();
-        std::fs::write(
-            deps.join("demo-new.second.rcgu.c"),
-            "void teach_me(void) {}",
-        )
-        .unwrap();
-        std::fs::write(deps.join("native_stubs.c"), "void native(void) {}").unwrap();
-        std::fs::write(
-            deps.join("core-dependency.part.rcgu.c"),
-            "void core(void) {}",
-        )
-        .unwrap();
-
-        let units =
-            collect_generated_c_units(temporary.path(), &["demo".to_owned()], Some("teach_me"))
-                .unwrap();
-        assert_eq!(units.len(), 2);
-        assert!(units[0].code.contains("teach_me"));
-        assert!(units.iter().all(|unit| !unit.code.contains("stale")));
-        assert!(units.iter().all(|unit| !unit.code.contains("native")));
-        assert!(units.iter().all(|unit| !unit.code.contains("core")));
-    }
-
-    #[test]
-    fn generated_c_live_smoke_when_bundled_toolchain_is_configured() {
-        if std::env::var_os("RUST_WORKBENCH_RUSTIC_SYSROOT").is_none() {
-            return;
-        }
-        let temporary = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temporary.path().join("src")).unwrap();
-        std::fs::write(
-            temporary.path().join("Cargo.toml"),
-            "[package]\nname = \"workbench_c_live\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .unwrap();
-        let source_path = temporary.path().join("src/main.rs");
-        let source = "fn workbench_live_marker() -> u32 { 42 }\nfn main() { println!(\"{}\", workbench_live_marker()); }\n";
-        std::fs::write(&source_path, source).unwrap();
-
-        let artifact = futures::executor::block_on(generate_c_artifact(
-            source_path,
-            ownership_source_hash(source),
-            Some("workbench_live_marker".to_owned()),
-        ))
-        .unwrap();
-        assert_eq!(artifact.target.as_ref(), "workbench_c_live");
-        assert!(!artifact.units.is_empty());
-        assert!(artifact.units[0].code.contains("workbench_live_marker"));
-        assert!(artifact.duration < Duration::from_secs(5));
-    }
-
-    #[test]
     fn intent_matrix_distinguishes_clone_rc_refcell_and_threads() {
         assert!(
             intent_recommendation(IntentAnswers {
@@ -10154,49 +8521,26 @@ mod tests {
     }
 
     #[test]
-    fn beginner_pointer_models_keep_owners_references_and_runtime_guards_distinct() {
-        let cases = [
-            ("Box<Vec<i32>>", "unique Box handle", "not the allocation"),
-            ("&String", "non-owning pointer", "remains alive"),
-            ("&mut String", "exclusive access", "remains alive"),
-            (
-                "Rc<String>",
-                "strong count = symbolic N",
-                "Rc::clone: N + 1",
-            ),
-            (
-                "Arc<String>",
-                "atomic strong count = symbolic N",
-                "Arc::clone: N + 1",
-            ),
-            ("RefCell<String>", "runtime borrow flag", "can panic"),
-            (
-                "Rc<RefCell<String>>",
-                "shared heap allocation",
-                "runtime borrow flag",
-            ),
-            (
-                "Arc<Mutex<String>>",
-                "atomic strong count",
-                "one lock holder",
-            ),
-            (
-                "Arc<RwLock<String>>",
-                "atomic strong count",
-                "many readers or one writer",
-            ),
-        ];
-        for (type_name, first_fact, second_fact) in cases {
-            let model = smart_pointer_nodes("value", type_name).join("\n");
-            assert!(
-                model.contains(first_fact),
-                "missing `{first_fact}` for {type_name}: {model}"
-            );
-            assert!(
-                model.contains(second_fact),
-                "missing `{second_fact}` for {type_name}: {model}"
-            );
-        }
+    fn structured_memory_layers_distinguish_handles_allocations_and_gates() {
+        assert_eq!(memory_layer_role("rc_handle", "inline"), "HANDLE");
+        assert_eq!(memory_layer_role("rc_allocation", "heap"), "HEAP");
+        assert_eq!(memory_layer_role("vec_header", "inline"), "WRAPPER");
+        assert_eq!(
+            memory_layer_relation("stack_binding", "rc_handle"),
+            "stores"
+        );
+        assert_eq!(
+            memory_layer_relation("rc_handle", "rc_allocation"),
+            "shares allocation"
+        );
+        assert_eq!(
+            memory_layer_relation("ref_cell_state", "vec_header"),
+            "guards access to"
+        );
+        assert_eq!(
+            memory_layer_relation("vec_header", "vec_buffer"),
+            "owns buffer"
+        );
     }
 
     #[test]

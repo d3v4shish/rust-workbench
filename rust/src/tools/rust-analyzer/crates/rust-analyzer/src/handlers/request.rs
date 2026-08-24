@@ -2072,7 +2072,8 @@ pub(crate) fn handle_ownership_model(
         .unwrap_or_else(|| ownership_value_trace(&events, &operations));
 
     Ok(lsp_ext::OwnershipModelResult {
-        schema_version: tutorial.schema_version.max(13),
+        schema_version: tutorial.schema_version.max(14),
+        compiler_schema_version: tutorial.schema_version,
         target_triple: tutorial.target_triple.clone(),
         precision: if exact { "compiler_exact" } else { "estimated" }.to_owned(),
         status: if events.is_empty() && !has_tutorial_facts && selected_diagnostic.is_none() {
@@ -7080,6 +7081,7 @@ fn borrow_conflict_trace_keeps_borrower_referent_and_owner_distinct() {
 fn bounded_ownership_model_protocol_marks_large_responses() {
     let model = lsp_ext::OwnershipModelResult {
         schema_version: 5,
+        compiler_schema_version: 5,
         target_triple: "x86_64-unknown-linux-gnu".to_owned(),
         precision: "compiler_exact".to_owned(),
         status: "ready".to_owned(),
@@ -7153,6 +7155,7 @@ fn bounded_ownership_model_protocol_marks_large_responses() {
     };
     let serialized = serde_json::to_string(&model).unwrap();
     assert!(serialized.contains("\"truncated\":true"));
+    assert!(serialized.contains("\"compilerSchemaVersion\":5"));
     let round_trip: lsp_ext::OwnershipModelResult = serde_json::from_str(&serialized).unwrap();
     assert!(round_trip.truncated);
     assert_eq!(round_trip.operations[0].required_access, "mutable_borrow");
@@ -7378,6 +7381,7 @@ fn ownership_model_protocol_accepts_pre_graph_responses() {
         "cSketch": null
     });
     let model: lsp_ext::OwnershipModelResult = serde_json::from_value(json).unwrap();
+    assert_eq!(model.compiler_schema_version, 0);
     assert!(model.conflict_graph.is_none());
     assert!(model.value_trace.is_empty());
 }

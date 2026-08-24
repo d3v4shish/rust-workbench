@@ -598,9 +598,16 @@ fn push_memory_layers<'tcx>(
     if path.ends_with("::boxed::Box") {
         if let Some(inner) = inner {
             push(
+                BorrowckMemoryKind::BoxHandle,
+                BorrowckMemoryStorage::Inline,
+                "Box handle (unique owner)",
+                ty,
+                true,
+            );
+            push(
                 BorrowckMemoryKind::BoxAllocation,
                 BorrowckMemoryStorage::Heap,
-                "owned heap allocation",
+                "Box allocation containing the owned value",
                 inner,
                 true,
             );
@@ -609,9 +616,16 @@ fn push_memory_layers<'tcx>(
     } else if path.ends_with("::rc::Rc") {
         if let Some(inner) = inner {
             push(
+                BorrowckMemoryKind::RcHandle,
+                BorrowckMemoryStorage::Inline,
+                "Rc handle (shared owner)",
+                ty,
+                true,
+            );
+            push(
                 BorrowckMemoryKind::RcAllocation,
                 BorrowckMemoryStorage::Heap,
-                "shared allocation with strong and weak counters",
+                "Rc allocation containing the value and strong/weak counters",
                 inner,
                 false,
             );
@@ -620,9 +634,16 @@ fn push_memory_layers<'tcx>(
     } else if path.ends_with("::sync::Arc") {
         if let Some(inner) = inner {
             push(
+                BorrowckMemoryKind::ArcHandle,
+                BorrowckMemoryStorage::Inline,
+                "Arc handle (thread-safe shared owner)",
+                ty,
+                true,
+            );
+            push(
                 BorrowckMemoryKind::ArcAllocation,
                 BorrowckMemoryStorage::Heap,
-                "thread-safe shared allocation with atomic counters",
+                "Arc allocation containing the value and atomic counters",
                 inner,
                 false,
             );
@@ -631,9 +652,16 @@ fn push_memory_layers<'tcx>(
     } else if path.ends_with("::rc::Weak") || path.ends_with("::sync::Weak") {
         if let Some(inner) = inner {
             push(
+                BorrowckMemoryKind::WeakHandle,
+                BorrowckMemoryStorage::Inline,
+                "Weak handle (non-owning shared reference)",
+                ty,
+                true,
+            );
+            push(
                 BorrowckMemoryKind::WeakAllocation,
                 BorrowckMemoryStorage::Heap,
-                "weak handle to a shared control block (value may already be gone)",
+                "shared control block (the value may already be dropped)",
                 inner,
                 false,
             );

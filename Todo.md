@@ -852,13 +852,10 @@ Acceptance criteria:
 
 - [x] Synchronize conceptual C with the selected event and graph node.
 - [x] Match Rust variables to conceptual C owner/pointer names.
-- [x] Keep generated C lazy and off the UI thread.
-- [x] Retain warnings about invalid Rust and non-idiomatic generated C.
 
 Acceptance criteria:
 
 - [x] Conceptual C is labeled as intent, not an ABI-equivalent translation.
-- [x] Generated C is never attempted for stale or invalid saved input.
 
 ### LEARN-003 — Complete accessibility support [P0]
 
@@ -1185,48 +1182,6 @@ Acceptance criteria:
       selects an issue.
 - [x] UI latency and full Rust guide unit suites pass.
 
-## Milestone 14: Offline, verified Generated C
-
-### CGEN-001 — Pin and bundle rustc_codegen_c [P0]
-
-- [x] Pin `release-1.94.1-2` and GitHub's recorded asset SHA-256.
-- [x] Add atomic `./workbench bootstrap generated-c` installation.
-- [x] Bundle a runtime-pruned Cargo, rustc, prebuilt std, and licenses.
-- [x] Remove the global rustup `rustic` dependency from packaged operation.
-
-Acceptance criteria:
-
-- [x] Doctor reports the exact release, versions, and archive verification.
-- [x] A relocated bundle can generate C without host rustup, rustc, or Cargo.
-- [x] The package manifest records release and binary/archive checksums.
-
-### CGEN-002 — Generate the correct project C quickly [P0]
-
-- [x] Pair rustic Cargo with its exact rustc and sanitize inherited overrides.
-- [x] Select the active Cargo target through metadata.
-- [x] Use prebuilt std instead of `-Z build-std`.
-- [x] Reuse a stable project/target/toolchain cache.
-- [x] Filter stubs, dependencies, std, and stale crate hashes.
-
-Acceptance criteria:
-
-- [x] A dependency-free cold smoke generates project C in under five seconds.
-- [x] No `core` or `std` C translation units are produced.
-- [x] Cancellation retains `kill_on_drop` process termination.
-
-### CGEN-003 — Present translation units honestly [P1]
-
-- [x] Show target, backend, duration, unit count, source hash, and exact path.
-- [x] Prefer the unit containing the selected function when available.
-- [x] Navigate and open each real translation unit without concatenating it.
-- [x] Keep previews bounded to 400 KB per selected unit.
-
-Acceptance criteria:
-
-- [x] `native_stubs.c` is never presented as the user's generated code.
-- [x] Multiple real units are independently navigable.
-- [x] Conceptual C remains available when compilation is invalid or fails.
-
 ## Milestone 15: Workspace-wide ownership roots and safe repairs
 
 ### WSG-001 — Cluster ownership diagnostics across local workspace files [P0]
@@ -1296,6 +1251,57 @@ Acceptance criteria:
 - [x] The real multi-file slow test passes and repeats the same revision/root.
 - [x] Workspace-guide p95 remains below 20 ms and max below 100 ms.
 - [x] No ownership artifact event-loop stall is observed.
+
+## Milestone 16: Explicit wrapper topology and focused UX
+
+### TOPO-001 — Emit real handle and wrapper layers [P0]
+
+- [x] Add schema-7 `Box`, `Rc`, `Arc`, and `Weak` inline handle facts.
+- [x] Distinguish variable storage, wrapping, allocation sharing, access gates,
+      owned buffers, and weak references with structured graph relations.
+- [x] Preserve one allocation identity across smart-pointer moves and clones.
+- [x] Deactivate the source ownership edge after a full smart-pointer move.
+
+Acceptance criteria:
+
+- [x] Compiler run-make covers explicit handles, wrapper relations, clone
+      convergence, and move identity.
+- [x] Older compiler models decode safely and request a refresh rather than
+      synthesizing missing handles from type-name strings.
+
+### TOPO-002 — Make the selected value path primary [P0]
+
+- [x] Render one vertical variable -> handle/wrapper -> heap/target flow with
+      stable node coordinates and inline relation labels.
+- [x] Keep the event scrubber directly below the value map and update states
+      without moving nodes.
+- [x] Preserve the complete selected semantic chain before applying compact
+      node and relation bounds.
+- [x] Put the beginner explanation before workspace impact and collapse
+      single-file impact by default.
+
+Acceptance criteria:
+
+- [x] `Rc<RefCell<Vec<T>>>` shows the Rc handle, shared allocation, RefCell
+      gate, Vec header, and heap buffer as distinct layers.
+- [x] Two Rc handles visibly converge on one allocation.
+- [x] The full Rust Workbench unit suite and quick qualification gate pass.
+
+### TOPO-003 — Remove Generated C and harden release packaging [P0]
+
+- [x] Remove the backend, download cache, configuration, UI mode, launchers,
+      smoke fixtures, licenses, and bundle contents.
+- [x] Keep Conceptual C as an intent-only optional drawer.
+- [x] Require a clean commit for packages and verify `--skip-build` artifacts
+      through commit-bound receipts and hashes.
+- [x] Use commit time for reproducible archive and manifest timestamps.
+
+Acceptance criteria:
+
+- [x] Source and bundle audits reject remaining Generated C components.
+- [x] Package manifests identify Rust Workbench `1.0.0` and the exact source
+      commit.
+- [x] The pre-change checkpoint tag remains available for rollback.
 
 ## Prioritized next phase — not required for the first release
 

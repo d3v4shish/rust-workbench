@@ -105,9 +105,9 @@ def percentile(values, percentile):
     return ordered[index]
 
 
-def request_baseline(path, selected_place):
+def request_baseline(path, selected_place, model_schema_version, compiler_schema_version):
     if path is None or not path.is_file():
-        return None
+        return None, None
     evidence = json.loads(path.read_text(encoding="utf-8"))
     if selected_place == "self.events":
         samples = [
@@ -119,20 +119,36 @@ def request_baseline(path, selected_place):
         # The wrapper fixture records validation latency from one correctness
         # run, not a repeatable warm-request baseline. Keep its existing
         # absolute latency gate instead of pretending that sample is a 5% gate.
-        return None
+        return None, None
     else:
         samples = [
             run.get("learning_fixture", {})
             for run in evidence.get("runs", [])
             if run.get("source") == "./workbench test performance"
         ]
-    medians = [sample.get("request_median_ms") for sample in samples]
-    p95s = [sample.get("request_p95_ms") for sample in samples]
+    compatible_samples = [
+        sample
+        for sample in samples
+        if sample.get("model_schema_version") == model_schema_version
+        and sample.get("compiler_schema_version") == compiler_schema_version
+    ]
+    if samples and not compatible_samples:
+        return None, {
+            "path": str(path),
+            "status": "skipped_incompatible_schema",
+            "required_model_schema_version": model_schema_version,
+            "required_compiler_schema_version": compiler_schema_version,
+        }
+    medians = [sample.get("request_median_ms") for sample in compatible_samples]
+    p95s = [sample.get("request_p95_ms") for sample in compatible_samples]
     medians = [value for value in medians if isinstance(value, (int, float))]
     p95s = [value for value in p95s if isinstance(value, (int, float))]
     if not medians or not p95s:
         raise RuntimeError(f"baseline evidence has no analyzer request samples: {path}")
-    return {"median_ms": statistics.median(medians), "p95_ms": statistics.median(p95s)}
+    return (
+        {"median_ms": statistics.median(medians), "p95_ms": statistics.median(p95s)},
+        None,
+    )
 
 
 def ownership_event_loop_stalls(log_text):
@@ -252,7 +268,7 @@ def main():
         "--assert-memory-node",
         action="append",
         default=[],
-        help="require this label in the schema-12 ownership memory graph",
+        help="require this label in the schema-14 ownership memory graph",
     )
     parser.add_argument(
         "--assert-access-place",
@@ -394,14 +410,26 @@ def main():
                 model = request_stable(
                     client, "rust-analyzer/ownershipModel", params, deadline
                 )
-                if model and model.get("status") == "ready":
+                if (
+                    model
+                    and model.get("status") == "ready"
+                    and model.get("compilerSchemaVersion", 0) >= 7
+                ):
                     break
                 time.sleep(0.25)
-            if not model or model.get("status") != "ready":
-                raise RuntimeError("learning context did not become ready before the timeout")
+            if (
+                not model
+                or model.get("status") != "ready"
+                or model.get("compilerSchemaVersion", 0) < 7
+            ):
+                raise RuntimeError(
+                    "compiler-backed learning context did not become ready before the timeout"
+                )
             ready_ms = (time.monotonic() - benchmark_started) * 1000
-            if model.get("schemaVersion", 0) < 12:
+            if model.get("schemaVersion", 0) < 14:
                 raise RuntimeError("rust-analyzer returned a pre-memory-graph schema")
+            if model.get("compilerSchemaVersion", 0) < 7:
+                raise RuntimeError("rust-analyzer returned a pre-wrapper compiler schema")
             memory_graph = model.get("memoryGraph") or {}
             for field in ("nodes", "edges", "snapshots", "accessPaths"):
                 if not isinstance(memory_graph.get(field, []), list):
@@ -646,6 +674,8 @@ def main():
                 "median_ms": round(statistics.median(durations), 3),
                 "p95_ms": round(percentile(durations, 0.95), 3),
                 "max_ms": round(max(durations), 3),
+                "model_schema_version": model.get("schemaVersion"),
+                "compiler_schema_version": model.get("compilerSchemaVersion"),
                 "median_response_bytes": int(statistics.median(response_bytes)),
                 "workspace_guide_median_ms": round(
                     statistics.median(guide_durations), 3
@@ -725,7 +755,14 @@ def main():
                     round(validation_ms, 3) if validation_ms is not None else None
                 ),
             }
-            saved_baseline = request_baseline(args.baseline_json, model.get("selectedPlace"))
+            saved_baseline, baseline_note = request_baseline(
+                args.baseline_json,
+                model.get("selectedPlace"),
+                model.get("schemaVersion"),
+                model.get("compilerSchemaVersion"),
+            )
+            if baseline_note is not None:
+                result["saved_baseline"] = baseline_note
             if saved_baseline is not None:
                 median_regression = (
                     (statistics.median(durations) - saved_baseline["median_ms"])

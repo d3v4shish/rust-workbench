@@ -88,13 +88,13 @@ def run_check(cargo, project, rustc, analyzer, root, mode, run_id):
         for artifact_path in artifacts:
             artifact_bytes += artifact_path.stat().st_size
             artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-            if artifact.get("schema_version") != 6:
+            if artifact.get("schema_version") != 7:
                 raise RuntimeError(f"unexpected schema in {artifact_path}")
             if any(source.get("source") is not None for source in artifact.get("sources", [])):
                 raise RuntimeError(f"{artifact_path} retained duplicate source text")
             graph = artifact.get("memory_graph")
             if not isinstance(graph, dict):
-                raise RuntimeError(f"{artifact_path} omitted the schema-6 memory graph")
+                raise RuntimeError(f"{artifact_path} omitted the schema-7 memory graph")
             for field in ("nodes", "edges", "snapshots", "access_paths"):
                 if not isinstance(graph.get(field), list):
                     raise RuntimeError(

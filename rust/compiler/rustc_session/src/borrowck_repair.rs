@@ -16,7 +16,7 @@ use crate::Session;
 pub const AUTOFIX_CHILD_ENV: &str = "RUSTC_BORROWCK_AUTOFIX_CHILD";
 pub const AUTOFIX_OVERLAY_ENV: &str = "RUSTC_BORROWCK_AUTOFIX_OVERLAY";
 pub const AUTOFIX_PLAN_ENV: &str = "RUSTC_BORROWCK_AUTOFIX_PLAN";
-pub const BORROWCK_OWNERSHIP_MODEL_SCHEMA_VERSION: u32 = 6;
+pub const BORROWCK_OWNERSHIP_MODEL_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,7 +55,9 @@ pub struct BorrowckRepairCollector {
 pub enum BorrowckMemoryKind {
     AggregateValue,
     ArcAllocation,
+    ArcHandle,
     BoxAllocation,
+    BoxHandle,
     CellState,
     ConditionalValue,
     ContainerBuffer,
@@ -68,6 +70,7 @@ pub enum BorrowckMemoryKind {
     PinConstraint,
     RawPointer,
     RcAllocation,
+    RcHandle,
     ReferenceHandle,
     RefCellState,
     RwLockState,
@@ -78,6 +81,7 @@ pub enum BorrowckMemoryKind {
     VecBuffer,
     VecHeader,
     WeakAllocation,
+    WeakHandle,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -335,6 +339,8 @@ pub enum BorrowckGraphStorageRegion {
 #[serde(rename_all = "snake_case")]
 pub enum BorrowckGraphNodeKind {
     Binding,
+    Handle,
+    Wrapper,
     InlineValue,
     HeapAllocation,
     Buffer,
@@ -352,6 +358,8 @@ pub enum BorrowckGraphNodeKind {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BorrowckGraphEdgeRelation {
+    Stores,
+    Wraps,
     Owns,
     Contains,
     OwnsBuffer,
@@ -1115,17 +1123,21 @@ fn binding_node_id(
 fn layer_node_kind(kind: BorrowckMemoryKind) -> BorrowckGraphNodeKind {
     match kind {
         BorrowckMemoryKind::StackBinding => BorrowckGraphNodeKind::Binding,
+        BorrowckMemoryKind::ArcHandle
+        | BorrowckMemoryKind::BoxHandle
+        | BorrowckMemoryKind::RawPointer
+        | BorrowckMemoryKind::RcHandle
+        | BorrowckMemoryKind::ReferenceHandle
+        | BorrowckMemoryKind::WeakHandle => BorrowckGraphNodeKind::Handle,
+        BorrowckMemoryKind::ContainerHeader
+        | BorrowckMemoryKind::PinConstraint
+        | BorrowckMemoryKind::StringHeader
+        | BorrowckMemoryKind::VecHeader => BorrowckGraphNodeKind::Wrapper,
         BorrowckMemoryKind::AggregateValue
         | BorrowckMemoryKind::CellState
         | BorrowckMemoryKind::ConditionalValue
-        | BorrowckMemoryKind::ContainerHeader
         | BorrowckMemoryKind::InlineValue
-        | BorrowckMemoryKind::PinConstraint
-        | BorrowckMemoryKind::RawPointer
-        | BorrowckMemoryKind::ReferenceHandle
-        | BorrowckMemoryKind::StringHeader
-        | BorrowckMemoryKind::UnsafeCellState
-        | BorrowckMemoryKind::VecHeader => BorrowckGraphNodeKind::InlineValue,
+        | BorrowckMemoryKind::UnsafeCellState => BorrowckGraphNodeKind::InlineValue,
         BorrowckMemoryKind::BoxAllocation => BorrowckGraphNodeKind::HeapAllocation,
         BorrowckMemoryKind::RcAllocation
         | BorrowckMemoryKind::ArcAllocation
@@ -1160,8 +1172,29 @@ fn graph_provenance(layer: &SerializedBorrowckMemoryLayer) -> BorrowckOwnershipP
     }
 }
 
-fn topology_relation(kind: BorrowckMemoryKind) -> BorrowckGraphEdgeRelation {
-    match kind {
+fn topology_relation(
+    source: BorrowckMemoryKind,
+    target: BorrowckMemoryKind,
+) -> BorrowckGraphEdgeRelation {
+    if source == BorrowckMemoryKind::StackBinding {
+        return BorrowckGraphEdgeRelation::Stores;
+    }
+    if source == BorrowckMemoryKind::PinConstraint {
+        return BorrowckGraphEdgeRelation::Wraps;
+    }
+    if matches!(
+        source,
+        BorrowckMemoryKind::CellState
+            | BorrowckMemoryKind::GuardState
+            | BorrowckMemoryKind::MutexState
+            | BorrowckMemoryKind::OnceState
+            | BorrowckMemoryKind::RefCellState
+            | BorrowckMemoryKind::RwLockState
+            | BorrowckMemoryKind::UnsafeCellState
+    ) {
+        return BorrowckGraphEdgeRelation::GuardsAccess;
+    }
+    match target {
         BorrowckMemoryKind::BoxAllocation => BorrowckGraphEdgeRelation::Owns,
         BorrowckMemoryKind::RcAllocation | BorrowckMemoryKind::ArcAllocation => {
             BorrowckGraphEdgeRelation::SharesAllocation
@@ -1172,23 +1205,26 @@ fn topology_relation(kind: BorrowckMemoryKind) -> BorrowckGraphEdgeRelation {
         | BorrowckMemoryKind::VecBuffer => BorrowckGraphEdgeRelation::OwnsBuffer,
         BorrowckMemoryKind::ConditionalValue => BorrowckGraphEdgeRelation::Conditional,
         BorrowckMemoryKind::GuardState => BorrowckGraphEdgeRelation::GuardsAccess,
-        BorrowckMemoryKind::PinConstraint => BorrowckGraphEdgeRelation::GuardsAccess,
-        BorrowckMemoryKind::ReferenceHandle | BorrowckMemoryKind::RawPointer => {
-            BorrowckGraphEdgeRelation::PointsTo
-        }
+        BorrowckMemoryKind::PinConstraint => BorrowckGraphEdgeRelation::Wraps,
         BorrowckMemoryKind::StackBinding
         | BorrowckMemoryKind::AggregateValue
+        | BorrowckMemoryKind::ArcHandle
+        | BorrowckMemoryKind::BoxHandle
         | BorrowckMemoryKind::CellState
         | BorrowckMemoryKind::ContainerHeader
         | BorrowckMemoryKind::FatPointerMetadata
         | BorrowckMemoryKind::InlineValue
         | BorrowckMemoryKind::MutexState
         | BorrowckMemoryKind::OnceState
+        | BorrowckMemoryKind::RawPointer
+        | BorrowckMemoryKind::RcHandle
+        | BorrowckMemoryKind::ReferenceHandle
         | BorrowckMemoryKind::RefCellState
         | BorrowckMemoryKind::RwLockState
         | BorrowckMemoryKind::StringHeader
         | BorrowckMemoryKind::UnsafeCellState
-        | BorrowckMemoryKind::VecHeader => BorrowckGraphEdgeRelation::Contains,
+        | BorrowckMemoryKind::VecHeader
+        | BorrowckMemoryKind::WeakHandle => BorrowckGraphEdgeRelation::Contains,
     }
 }
 
@@ -1661,7 +1697,7 @@ fn build_ownership_memory_graph(
             byte_start: binding.binding.byte_start,
             byte_end: binding.binding.byte_start + binding.binding.name.len(),
         };
-        let mut previous: Option<String> = None;
+        let mut previous: Option<(String, BorrowckMemoryKind)> = None;
         for (index, layer) in binding.memory_layers.iter().enumerate().take(12) {
             let id = if index == 0 {
                 binding_id.clone()
@@ -1688,8 +1724,8 @@ fn build_ownership_memory_graph(
                     "Source-level model; optimized machine placement may differ.".to_string(),
                 truncated: binding.memory_layers.len() > 12 && index == 11,
             });
-            if let Some(source) = previous {
-                let relation = topology_relation(layer.kind);
+            if let Some((source, source_kind)) = previous {
+                let relation = topology_relation(source_kind, layer.kind);
                 graph.edges.push(SerializedBorrowckMemoryEdge {
                     id: graph_id("edge", &format!("{source}:{relation:?}:{id}")),
                     source,
@@ -1702,7 +1738,7 @@ fn build_ownership_memory_graph(
                     path_marker: None,
                 });
             }
-            previous = Some(id);
+            previous = Some((id, layer.kind));
         }
         graph.truncated |= binding.memory_layers.len() > 12;
         let initialization_id = graph_id("initialize", &binding_id);
@@ -1740,28 +1776,22 @@ fn build_ownership_memory_graph(
         };
         let source_root = binding_node_id(source, bindings);
         let destination_root = binding_node_id(destination, bindings);
-        let Some(source_allocation) = graph
-            .edges
-            .iter()
-            .find(|edge| {
-                edge.source == source_root
-                    && edge.relation == BorrowckGraphEdgeRelation::SharesAllocation
-            })
-            .map(|edge| edge.target.clone())
+        let Some((_, source_allocation, relation)) = allocation_link_for_root(&graph, &source_root)
         else {
             continue;
         };
-        if let Some(destination_allocation) = graph
-            .edges
-            .iter()
-            .find(|edge| {
-                edge.source == destination_root
-                    && edge.relation == BorrowckGraphEdgeRelation::SharesAllocation
-            })
-            .map(|edge| edge.target.clone())
-        {
-            remove_duplicate_allocation(&mut graph, &destination_allocation);
+        if !matches!(
+            relation,
+            BorrowckGraphEdgeRelation::SharesAllocation | BorrowckGraphEdgeRelation::WeakReference
+        ) {
+            continue;
         }
+        let Some((destination_handle, destination_allocation, _)) =
+            allocation_link_for_root(&graph, &destination_root)
+        else {
+            continue;
+        };
+        remove_duplicate_allocation(&mut graph, &destination_allocation);
         let span = SerializedBorrowckSpan {
             path: destination.binding.path.clone(),
             byte_start: destination.binding.byte_start,
@@ -1778,13 +1808,10 @@ fn build_ownership_memory_graph(
             ),
         );
         graph.edges.push(SerializedBorrowckMemoryEdge {
-            id: graph_id(
-                "edge",
-                &format!("{destination_root}:shares_allocation:{source_allocation}"),
-            ),
-            source: destination_root.clone(),
+            id: graph_id("edge", &format!("{destination_handle}:{relation:?}:{source_allocation}")),
+            source: destination_handle,
             target: source_allocation,
-            relation: BorrowckGraphEdgeRelation::SharesAllocation,
+            relation,
             event_id: Some(event_id.clone()),
             loan_id: None,
             span: Some(span.clone()),
@@ -1806,7 +1833,7 @@ fn build_ownership_memory_graph(
                 node_id: destination_root,
                 from: None,
                 to: BorrowckOwnershipState::Available,
-                relation_added: Some(BorrowckGraphEdgeRelation::SharesAllocation),
+                relation_added: Some(relation),
                 relation_removed: None,
             }],
             provenance: BorrowckOwnershipProvenance::Derived,
@@ -1868,6 +1895,7 @@ fn build_ownership_memory_graph(
     }
 
     for event in events {
+        let mut additional_deltas = Vec::new();
         let event_span = SerializedBorrowckSpan {
             path: event.path.clone(),
             byte_start: event.byte_start,
@@ -1913,7 +1941,7 @@ fn build_ownership_memory_graph(
             graph.edges.push(SerializedBorrowckMemoryEdge {
                 id: graph_id("edge", &format!("{}:moved_to:{target}", event.event_id)),
                 source: node_id.clone(),
-                target,
+                target: target.clone(),
                 relation: BorrowckGraphEdgeRelation::MovedTo,
                 event_id: Some(event.event_id.clone()),
                 loan_id: event.loan_id,
@@ -1921,6 +1949,35 @@ fn build_ownership_memory_graph(
                 provenance: BorrowckOwnershipProvenance::Exact,
                 path_marker: Some(format!("bb{}", event.basic_block)),
             });
+            if event.kind == BorrowckOwnershipEventKind::Move
+                && let Some((source_handle, source_allocation, allocation_relation)) =
+                    allocation_link_for_root(&graph, &node_id)
+                && let Some((destination_handle, duplicate_allocation, _)) =
+                    allocation_link_for_root(&graph, &target)
+            {
+                remove_duplicate_allocation(&mut graph, &duplicate_allocation);
+                graph.edges.push(SerializedBorrowckMemoryEdge {
+                    id: graph_id(
+                        "edge",
+                        &format!("{}:{allocation_relation:?}:{source_allocation}", event.event_id),
+                    ),
+                    source: destination_handle,
+                    target: source_allocation,
+                    relation: allocation_relation,
+                    event_id: Some(event.event_id.clone()),
+                    loan_id: event.loan_id,
+                    span: Some(event_span.clone()),
+                    provenance: BorrowckOwnershipProvenance::Exact,
+                    path_marker: Some(format!("bb{}", event.basic_block)),
+                });
+                additional_deltas.push(SerializedBorrowckStateDelta {
+                    node_id: source_handle,
+                    from: None,
+                    to: BorrowckOwnershipState::Moved,
+                    relation_added: None,
+                    relation_removed: Some(allocation_relation),
+                });
+            }
         }
         if event.kind == BorrowckOwnershipEventKind::Clone
             && let Some(destination) = event.destination.as_ref()
@@ -1933,55 +1990,25 @@ fn build_ownership_memory_graph(
                 destination.span.clone(),
                 BorrowckOwnershipProvenance::Exact,
             )
-            && let Some(source_allocation) = graph
-                .edges
-                .iter()
-                .find(|edge| {
-                    edge.source == node_id
-                        && edge.relation == BorrowckGraphEdgeRelation::SharesAllocation
-                })
-                .map(|edge| edge.target.clone())
+            && let Some((_, source_allocation, allocation_relation)) =
+                allocation_link_for_root(&graph, &node_id)
+            && matches!(
+                allocation_relation,
+                BorrowckGraphEdgeRelation::SharesAllocation
+                    | BorrowckGraphEdgeRelation::WeakReference
+            )
+            && let Some((destination_handle, duplicate_allocation, _)) =
+                allocation_link_for_root(&graph, &destination_root)
         {
-            if let Some(destination_allocation) = graph
-                .edges
-                .iter()
-                .find(|edge| {
-                    edge.source == destination_root
-                        && edge.relation == BorrowckGraphEdgeRelation::SharesAllocation
-                })
-                .map(|edge| edge.target.clone())
-            {
-                let mut duplicate_nodes = vec![destination_allocation];
-                let mut cursor = 0;
-                while cursor < duplicate_nodes.len() {
-                    let current = duplicate_nodes[cursor].clone();
-                    cursor += 1;
-                    let children = graph
-                        .edges
-                        .iter()
-                        .filter(|edge| edge.source == current)
-                        .map(|edge| edge.target.clone())
-                        .collect::<Vec<_>>();
-                    for child in children {
-                        if !duplicate_nodes.contains(&child) {
-                            duplicate_nodes.push(child);
-                        }
-                    }
-                }
-                graph.nodes.retain(|node| !duplicate_nodes.contains(&node.id));
-                graph.edges.retain(|edge| {
-                    !duplicate_nodes.contains(&edge.source)
-                        && !duplicate_nodes.contains(&edge.target)
-                });
-            }
+            remove_duplicate_allocation(&mut graph, &duplicate_allocation);
             graph.edges.push(SerializedBorrowckMemoryEdge {
                 id: graph_id(
                     "edge",
-                    &format!("{}:shares_allocation:{source_allocation}", event.event_id),
+                    &format!("{}:{allocation_relation:?}:{source_allocation}", event.event_id),
                 ),
-                source: destination_root,
+                source: destination_handle,
                 target: source_allocation,
-                relation: BorrowckGraphEdgeRelation::SharesAllocation,
+                relation: allocation_relation,
                 event_id: Some(event.event_id.clone()),
                 loan_id: event.loan_id,
                 span: Some(event_span.clone()),
@@ -1989,6 +2016,18 @@ fn build_ownership_memory_graph(
                 path_marker: Some(format!("bb{}", event.basic_block)),
             });
         }
+        let mut deltas = vec![SerializedBorrowckStateDelta {
+            node_id,
+            from: None,
+            to: event.state,
+            relation_added: relation,
+            relation_removed: if event.kind == BorrowckOwnershipEventKind::BorrowEnd {
+                Some(BorrowckGraphEdgeRelation::BorrowShared)
+            } else {
+                None
+            },
+        }];
+        deltas.extend(additional_deltas);
         graph.snapshots.push(SerializedBorrowckOwnershipSnapshot {
             id: graph_id("snapshot", &event.event_id),
             event_id: event.event_id.clone(),
@@ -2000,17 +2039,7 @@ fn build_ownership_memory_graph(
             place: event.place.clone(),
             loan_id: event.loan_id,
             path_marker: Some(format!("bb{}", event.basic_block)),
-            deltas: vec![SerializedBorrowckStateDelta {
-                node_id,
-                from: None,
-                to: event.state,
-                relation_added: relation,
-                relation_removed: if event.kind == BorrowckOwnershipEventKind::BorrowEnd {
-                    Some(BorrowckGraphEdgeRelation::BorrowShared)
-                } else {
-                    None
-                },
-            }],
+            deltas,
             provenance: BorrowckOwnershipProvenance::Exact,
         });
     }
@@ -2065,6 +2094,35 @@ fn remove_duplicate_allocation(graph: &mut SerializedBorrowckMemoryGraph, alloca
     graph.edges.retain(|edge| {
         !duplicate_nodes.contains(&edge.source) && !duplicate_nodes.contains(&edge.target)
     });
+}
+
+fn allocation_link_for_root(
+    graph: &SerializedBorrowckMemoryGraph,
+    root: &str,
+) -> Option<(String, String, BorrowckGraphEdgeRelation)> {
+    let mut pending = vec![root.to_string()];
+    let mut visited = BTreeSet::new();
+    while let Some(source) = pending.pop() {
+        if !visited.insert(source.clone()) {
+            continue;
+        }
+        for edge in graph.edges.iter().filter(|edge| edge.source == source) {
+            match edge.relation {
+                BorrowckGraphEdgeRelation::Owns
+                | BorrowckGraphEdgeRelation::OwnsBuffer
+                | BorrowckGraphEdgeRelation::SharesAllocation
+                | BorrowckGraphEdgeRelation::WeakReference => {
+                    return Some((edge.source.clone(), edge.target.clone(), edge.relation));
+                }
+                BorrowckGraphEdgeRelation::Contains
+                | BorrowckGraphEdgeRelation::GuardsAccess
+                | BorrowckGraphEdgeRelation::Stores
+                | BorrowckGraphEdgeRelation::Wraps => pending.push(edge.target.clone()),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 fn shared_clone_source(

@@ -153,18 +153,17 @@ shows a runtime address, collection capacity, reference count, lock state, or
 `RefCell` borrow flag unless a future explicit runtime-observation mode supplies
 that evidence.
 
-The conceptual C drawer explains intent using C-like owner and pointer names.
-It is not ABI-equivalent output. Generated C is lazy, uses a saved valid input,
-and runs outside the UI thread. Invalid or stale Rust is not presented as a
-successful C translation.
+The value map uses compiler schema 7 to keep variables, inline handles,
+wrappers, access gates, allocations, and buffers as separate nodes. A nested
+value can therefore read from top to bottom as variable -> `Rc` handle -> shared
+heap allocation -> `RefCell` gate -> `Vec` header -> heap buffer. Relation labels
+distinguish storing, wrapping, owning, sharing, guarding access, borrowing, and
+moving. Older cached compiler models remain readable but ask for a refresh
+instead of guessing missing wrapper layers.
 
-The Linux bundle includes a pinned, checksum-verified rustc_codegen_c toolchain
-and does not require a global rustup `rustic` installation. Generated C builds
-only the selected project target against the toolchain's prebuilt standard
-library. The drawer lists the target's real `.rcgu.c` translation units and
-filters backend stubs, dependencies, standard-library output, and stale build
-hashes. External Cargo dependencies may still need an existing local cache or
-network access.
+The Conceptual C drawer explains intent using C-like owner and pointer names.
+It is not compiler output or an ABI-equivalent translation. The drawer follows
+the selected compiler ownership event without invoking another backend.
 
 ## Repeatable acceptance check {#rust-learning-manual-check}
 

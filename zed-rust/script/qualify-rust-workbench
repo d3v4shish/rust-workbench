@@ -7,7 +7,6 @@ workspace_root="$(cd "$zed_source_dir/.." && pwd)"
 rust_source_dir="$workspace_root/rust"
 analyzer_source_dir="$rust_source_dir/src/tools/rust-analyzer"
 local_sysroot="$zed_source_dir/.build-deps/sysroot"
-rustic_sysroot="$zed_source_dir/.build-deps/rustic/current"
 mode="${1:---quick}"
 
 if [[ "$mode" != "--quick" && "$mode" != "--full" ]]; then
@@ -15,7 +14,7 @@ if [[ "$mode" != "--quick" && "$mode" != "--full" ]]; then
   exit 2
 fi
 
-if [[ ! -d "$analyzer_source_dir" || ! -d "$local_sysroot" || ! -x "$rustic_sysroot/bin/rustc" ]]; then
+if [[ ! -d "$analyzer_source_dir" || ! -d "$local_sysroot" ]]; then
   echo "Run this from the RustC workspace after bootstrapping Rust Workbench." >&2
   exit 1
 fi
@@ -52,10 +51,6 @@ RUN_SLOW_TESTS=1 cargo test --manifest-path "$analyzer_source_dir/Cargo.toml" \
 
 echo "[2/5] Zed beginner flow, pointer models, repairs, and compiler-verified results"
 cargo test --manifest-path "$zed_source_dir/Cargo.toml" -p rust_workbench --lib
-XDG_CACHE_HOME="$zed_source_dir/rust-workbench-data/cache" \
-RUST_WORKBENCH_RUSTIC_SYSROOT="$rustic_sysroot" \
-  cargo test --manifest-path "$zed_source_dir/Cargo.toml" -p rust_workbench --lib \
-  generated_c_live_smoke_when_bundled_toolchain_is_configured
 cargo test --manifest-path "$zed_source_dir/Cargo.toml" -p project rust_workbench_inlay_tests --lib
 cargo test --manifest-path "$zed_source_dir/Cargo.toml" -p language \
   ordinary_other_hints_do_not_bypass_semantic_workbench_filters --lib

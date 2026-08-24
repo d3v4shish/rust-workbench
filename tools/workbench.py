@@ -20,7 +20,6 @@ import tempfile
 import textwrap
 import time
 import tomllib
-import urllib.request
 from typing import Iterable, Sequence
 
 
@@ -81,12 +80,10 @@ PROC_MACRO_SERVER = STAGE1 / "libexec" / "rust-analyzer-proc-macro-srv"
 STAGE1_TARGET_LIB = STAGE1 / "lib" / "rustlib" / HOST / "lib"
 BUNDLE_TEMPLATES = ROOT / "tools" / "bundle"
 DIST = ROOT / "dist"
-RUSTIC_ROOT = ZED / ".build-deps" / "rustic"
-RUSTIC_DOWNLOADS = ZED / ".build-deps" / "downloads"
-RUSTIC_CONFIG = CONFIG["generated_c"]
-RUSTIC_ARCHIVE = RUSTIC_DOWNLOADS / RUSTIC_CONFIG["asset"]
-RUSTIC_SYSROOT = RUSTIC_ROOT / RUSTIC_CONFIG["release"]
-RUSTIC_CURRENT = RUSTIC_ROOT / "current"
+BUILD_RECEIPT = ZED / ".build-deps" / "rust-workbench-build-receipt.json"
+RELEASE_VERSION = tomllib.loads(
+    (ZED / "crates" / "rust_workbench" / "Cargo.toml").read_text(encoding="utf-8")
+)["package"]["version"]
 
 CORE_GLIBC_LIBRARIES = {
     "ld-linux-x86-64.so.2",
@@ -143,43 +140,112 @@ def version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in value.split("."))
 
 
-def rustic_version_lines(sysroot: Path) -> tuple[str, str]:
-    rustc = sysroot / "bin" / "rustc"
-    cargo = sysroot / "bin" / "cargo"
-    if not rustc.is_file() or not cargo.is_file():
-        raise RuntimeError(f"rustic toolchain is incomplete: {sysroot}")
-    rustc_version = first_line([rustc, "-Vv"])
-    cargo_version = first_line([cargo, "-V"])
-    expected = str(RUSTIC_CONFIG["rust_version"])
-    if not rustc_version.startswith(f"rustc {expected} "):
-        raise RuntimeError(
-            f"rustic rustc version mismatch: expected {expected}, got {rustc_version}"
-        )
-    if not cargo_version.startswith(f"cargo {expected} "):
-        raise RuntimeError(
-            f"rustic Cargo version mismatch: expected {expected}, got {cargo_version}"
-        )
-    return rustc_version, cargo_version
+def source_commit() -> str:
+    return output(["git", "rev-parse", "HEAD"])
 
 
-def verify_rustic_archive() -> None:
-    if not RUSTIC_ARCHIVE.is_file():
-        raise RuntimeError(
-            f"generated-C archive is missing: {RUSTIC_ARCHIVE}\n"
-            "Run ./workbench bootstrap generated-c."
+def source_epoch() -> int:
+    configured = os.environ.get("SOURCE_DATE_EPOCH")
+    value = configured or output(["git", "show", "-s", "--format=%ct", "HEAD"])
+    try:
+        epoch = int(value)
+    except ValueError as error:
+        raise RuntimeError(f"invalid SOURCE_DATE_EPOCH: {value!r}") from error
+    if epoch < 0:
+        raise RuntimeError(f"SOURCE_DATE_EPOCH must be non-negative: {epoch}")
+    return epoch
+
+
+def source_changes() -> str:
+    return output(["git", "status", "--porcelain=v1", "--untracked-files=all"])
+
+
+def require_clean_source() -> None:
+    changes = source_changes()
+    if changes:
+        raise SystemExit(
+            "packaging requires a clean, committed source tree; commit or stash these paths:\n"
+            + changes
         )
-    actual_size = RUSTIC_ARCHIVE.stat().st_size
-    expected_size = int(RUSTIC_CONFIG["archive_size"])
-    if actual_size != expected_size:
-        raise RuntimeError(
-            f"generated-C archive size mismatch: expected {expected_size}, got {actual_size}"
+
+
+def record_build(component: str, artifacts: Sequence[Path], **details: object) -> None:
+    commit = source_commit()
+    dirty = bool(source_changes())
+    receipt: dict[str, object] = {}
+    if BUILD_RECEIPT.is_file():
+        try:
+            loaded = json.loads(BUILD_RECEIPT.read_text(encoding="utf-8"))
+            if (
+                isinstance(loaded, dict)
+                and loaded.get("source_commit") == commit
+                and loaded.get("source_dirty") == dirty
+            ):
+                receipt = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+    components = receipt.setdefault("components", {})
+    if not isinstance(components, dict):
+        components = {}
+        receipt["components"] = components
+    artifact_records = []
+    for artifact in artifacts:
+        if not artifact.is_file():
+            raise RuntimeError(f"build did not produce required artifact: {artifact}")
+        artifact_records.append(
+            {"path": str(artifact.relative_to(ROOT)), "sha256": sha256(artifact)}
         )
-    actual_hash = sha256(RUSTIC_ARCHIVE)
-    expected_hash = str(RUSTIC_CONFIG["sha256"])
-    if actual_hash != expected_hash:
-        raise RuntimeError(
-            f"generated-C archive checksum mismatch: expected {expected_hash}, got {actual_hash}"
+    components[component] = {"artifacts": artifact_records, **details}
+    receipt.update(
+        {
+            "format_version": 1,
+            "source_commit": commit,
+            "source_dirty": dirty,
+            "built_at_epoch": int(time.time()),
+        }
+    )
+    BUILD_RECEIPT.parent.mkdir(parents=True, exist_ok=True)
+    BUILD_RECEIPT.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def validate_build_receipt() -> None:
+    try:
+        receipt = json.loads(BUILD_RECEIPT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            "missing or invalid release build receipt; rebuild without --skip-build"
+        ) from error
+    if receipt.get("source_commit") != source_commit() or receipt.get("source_dirty"):
+        raise SystemExit(
+            "release artifacts were not built from the current clean commit; "
+            "rebuild without --skip-build"
         )
+    components = receipt.get("components")
+    if not isinstance(components, dict):
+        raise SystemExit("release build receipt has no component records")
+    for component in ("compiler", "editor"):
+        record = components.get(component)
+        if not isinstance(record, dict):
+            raise SystemExit(f"release build receipt is missing {component}")
+        if component == "editor" and record.get("portable") is not True:
+            raise SystemExit("release editor receipt is not marked portable")
+        artifacts = record.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise SystemExit(f"release build receipt has no {component} artifacts")
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                raise SystemExit(f"invalid {component} artifact receipt")
+            path = (ROOT / str(artifact.get("path", ""))).resolve()
+            if path == ROOT or ROOT not in path.parents:
+                raise SystemExit(f"unsafe {component} artifact path in build receipt: {path}")
+            expected = artifact.get("sha256")
+            if not path.is_file() or not isinstance(expected, str) or sha256(path) != expected:
+                raise SystemExit(
+                    f"stale or modified {component} artifact: {path}; "
+                    "rebuild without --skip-build"
+                )
 
 
 def doctor() -> int:
@@ -243,17 +309,6 @@ def doctor() -> int:
         for line in paths or ["no RPATH/RUNPATH"]:
             print(f"editor linkage: {line}")
 
-    try:
-        verify_rustic_archive()
-        rustc_version, cargo_version = rustic_version_lines(RUSTIC_CURRENT.resolve(strict=True))
-        print(
-            "OK artifact: generated-C toolchain: "
-            f"{RUSTIC_CONFIG['release']} ({rustc_version}; {cargo_version}; SHA-256 verified)"
-        )
-    except (OSError, RuntimeError) as error:
-        print(f"MISSING generated-C toolchain: {error}")
-        failed = True
-
     if glibc and version_tuple(glibc) < version_tuple(required_glibc):
         failed = True
     return 1 if failed else 0
@@ -263,116 +318,8 @@ def bootstrap_native() -> None:
     run([ZED / "script" / "bootstrap-rust-workbench-linux"], cwd=ZED)
 
 
-def download_rustic_archive() -> None:
-    RUSTIC_DOWNLOADS.mkdir(parents=True, exist_ok=True)
-    if RUSTIC_ARCHIVE.is_file():
-        try:
-            verify_rustic_archive()
-            print(f"Reusing verified generated-C archive: {RUSTIC_ARCHIVE}")
-            return
-        except RuntimeError as error:
-            print(f"Discarding invalid generated-C archive: {error}")
-            RUSTIC_ARCHIVE.unlink()
-
-    partial = RUSTIC_ARCHIVE.with_name(f"{RUSTIC_ARCHIVE.name}.part")
-    partial.unlink(missing_ok=True)
-    expected_size = int(RUSTIC_CONFIG["archive_size"])
-    print(
-        "Downloading pinned generated-C toolchain "
-        f"{RUSTIC_CONFIG['release']} ({human_size(expected_size)})"
-    )
-    request = urllib.request.Request(
-        str(RUSTIC_CONFIG["url"]),
-        headers={"User-Agent": "Rust-Workbench-bootstrap"},
-    )
-    digest = hashlib.sha256()
-    downloaded = 0
-    try:
-        with urllib.request.urlopen(request) as response, partial.open("wb") as destination:
-            while chunk := response.read(1024 * 1024):
-                destination.write(chunk)
-                digest.update(chunk)
-                downloaded += len(chunk)
-                if downloaded == len(chunk) or downloaded % (32 * 1024 * 1024) < len(chunk):
-                    print(f"  downloaded {human_size(downloaded)}", flush=True)
-    except BaseException:
-        partial.unlink(missing_ok=True)
-        raise
-    expected_hash = str(RUSTIC_CONFIG["sha256"])
-    if downloaded != expected_size or digest.hexdigest() != expected_hash:
-        partial.unlink(missing_ok=True)
-        raise RuntimeError(
-            "downloaded generated-C archive failed verification: "
-            f"size={downloaded}, sha256={digest.hexdigest()}"
-        )
-    os.replace(partial, RUSTIC_ARCHIVE)
-    verify_rustic_archive()
-
-
-def extract_rustic_archive(destination: Path, *, prune_for_bundle: bool) -> None:
-    verify_rustic_archive()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
-    try:
-        run(
-            [
-                "tar",
-                "-xzf",
-                RUSTIC_ARCHIVE,
-                "--no-same-owner",
-                "--no-same-permissions",
-                "-C",
-                temporary,
-            ]
-        )
-        rustic_version_lines(temporary)
-        if prune_for_bundle:
-            for path in (
-                temporary / "share" / "doc" / "docs",
-                temporary / "lib" / "rustlib" / "src",
-                temporary / "share" / "man",
-            ):
-                shutil.rmtree(path, ignore_errors=True)
-            for name in ("rustdoc", "rust-gdb", "rust-gdbgui", "rust-lldb"):
-                (temporary / "bin" / name).unlink(missing_ok=True)
-        if destination.exists() or destination.is_symlink():
-            if destination.is_dir() and not destination.is_symlink():
-                shutil.rmtree(destination)
-            else:
-                destination.unlink()
-        os.replace(temporary, destination)
-    finally:
-        if temporary.exists():
-            shutil.rmtree(temporary, ignore_errors=True)
-
-
-def bootstrap_generated_c() -> None:
-    download_rustic_archive()
-    reinstall = True
-    if RUSTIC_SYSROOT.is_dir():
-        try:
-            rustic_version_lines(RUSTIC_SYSROOT)
-            reinstall = False
-        except RuntimeError as error:
-            print(f"Reinstalling invalid generated-C toolchain: {error}")
-    if reinstall:
-        print(f"Extracting generated-C toolchain to {RUSTIC_SYSROOT}")
-        extract_rustic_archive(RUSTIC_SYSROOT, prune_for_bundle=False)
-
-    RUSTIC_ROOT.mkdir(parents=True, exist_ok=True)
-    temporary_link = RUSTIC_ROOT / ".current.tmp"
-    temporary_link.unlink(missing_ok=True)
-    temporary_link.symlink_to(RUSTIC_SYSROOT.name)
-    os.replace(temporary_link, RUSTIC_CURRENT)
-    rustc_version, cargo_version = rustic_version_lines(RUSTIC_CURRENT.resolve(strict=True))
-    print(f"Generated C ready: {rustc_version}; {cargo_version}")
-
-
-def bootstrap(component: str) -> None:
-    if component in ("all", "native"):
-        bootstrap_native()
-    if component in ("all", "generated-c"):
-        bootstrap_generated_c()
+def bootstrap() -> None:
+    bootstrap_native()
 
 
 def build_compiler() -> None:
@@ -393,6 +340,13 @@ def build_compiler() -> None:
         ],
         cwd=RUST,
     )
+    standard_libraries = sorted(STAGE1_TARGET_LIB.glob("libstd-*.rlib"))
+    if not standard_libraries:
+        raise RuntimeError(f"compiler build did not produce {STAGE1_TARGET_LIB}/libstd-*.rlib")
+    record_build(
+        "compiler",
+        [RUSTC, RUSTDOC, CARGO, PROC_MACRO_SERVER, standard_libraries[0]],
+    )
 
 
 def build_analyzer() -> None:
@@ -403,6 +357,7 @@ def build_analyzer() -> None:
         [cargo, "build", "--manifest-path", ANALYZER / "Cargo.toml", "-p", "rust-analyzer", "--release"],
         cwd=ANALYZER,
     )
+    record_build("analyzer", [ANALYZER_BINARY])
 
 
 def portable_build_environment() -> dict[str, str]:
@@ -415,6 +370,8 @@ def portable_build_environment() -> dict[str, str]:
 def build_editor(*, portable: bool = False) -> None:
     environment = portable_build_environment() if portable else os.environ.copy()
     run([ZED / "script" / "build-rust-workbench"], cwd=ZED, env=environment)
+    record_build("analyzer", [ANALYZER_BINARY])
+    record_build("editor", [EDITOR_BINARY, ANALYZER_BINARY], portable=portable)
 
 
 def build(component: str, *, portable: bool = False) -> None:
@@ -490,8 +447,6 @@ def disk_report() -> None:
         ZED / "build",
         ZED / "rust-workbench-data",
         ZED / "rust-workbench-analysis-target",
-        RUSTIC_DOWNLOADS,
-        RUSTIC_ROOT,
         DIST,
     ]
     print("Disk usage")
@@ -671,7 +626,6 @@ def runtime_seed_binaries(app: Path) -> list[Path]:
         app / "libexec" / "rust-workbench",
         app / "libexec" / "rust-analyzer",
         app / "toolchain" / "bin" / "cargo",
-        app / "toolchains" / "rustic" / "bin" / "cargo",
         sysroot / "usr" / "bin" / "x86_64-linux-gnu-gcc-15",
         sysroot / "usr" / "bin" / "x86_64-linux-gnu-g++-15",
         sysroot / "usr" / "libexec" / "gcc" / "x86_64-linux-gnu" / "15" / "cc1",
@@ -818,49 +772,6 @@ def write_broken_project(destination: Path) -> None:
     )
 
 
-def write_generated_c_project(destination: Path) -> None:
-    (destination / "src").mkdir(parents=True)
-    (destination / "Cargo.toml").write_text(
-        textwrap.dedent(
-            """\
-            [package]
-            name = "rust_workbench_generated_c_smoke"
-            version = "0.1.0"
-            edition = "2024"
-            """
-        ),
-        encoding="utf-8",
-    )
-    (destination / "src" / "main.rs").write_text(
-        textwrap.dedent(
-            """\
-            fn generated_c_marker(input: u64) -> u64 {
-                input.wrapping_mul(42)
-            }
-
-            fn main() {
-                println!("generated C smoke: {}", generated_c_marker(2));
-            }
-            """
-        ),
-        encoding="utf-8",
-    )
-
-
-def assert_generated_c_output(target: Path, *, elapsed: float, label: str) -> None:
-    units = list((target / "debug" / "deps").glob("rust_workbench_generated_c_smoke-*.rcgu.c"))
-    if not units:
-        raise RuntimeError(f"generated-C smoke produced no project translation units for {label}")
-    if not any("generated_c_marker" in unit.read_text(encoding="utf-8") for unit in units):
-        raise RuntimeError(f"generated-C smoke output omitted its marker function for {label}")
-    forbidden = list((target / "debug" / "deps").glob("core-*.rcgu.c"))
-    forbidden.extend((target / "debug" / "deps").glob("std-*.rcgu.c"))
-    if forbidden:
-        raise RuntimeError(f"generated-C smoke unexpectedly rebuilt std for {label}: {forbidden[:3]}")
-    if elapsed > 10.0:
-        raise RuntimeError(f"generated-C smoke exceeded 10 seconds for {label}: {elapsed:.2f}s")
-
-
 def smoke_bundle(app: Path, *, label: str) -> None:
     launcher = app / "bin" / "rust-workbench"
     with tempfile.TemporaryDirectory(prefix="rust-workbench-smoke-") as temp:
@@ -896,28 +807,6 @@ def smoke_bundle(app: Path, *, label: str) -> None:
         if "borrowck_wrapper_ref_cell" not in combined:
             raise RuntimeError(f"custom compiler suggestion missing from {label} bundle smoke test")
 
-        generated = temp_path / "generated-c-project"
-        generated_target = generated / "target"
-        write_generated_c_project(generated)
-        generated_environment = bundle_environment(app, data, generated_target)
-        started = time.monotonic()
-        run(
-            [
-                launcher,
-                "--run-generated-c-toolchain",
-                "cargo",
-                "build",
-                "--offline",
-                "--manifest-path",
-                generated / "Cargo.toml",
-            ],
-            env=generated_environment,
-        )
-        assert_generated_c_output(
-            generated_target,
-            elapsed=time.monotonic() - started,
-            label=label,
-        )
     print(f"bundle smoke passed: {label}")
 
 
@@ -928,6 +817,16 @@ def all_elf_files(app: Path) -> Iterable[Path]:
 
 
 def validate_bundle(app: Path) -> dict[str, object]:
+    forbidden_paths = [
+        path.relative_to(app).as_posix()
+        for path in app.rglob("*")
+        if "rustic" in path.name.lower() or "rustc_codegen_c" in path.name.lower()
+    ]
+    if forbidden_paths:
+        raise RuntimeError(
+            "removed Generated C components found in bundle:\n" + "\n".join(forbidden_paths)
+        )
+
     editor = app / "libexec" / "rust-workbench"
     dynamic = run(["readelf", "-d", editor], capture=True).stdout
     if "$ORIGIN/../lib" not in dynamic:
@@ -983,8 +882,6 @@ def validate_bundle(app: Path) -> dict[str, object]:
         app / "libexec" / "rust-analyzer",
         app / "toolchain" / "bin" / "cargo",
         app / "toolchain" / "bin" / "rustc",
-        app / "toolchains" / "rustic" / "bin" / "cargo",
-        app / "toolchains" / "rustic" / "bin" / "rustc",
     ):
         result = run(["ldd", path], env=environment, capture=True, check=False)
         combined = f"{result.stdout}\n{result.stderr}"
@@ -997,11 +894,13 @@ def validate_bundle(app: Path) -> dict[str, object]:
 def create_manifest(app: Path, native_versions: dict[str, str], validation: dict[str, object]) -> None:
     environment = os.environ.copy()
     environment["LD_LIBRARY_PATH"] = str(app / "lib")
-    commit = output(["git", "rev-parse", "HEAD"])
+    commit = source_commit()
+    created = dt.datetime.fromtimestamp(source_epoch(), dt.UTC).isoformat()
     manifest = {
         "format_version": 2,
         "name": "Rust Workbench",
-        "created_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "version": RELEASE_VERSION,
+        "created_utc": created,
         "source_commit": commit,
         "compatibility": {
             "os": CONFIG["compatibility"]["os"],
@@ -1018,37 +917,16 @@ def create_manifest(app: Path, native_versions: dict[str, str], validation: dict
             "analyzer_sha256": sha256(app / "libexec" / "rust-analyzer"),
             "rustc_sha256": sha256(app / "toolchain" / "bin" / "rustc"),
             "cargo_sha256": sha256(app / "toolchain" / "bin" / "cargo"),
-            "rustc_codegen_c": {
-                "release": RUSTIC_CONFIG["release"],
-                "source": RUSTIC_CONFIG["source"],
-                "archive_sha256": RUSTIC_CONFIG["sha256"],
-                "rustc": component_version(
-                    [app / "toolchains" / "rustic" / "bin" / "rustc", "-Vv"],
-                    environment=environment,
-                ),
-                "cargo": component_version(
-                    [app / "toolchains" / "rustic" / "bin" / "cargo", "-V"],
-                    environment=environment,
-                ),
-                "rustc_sha256": sha256(app / "toolchains" / "rustic" / "bin" / "rustc"),
-                "cargo_sha256": sha256(app / "toolchains" / "rustic" / "bin" / "cargo"),
-            },
         },
         "native_sdk_packages": native_versions,
         "validation": validation,
     }
     (app / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    rustic_drivers = list((app / "toolchains" / "rustic" / "lib").glob("librustc_driver-*.so"))
-    if len(rustic_drivers) != 1:
-        raise RuntimeError(f"expected one rustic compiler driver, found {rustic_drivers}")
     checksum_paths = (
         app / "libexec" / "rust-workbench",
         app / "libexec" / "rust-analyzer",
         app / "toolchain" / "bin" / "rustc",
         app / "toolchain" / "bin" / "cargo",
-        app / "toolchains" / "rustic" / "bin" / "rustc",
-        app / "toolchains" / "rustic" / "bin" / "cargo",
-        rustic_drivers[0],
     )
     (app / "checksums.sha256").write_text(
         "".join(
@@ -1073,7 +951,6 @@ def populate_bundle(app: Path) -> dict[str, str]:
 
     copy_tree(STAGE1, app / "toolchain")
     copy_executable(CARGO, app / "toolchain" / "bin" / "cargo")
-    extract_rustic_archive(app / "toolchains" / "rustic", prune_for_bundle=True)
     # A compiler built in-tree installs these as absolute links back to the
     # checkout.  They are useful for compiler development, but would make the
     # supposedly portable bundle depend on this machine.  Materialize only the
@@ -1094,16 +971,6 @@ def populate_bundle(app: Path) -> dict[str, str]:
     shutil.copy2(RUST / "LICENSE-MIT", license_dir / "rust-LICENSE-MIT")
     shutil.copy2(ZED / "LICENSE-APACHE", license_dir / "zed-LICENSE-APACHE")
     shutil.copy2(ZED / "LICENSE-GPL", license_dir / "zed-LICENSE-GPL")
-    rustic_license_dir = app / "toolchains" / "rustic" / "share" / "doc" / "rustc" / "licenses"
-    shutil.copy2(
-        rustic_license_dir / "Apache-2.0.txt",
-        license_dir / "rustc_codegen_c-LICENSE-APACHE",
-    )
-    shutil.copy2(
-        rustic_license_dir / "MIT.txt",
-        license_dir / "rustc_codegen_c-LICENSE-MIT",
-    )
-
     shutil.copy2(
         ZED / "crates" / "zed" / "resources" / "app-icon-rust-workbench.png",
         app / "share" / "icons" / "hicolor" / "512x512" / "apps" / "rust-workbench.png",
@@ -1123,19 +990,8 @@ def populate_bundle(app: Path) -> dict[str, str]:
 def ensure_package_artifacts(*, skip_build: bool) -> None:
     if platform.system() != "Linux" or platform.machine() != CONFIG["compatibility"]["arch"]:
         raise SystemExit("this package target supports only x86_64 Linux")
-    if not RUSTC.is_file():
-        if skip_build:
-            raise SystemExit(f"missing custom compiler: {RUSTC}")
-        build_compiler()
-    try:
-        verify_rustic_archive()
-        rustic_version_lines(RUSTIC_CURRENT.resolve(strict=True))
-    except (OSError, RuntimeError) as error:
-        raise SystemExit(
-            f"generated-C toolchain is not ready: {error}\n"
-            "Run ./workbench bootstrap generated-c before packaging."
-        ) from None
     if skip_build:
+        validate_build_receipt()
         missing = [
             path
             for path in (EDITOR_BINARY, ANALYZER_BINARY, CARGO, RUSTDOC, PROC_MACRO_SERVER)
@@ -1155,13 +1011,14 @@ def ensure_package_artifacts(*, skip_build: bool) -> None:
                 f"{STAGE1_TARGET_LIB}/libstd-*.rlib"
             )
     else:
+        build_compiler()
         build_editor(portable=True)
 
 
 def archive_bundle(staging: Path, archive: Path, app_name: str) -> None:
     if archive.exists():
         archive.unlink()
-    epoch = output(["git", "show", "-s", "--format=%ct", "HEAD"])
+    epoch = source_epoch()
     run(
         [
             "tar",
@@ -1215,8 +1072,6 @@ def verify_bundle_in_container(app: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="rust-workbench-container-smoke-") as temp:
         fixture = Path(temp) / "project"
         write_smoke_project(fixture)
-        generated_fixture = fixture / "generated-c"
-        write_generated_c_project(generated_fixture)
         launcher = "/opt/rust-workbench.app/bin/rust-workbench"
         base = [
             "docker",
@@ -1237,22 +1092,11 @@ def verify_bundle_in_container(app: Path) -> None:
         run([*base, "sh", "-c", "test ! -e /usr/bin/rustc && test ! -e /usr/bin/cargo && test ! -e /usr/bin/cc"])
         run([*base, launcher, "--doctor"])
         run([*base, launcher, "--run-toolchain", "cargo", "run", "--quiet", "--manifest-path", "/work/Cargo.toml"])
-        run(
-            [
-                *base,
-                launcher,
-                "--run-generated-c-toolchain",
-                "cargo",
-                "build",
-                "--offline",
-                "--manifest-path",
-                "/work/generated-c/Cargo.toml",
-            ]
-        )
     print("bundle smoke passed: clean Ubuntu 26.04 container")
 
 
 def package_linux(*, skip_build: bool, keep_staging: bool, verify: bool) -> Path:
+    require_clean_source()
     ensure_package_artifacts(skip_build=skip_build)
     DIST.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".rust-workbench-package-", dir=DIST))
@@ -1295,15 +1139,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     subcommands = result.add_subparsers(dest="command", required=True)
     subcommands.add_parser("doctor", help="validate source, tools, artifacts, and ABI")
-    bootstrap_parser = subcommands.add_parser(
-        "bootstrap", help="download workspace-local native and generated-C dependencies"
-    )
-    bootstrap_parser.add_argument(
-        "component",
-        nargs="?",
-        choices=("all", "native", "generated-c"),
-        default="all",
-    )
+    subcommands.add_parser("bootstrap", help="install workspace-local native dependencies")
 
     build_parser = subcommands.add_parser("build", help="build compiler, analyzer, editor, or all")
     build_parser.add_argument("component", choices=("compiler", "analyzer", "editor", "all"))
@@ -1339,7 +1175,7 @@ def main() -> int:
     if arguments.command == "doctor":
         return doctor()
     if arguments.command == "bootstrap":
-        bootstrap(arguments.component)
+        bootstrap()
     elif arguments.command == "build":
         build(arguments.component, portable=arguments.portable)
     elif arguments.command == "test":

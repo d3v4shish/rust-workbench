@@ -1282,6 +1282,9 @@ impl GlobalState {
         self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {
             let started = Instant::now();
             let files = prepare_ownership_model_artifacts(&snap, paths);
+            // Release the cloned diagnostic/model caches before the main loop calls
+            // `Arc::make_mut` to install the prepared files.
+            drop(snap);
             let preparation_time = started.elapsed();
             // Install one source file per main-loop turn. The persistent caches make each commit
             // cheap, but committing an entire multi-crate workspace in one event can still exceed
@@ -1339,14 +1342,18 @@ impl GlobalState {
                 }
             }
             self.ownership_file_sequences.insert(file.file_id, batch.sequence);
-            self.send_notification::<lsp_ext::OwnershipModelChangedNotification>(
-                lsp_ext::OwnershipModelChangedParams {
-                    uri: file.uri,
-                    schema_version: file.schema_version,
-                    status: "ready".to_owned(),
-                    source_hash: file.source_hash,
-                },
-            );
+            let document_is_open =
+                from_proto::vfs_path(&file.uri).is_ok_and(|path| self.mem_docs.contains(&path));
+            if document_is_open {
+                self.send_notification::<lsp_ext::OwnershipModelChangedNotification>(
+                    lsp_ext::OwnershipModelChangedParams {
+                        uri: file.uri,
+                        schema_version: file.schema_version,
+                        status: "ready".to_owned(),
+                        source_hash: file.source_hash,
+                    },
+                );
+            }
             if !retired.is_empty() {
                 self.task_pool
                     .handle
@@ -1822,7 +1829,7 @@ fn prepare_ownership_model_artifacts(
     let mut prepared = FxHashMap::<FileId, PreparedOwnershipFile>::default();
     for path in paths {
         let artifact = match read_ownership_model_artifact(&path) {
-            Ok(artifact) if matches!(artifact.schema_version, 2 | 3 | 4 | 5 | 6) => artifact,
+            Ok(artifact) if matches!(artifact.schema_version, 2 | 3 | 4 | 5 | 6 | 7) => artifact,
             Ok(artifact) => {
                 tracing::warn!(
                     version = artifact.schema_version,
