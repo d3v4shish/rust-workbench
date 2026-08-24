@@ -971,6 +971,8 @@ pub struct RustOwnershipDisplayPreferences {
     pub show_access: bool,
     #[serde(default)]
     pub show_wrappers: bool,
+    #[serde(default)]
+    pub show_method_coach: bool,
     #[serde(skip)]
     pub focus_rows: Vec<(u32, u32)>,
 }
@@ -1006,6 +1008,7 @@ impl RustOwnershipDisplayPreferences {
             show_storage: false,
             show_access: false,
             show_wrappers: false,
+            show_method_coach: true,
             focus_rows: Vec::new(),
         }
     }
@@ -1034,6 +1037,7 @@ impl RustOwnershipDisplayPreferences {
             show_storage: true,
             show_access: true,
             show_wrappers: true,
+            show_method_coach: true,
             focus_rows: Vec::new(),
         }
     }
@@ -1062,6 +1066,7 @@ impl RustOwnershipDisplayPreferences {
             show_storage: true,
             show_access: true,
             show_wrappers: true,
+            show_method_coach: true,
             focus_rows: Vec::new(),
         }
     }

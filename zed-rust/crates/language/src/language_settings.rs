@@ -456,17 +456,6 @@ impl InlayHintSettings {
         }
         if self.show_other_hints {
             kinds.insert(None);
-            kinds.extend([
-                Some(InlayHintKind::Adjustment),
-                Some(InlayHintKind::Lifetime),
-                Some(InlayHintKind::OwnershipEstimated),
-                Some(InlayHintKind::OwnershipExact),
-                Some(InlayHintKind::Drop),
-                Some(InlayHintKind::MechanicsLayout),
-                Some(InlayHintKind::MechanicsStorage),
-                Some(InlayHintKind::MechanicsAccess),
-                Some(InlayHintKind::MechanicsWrapper),
-            ]);
         }
         kinds
     }
@@ -955,6 +944,25 @@ mod tests {
     use gpui::TestAppContext;
     use settings::{LocalSettingsKind, LocalSettingsPath, WorktreeId};
     use util::rel_path::rel_path;
+
+    #[test]
+    fn ordinary_other_hints_do_not_bypass_semantic_workbench_filters() {
+        let settings = InlayHintSettings {
+            enabled: true,
+            show_type_hints: true,
+            show_parameter_hints: false,
+            show_other_hints: true,
+            show_value_hints: true,
+            show_background: false,
+            edit_debounce_ms: 0,
+            scroll_debounce_ms: 0,
+            toggle_on_modifiers_press: None,
+        };
+        assert_eq!(
+            settings.enabled_inlay_hint_kinds(),
+            HashSet::from_iter([None, Some(InlayHintKind::Type)])
+        );
+    }
 
     #[gpui::test]
     fn test_edit_predictions_enabled_for_file(cx: &mut TestAppContext) {

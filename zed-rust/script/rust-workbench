@@ -17,6 +17,7 @@ fi
 editor_binary="$zed_source_dir/target/$profile/rust-workbench"
 user_data_dir="$zed_source_dir/rust-workbench-data"
 local_sysroot="$zed_source_dir/.build-deps/sysroot"
+rustic_sysroot="$zed_source_dir/.build-deps/rustic/current"
 
 if [[ ! -x "$editor_binary" ]]; then
   build_flag=""
@@ -48,6 +49,11 @@ export RUST_WORKBENCH_RUSTC="$rustc_binary"
 export RUST_WORKBENCH_RUSTDOC="$rustdoc_binary"
 export RUST_WORKBENCH_CARGO="$cargo_binary"
 export RUST_WORKBENCH_RUST_SRC="$rust_source_dir/library"
+if [[ -x "$rustic_sysroot/bin/rustc" && -x "$rustic_sysroot/bin/cargo" ]]; then
+  export RUST_WORKBENCH_RUSTIC_SYSROOT="$rustic_sysroot"
+else
+  unset RUST_WORKBENCH_RUSTIC_SYSROOT || true
+fi
 export RUST_WORKBENCH_ANALYSIS_TARGET="$zed_source_dir/rust-workbench-analysis-target"
 export RUSTC="$rustc_binary"
 export RUSTDOC="$rustdoc_binary"
@@ -60,5 +66,21 @@ export ZED_RELEASE_CHANNEL="dev"
 export XDG_CACHE_HOME="$user_data_dir/cache"
 
 mkdir -p "$XDG_CACHE_HOME"
+
+if [[ "${1:-}" == "--run-generated-c-toolchain" ]]; then
+  shift
+  if [[ $# -eq 0 ]]; then
+    echo "usage: rust-workbench --run-generated-c-toolchain COMMAND [ARG ...]" >&2
+    exit 2
+  fi
+  if [[ ! -x "$rustic_sysroot/bin/rustc" || ! -x "$rustic_sysroot/bin/cargo" ]]; then
+    echo "Generated C is not installed. Run $workspace_root/workbench bootstrap generated-c." >&2
+    exit 1
+  fi
+  export RUSTC="$rustic_sysroot/bin/rustc"
+  unset RUSTDOC RUSTUP_TOOLCHAIN RUSTC_BOOTSTRAP || true
+  export PATH="$rustic_sysroot/bin:$PATH"
+  exec "$@"
+fi
 
 exec "$editor_binary" --user-data-dir "$user_data_dir" "$@"

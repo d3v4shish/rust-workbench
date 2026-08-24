@@ -826,6 +826,7 @@ pub enum InlayHintKind {
     MechanicsStorage,
     MechanicsAccess,
     MechanicsWrapper,
+    MethodCoach,
 }
 
 impl InlayHintKind {
@@ -846,6 +847,7 @@ impl InlayHintKind {
             "mechanics_storage" => Some(InlayHintKind::MechanicsStorage),
             "mechanics_access" => Some(InlayHintKind::MechanicsAccess),
             "mechanics_wrapper" => Some(InlayHintKind::MechanicsWrapper),
+            "method_coach" => Some(InlayHintKind::MethodCoach),
             _ => None,
         }
     }
@@ -864,6 +866,7 @@ impl InlayHintKind {
             InlayHintKind::MechanicsStorage => "mechanics_storage",
             InlayHintKind::MechanicsAccess => "mechanics_access",
             InlayHintKind::MechanicsWrapper => "mechanics_wrapper",
+            InlayHintKind::MethodCoach => "method_coach",
         }
     }
 }

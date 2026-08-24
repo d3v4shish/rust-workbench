@@ -340,6 +340,21 @@ mod rust_workbench_inlay_tests {
     }
 
     #[test]
+    fn version_four_method_coach_metadata_has_an_independent_semantic_kind() {
+        let clue = serde_json::json!({
+            "rustWorkbench": {
+                "version": 4,
+                "category": "method_coach",
+                "operationId": "method-coach-10-20-push"
+            }
+        });
+        assert_eq!(
+            rust_workbench_inlay_kind(Some(&clue)),
+            Some(InlayHintKind::MethodCoach)
+        );
+    }
+
+    #[test]
     fn version_two_mechanics_metadata_is_semantic() {
         for (category, expected) in [
             ("layout", InlayHintKind::MechanicsLayout),
@@ -3374,7 +3389,12 @@ impl LspCommand for OnTypeFormatting {
 
 fn rust_workbench_inlay_kind(data: Option<&lsp::LSPAny>) -> Option<InlayHintKind> {
     let metadata = data?.get("rustWorkbench")?;
-    if !matches!(metadata.get("version")?.as_u64()?, 1 | 2 | 3) {
+    let version = metadata.get("version")?.as_u64()?;
+    if version == 4 {
+        return (metadata.get("category")?.as_str()? == "method_coach")
+            .then_some(InlayHintKind::MethodCoach);
+    }
+    if !matches!(version, 1 | 2 | 3) {
         return None;
     }
     match metadata.get("category")?.as_str()? {
@@ -3711,7 +3731,8 @@ impl InlayHints {
                 | InlayHintKind::MechanicsLayout
                 | InlayHintKind::MechanicsStorage
                 | InlayHintKind::MechanicsAccess
-                | InlayHintKind::MechanicsWrapper => None,
+                | InlayHintKind::MechanicsWrapper
+                | InlayHintKind::MethodCoach => None,
             }),
             text_edits: None,
             tooltip: hint.tooltip.and_then(|tooltip| {

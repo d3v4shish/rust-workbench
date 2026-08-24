@@ -959,7 +959,19 @@ impl EditorElement {
             )
         {
             let point = position_map.point_for_position(mouse_position);
-            if editor.rust_mechanics_hint_at_point(&position_map.snapshot, &point, cx) {
+            if editor.rust_workbench_hint_at_point(&position_map.snapshot, &point, cx) {
+                // Inlay text has no source bytes of its own. Place the cursor at its attached
+                // source anchor before opening the workbench so a valid call cannot fall back to
+                // whichever diagnostic happened to be selected previously.
+                editor.select(
+                    SelectPhase::Begin {
+                        position: point.nearest_valid,
+                        add: false,
+                        click_count: 1,
+                    },
+                    window,
+                    cx,
+                );
                 window.dispatch_action(Box::new(crate::actions::OpenRustWorkbenchForClue), cx);
                 editor.selection_drag_state = SelectionDragState::None;
                 cx.stop_propagation();

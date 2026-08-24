@@ -2,15 +2,17 @@ mod learning_catalog;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-    time::Duration,
+    io::Read,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use db::kvp::KeyValueStore;
 use editor::{
     Editor, EditorEvent, HighlightKey, RowHighlightOptions, RustInlineDiagnosticMode,
     RustMechanicsHintMode, RustOwnershipDisplayPreferences, RustOwnershipDisplayProfile,
-    RustOwnershipHintScope, actions::OpenRustWorkbenchForClue,
+    RustOwnershipHintScope, SelectionEffects, actions::OpenRustWorkbenchForClue,
+    scroll::Autoscroll,
 };
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, FocusHandle,
@@ -23,10 +25,11 @@ use project::{
     Project,
     lsp_store::rust_analyzer_ext::{
         self, OwnershipBinding, OwnershipLoanPoint, OwnershipModel, OwnershipProblem,
-        OwnershipProblems,
+        OwnershipProblemCluster, OwnershipProblems, OwnershipWorkspaceGuide,
+        OwnershipWorkspaceSite,
     },
 };
-use text::{Bias, PointUtf16, ToPointUtf16};
+use text::{Bias, Point, PointUtf16, ToPointUtf16};
 use ui::{Button, Color, IconName, Label, LabelSize, prelude::*, utils::WithRemSize, v_flex};
 use util::ResultExt as _;
 use workspace::{
@@ -112,10 +115,18 @@ enum CGenerationState {
 
 #[derive(Clone, Debug)]
 struct GeneratedCArtifact {
-    code: SharedString,
-    path: PathBuf,
+    units: Vec<GeneratedCTranslationUnit>,
+    target: SharedString,
     source_hash: String,
     backend: SharedString,
+    duration: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct GeneratedCTranslationUnit {
+    code: SharedString,
+    path: PathBuf,
+    label: SharedString,
 }
 
 #[cfg(test)]
@@ -190,13 +201,21 @@ pub fn init(cx: &mut App) {
                     // The editor has already placed the cursor at the semantic
                     // clue's source anchor. Unlock the previous diagnostic so
                     // the next bounded scan can select the exact field/place.
+                    panel.observe_active_editor(cx);
                     panel.selected_problem_id = None;
+                    panel.operation_focus_requested = true;
                     panel.selection_epoch = panel.selection_epoch.wrapping_add(1);
                     panel.last_problem_key = None;
                     panel.pending_problem_key = None;
                     panel.last_model_key = None;
                     panel.pending_model_key = None;
+                    panel.last_workspace_guide_key = None;
+                    panel.pending_workspace_guide_key = None;
+                    panel.workspace_guide = OwnershipWorkspaceGuide::default();
+                    panel.selected_symptom_problem_id = None;
+                    panel.selected_intent_choice_id = None;
                     panel.selected_topology_element = None;
+                    panel.schedule_refresh(cx);
                     panel.schedule_problem_scan(cx);
                     cx.notify();
                 });
@@ -240,7 +259,11 @@ pub struct RustWorkbenchPanel {
     active: bool,
     model: OwnershipModel,
     problems: OwnershipProblems,
+    workspace_guide: OwnershipWorkspaceGuide,
     selected_problem_id: Option<String>,
+    selected_symptom_problem_id: Option<String>,
+    selected_intent_choice_id: Option<String>,
+    operation_focus_requested: bool,
     selection_epoch: u64,
     problem_status: SharedString,
     status_message: SharedString,
@@ -250,15 +273,19 @@ pub struct RustWorkbenchPanel {
     pending_problem_key: Option<ProblemRequestKey>,
     last_model_key: Option<ModelRequestKey>,
     pending_model_key: Option<ModelRequestKey>,
+    last_workspace_guide_key: Option<WorkspaceGuideRequestKey>,
+    pending_workspace_guide_key: Option<WorkspaceGuideRequestKey>,
     active_editor: Option<WeakEntity<Editor>>,
     editor_subscription: Option<Subscription>,
     refresh_task: Task<()>,
     problem_scan_task: Task<()>,
     problem_selection_task: Task<()>,
+    workspace_guide_task: Task<()>,
     font_scale_percent: u16,
     display_preferences: RustOwnershipDisplayPreferences,
     show_display_controls: bool,
     show_issue_list: bool,
+    show_workspace_roots: bool,
     active_detail_drawer: Option<DetailDrawer>,
     expanded_operations: BTreeSet<String>,
     repair_verification: Option<RepairVerification>,
@@ -267,6 +294,7 @@ pub struct RustWorkbenchPanel {
     c_view_mode: CViewMode,
     c_generation_state: CGenerationState,
     generated_c: Option<GeneratedCArtifact>,
+    generated_c_unit_index: usize,
     generated_c_task: Task<()>,
     exact_mode: bool,
     visual_step: usize,
@@ -292,6 +320,15 @@ struct ProblemRequestKey {
     source_hash: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceGuideRequestKey {
+    buffer_id: EntityId,
+    source_hash: String,
+    problem_id: Option<String>,
+    position: PointUtf16,
+    selection_epoch: u64,
+}
+
 fn model_response_is_current(
     pending: Option<&ModelRequestKey>,
     request: &ModelRequestKey,
@@ -301,6 +338,18 @@ fn model_response_is_current(
     pending == Some(request)
         && selection_epoch == request.selection_epoch
         && selected_problem_id == request.problem_id.as_deref()
+}
+
+fn default_problem_index(problem_count: usize, operation_focus_requested: bool) -> Option<usize> {
+    (!operation_focus_requested && problem_count > 0).then_some(0)
+}
+
+fn selected_workspace_cluster(guide: &OwnershipWorkspaceGuide) -> Option<&OwnershipProblemCluster> {
+    guide
+        .selected_cluster_id
+        .as_deref()
+        .and_then(|selected| guide.clusters.iter().find(|cluster| cluster.id == selected))
+        .or_else(|| guide.clusters.first())
 }
 
 pub struct OwnershipCoachBanner {
@@ -463,6 +512,10 @@ impl RustWorkbenchPanel {
                         panel.last_problem_key = None;
                         panel.pending_problem_key = None;
                         panel.validating_repair_id = None;
+                        panel.last_workspace_guide_key = None;
+                        panel.pending_workspace_guide_key = None;
+                        panel.workspace_guide = OwnershipWorkspaceGuide::default();
+                        panel.selected_intent_choice_id = None;
                         panel.schedule_problem_scan(cx);
                     }
                 });
@@ -473,7 +526,11 @@ impl RustWorkbenchPanel {
                     active: false,
                     model: OwnershipModel::default(),
                     problems: OwnershipProblems::default(),
+                    workspace_guide: OwnershipWorkspaceGuide::default(),
                     selected_problem_id: None,
+                    selected_symptom_problem_id: None,
+                    selected_intent_choice_id: None,
+                    operation_focus_requested: false,
                     selection_epoch: 0,
                     problem_status: "Checking this file for explainable Rust problems…".into(),
                     status_message: "Select a Rust variable, then refresh.".into(),
@@ -483,15 +540,19 @@ impl RustWorkbenchPanel {
                     pending_problem_key: None,
                     last_model_key: None,
                     pending_model_key: None,
+                    last_workspace_guide_key: None,
+                    pending_workspace_guide_key: None,
                     active_editor: None,
                     editor_subscription: None,
                     refresh_task: Task::ready(()),
                     problem_scan_task: Task::ready(()),
                     problem_selection_task: Task::ready(()),
+                    workspace_guide_task: Task::ready(()),
                     font_scale_percent: DEFAULT_PANEL_FONT_SCALE_PERCENT,
                     display_preferences,
                     show_display_controls: false,
                     show_issue_list: false,
+                    show_workspace_roots: false,
                     active_detail_drawer: None,
                     expanded_operations: BTreeSet::new(),
                     repair_verification: None,
@@ -500,6 +561,7 @@ impl RustWorkbenchPanel {
                     c_view_mode: CViewMode::Conceptual,
                     c_generation_state: CGenerationState::NotStarted,
                     generated_c: None,
+                    generated_c_unit_index: 0,
                     generated_c_task: Task::ready(()),
                     exact_mode: false,
                     visual_step: 0,
@@ -528,8 +590,15 @@ impl RustWorkbenchPanel {
         self.pending_model_key = None;
         self.last_problem_key = None;
         self.pending_problem_key = None;
+        self.last_workspace_guide_key = None;
+        self.pending_workspace_guide_key = None;
         self.problems = OwnershipProblems::default();
+        self.workspace_guide = OwnershipWorkspaceGuide::default();
         self.selected_problem_id = None;
+        self.selected_symptom_problem_id = None;
+        self.selected_intent_choice_id = None;
+        self.show_workspace_roots = false;
+        self.operation_focus_requested = false;
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         self.model = OwnershipModel::default();
         self.topology_scene = None;
@@ -562,6 +631,11 @@ impl RustWorkbenchPanel {
                     panel.pending_model_key = None;
                     panel.last_problem_key = None;
                     panel.pending_problem_key = None;
+                    panel.last_workspace_guide_key = None;
+                    panel.pending_workspace_guide_key = None;
+                    panel.workspace_guide = OwnershipWorkspaceGuide::default();
+                    panel.selected_symptom_problem_id = None;
+                    panel.selected_intent_choice_id = None;
                     panel.repair_validation_task = Task::ready(());
                     panel.validating_repair_id = None;
                     panel.clear_editor_cue(cx);
@@ -665,12 +739,24 @@ impl RustWorkbenchPanel {
         let range = problem.primary_range;
         let changed = self.selected_problem_id.as_deref() != Some(id.as_str());
         if !changed {
+            self.selected_symptom_problem_id = Some(id);
+            self.selected_intent_choice_id = None;
+            self.last_workspace_guide_key = None;
+            self.pending_workspace_guide_key = None;
+            self.workspace_guide = OwnershipWorkspaceGuide::default();
+            self.schedule_workspace_guide(cx);
             if reveal_source {
                 self.cue_range(range, cx);
             }
             return;
         }
-        self.selected_problem_id = Some(id);
+        self.selected_problem_id = Some(id.clone());
+        self.selected_symptom_problem_id = Some(id);
+        self.selected_intent_choice_id = None;
+        self.last_workspace_guide_key = None;
+        self.pending_workspace_guide_key = None;
+        self.workspace_guide = OwnershipWorkspaceGuide::default();
+        self.operation_focus_requested = false;
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         self.last_model_key = None;
         self.pending_model_key = None;
@@ -690,6 +776,7 @@ impl RustWorkbenchPanel {
         }
         self.apply_display_to_editor(cx);
         self.schedule_refresh(cx);
+        self.schedule_workspace_guide(cx);
         cx.notify();
     }
 
@@ -990,6 +1077,7 @@ impl RustWorkbenchPanel {
             "storage" => preferences.show_storage = !preferences.show_storage,
             "access" => preferences.show_access = !preferences.show_access,
             "wrappers" => preferences.show_wrappers = !preferences.show_wrappers,
+            "method_coach" => preferences.show_method_coach = !preferences.show_method_coach,
             _ => return,
         }
         preferences.profile = RustOwnershipDisplayProfile::Custom;
@@ -1137,6 +1225,14 @@ impl RustWorkbenchPanel {
         };
         let source = buffer.read(cx).snapshot().text();
         let source_hash = ownership_source_hash(&source);
+        let focus_label = self.model.source_context.as_ref().and_then(|context| {
+            context
+                .breadcrumbs
+                .iter()
+                .rev()
+                .find(|item| item.kind == "function" || item.kind == "method")
+                .map(|item| item.label.clone())
+        });
         self.c_generation_state = CGenerationState::Waiting;
         cx.notify();
         self.generated_c_task = cx.spawn(async move |panel, cx| {
@@ -1149,7 +1245,8 @@ impl RustWorkbenchPanel {
                     cx.notify();
                 })
                 .ok();
-            let generation = cx.background_spawn(generate_c_artifact(source_path, source_hash));
+            let generation =
+                cx.background_spawn(generate_c_artifact(source_path, source_hash, focus_label));
             let result = generation.await;
             panel
                 .update(cx, |panel, cx| {
@@ -1167,11 +1264,14 @@ impl RustWorkbenchPanel {
                                     "Rust changed while C was being generated.".into(),
                                 )
                             };
+                            panel.generated_c_unit_index = 0;
                             panel.generated_c = Some(artifact);
                         }
                         Err(error) => {
                             let message = error.to_string();
-                            panel.c_generation_state = if message.contains("rustic toolchain") {
+                            panel.c_generation_state = if message.contains("toolchain")
+                                || message.contains("bootstrap generated-c")
+                            {
                                 CGenerationState::Blocked(message.into())
                             } else {
                                 CGenerationState::Failed(message.into())
@@ -1198,7 +1298,8 @@ impl RustWorkbenchPanel {
         let Some(path) = self
             .generated_c
             .as_ref()
-            .map(|artifact| artifact.path.clone())
+            .and_then(|artifact| artifact.units.get(self.generated_c_unit_index))
+            .map(|unit| unit.path.clone())
         else {
             return;
         };
@@ -1214,6 +1315,55 @@ impl RustWorkbenchPanel {
             }
         })
         .detach();
+    }
+
+    fn open_workspace_site(
+        &mut self,
+        site: OwnershipWorkspaceSite,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(path) = site.location.uri.to_file_path() else {
+            self.status_message = "This compiler site is not a local file.".into();
+            cx.notify();
+            return;
+        };
+        let point = Point::new(site.location.range.start.line, 0);
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_panel, cx| {
+            let task = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    path,
+                    workspace::OpenOptions {
+                        focus: Some(true),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })?;
+            let item = task.await?;
+            let Some(editor) = item.downcast::<Editor>() else {
+                return anyhow::Ok(());
+            };
+            editor
+                .update_in(cx, |editor, window, cx| {
+                    let point = editor
+                        .buffer()
+                        .read(cx)
+                        .snapshot(cx)
+                        .clip_point(point, Bias::Left);
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::center()),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([point..point]),
+                    );
+                })
+                .ok();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn schedule_cursor_problem_selection(&mut self, cx: &mut Context<Self>) {
@@ -1343,7 +1493,12 @@ impl RustWorkbenchPanel {
                                         })
                                     })
                                     .or_else(|| panel.problem_index_at_cursor(cx))
-                                    .or_else(|| (!panel.problems.problems.is_empty()).then_some(0));
+                                    .or_else(|| {
+                                        default_problem_index(
+                                            panel.problems.problems.len(),
+                                            panel.operation_focus_requested,
+                                        )
+                                    });
                                 let selected_id =
                                     selected.map(|index| panel.problems.problems[index].id.clone());
                                 if selected_id != previous_id {
@@ -1354,11 +1509,17 @@ impl RustWorkbenchPanel {
                                     panel.selected_topology_element = None;
                                     panel.last_model_key = None;
                                     panel.pending_model_key = None;
+                                    panel.last_workspace_guide_key = None;
+                                    panel.pending_workspace_guide_key = None;
+                                    panel.workspace_guide = OwnershipWorkspaceGuide::default();
+                                    panel.selected_symptom_problem_id = selected_id.clone();
+                                    panel.selected_intent_choice_id = None;
                                 }
                                 panel.selected_problem_id = selected_id;
                                 panel.apply_display_to_editor(cx);
                                 if panel.active {
                                     panel.schedule_refresh(cx);
+                                    panel.schedule_workspace_guide(cx);
                                 }
                             } else {
                                 panel.last_problem_key = None;
@@ -1378,6 +1539,116 @@ impl RustWorkbenchPanel {
                                         .into(),
                                 );
                             }
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+        });
+    }
+
+    fn schedule_workspace_guide(&mut self, cx: &mut Context<Self>) {
+        if !self.active || self.selected_problem_id.is_none() {
+            return;
+        }
+        self.workspace_guide_task = cx.spawn(async move |panel, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            panel
+                .update(cx, |panel, cx| panel.refresh_workspace_guide(cx))
+                .ok();
+        });
+    }
+
+    fn refresh_workspace_guide(&mut self, cx: &mut Context<Self>) {
+        let (Some(buffer), Some(position)) = (self.active_buffer.clone(), self.active_position)
+        else {
+            return;
+        };
+        let source = buffer.read(cx).snapshot().text();
+        let requested_problem_id = self
+            .selected_symptom_problem_id
+            .clone()
+            .or_else(|| self.selected_problem_id.clone());
+        let request_key = WorkspaceGuideRequestKey {
+            buffer_id: buffer.entity_id(),
+            source_hash: ownership_source_hash(&source),
+            problem_id: requested_problem_id.clone(),
+            position,
+            selection_epoch: self.selection_epoch,
+        };
+        if self.pending_workspace_guide_key.as_ref() == Some(&request_key)
+            || self.last_workspace_guide_key.as_ref() == Some(&request_key)
+        {
+            return;
+        }
+        self.pending_workspace_guide_key = Some(request_key.clone());
+        let expected_revision = (!self.workspace_guide.revision.is_empty())
+            .then(|| self.workspace_guide.revision.clone());
+        let request = rust_analyzer_ext::ownership_workspace_guide(
+            self.project.clone(),
+            buffer.clone(),
+            position,
+            requested_problem_id,
+            expected_revision,
+            cx,
+        );
+        self.workspace_guide_task = cx.spawn(async move |panel, cx| {
+            let result = request.await;
+            panel
+                .update(cx, |panel, cx| {
+                    if panel.pending_workspace_guide_key.as_ref() != Some(&request_key) {
+                        return;
+                    }
+                    panel.pending_workspace_guide_key = None;
+                    let source_is_current = panel
+                        .active_buffer
+                        .as_ref()
+                        .filter(|active| active.entity_id() == request_key.buffer_id)
+                        .is_some_and(|active| {
+                            ownership_source_hash(&active.read(cx).snapshot().text())
+                                == request_key.source_hash
+                        });
+                    if !source_is_current || panel.selection_epoch != request_key.selection_epoch {
+                        return;
+                    }
+                    match result {
+                        Ok(guide) => {
+                            panel.last_workspace_guide_key = Some(request_key.clone());
+                            let root_problem_id = selected_workspace_cluster(&guide)
+                                .map(|cluster| cluster.root_problem_id.clone());
+                            panel.workspace_guide = guide;
+
+                            // A clicked diagnostic can be only a downstream symptom. If rustc's
+                            // causal identity points to a root in this file, lock the detailed
+                            // model to that root while retaining the clicked symptom for the tree.
+                            if let Some(root_problem_id) = root_problem_id
+                                && panel.selected_problem_id.as_deref()
+                                    != Some(root_problem_id.as_str())
+                                && panel
+                                    .problems
+                                    .problems
+                                    .iter()
+                                    .any(|problem| problem.id == root_problem_id)
+                            {
+                                panel.selected_problem_id = Some(root_problem_id);
+                                panel.selection_epoch = panel.selection_epoch.wrapping_add(1);
+                                panel.last_model_key = None;
+                                panel.pending_model_key = None;
+                                panel.model = OwnershipModel::default();
+                                panel.topology_scene = None;
+                                panel.full_topology_scene = None;
+                                panel.status_message =
+                                    "The guide selected the compiler root cause; the clicked error remains highlighted below."
+                                        .into();
+                                panel.schedule_refresh(cx);
+                            }
+                        }
+                        Err(error) => {
+                            panel.last_workspace_guide_key = None;
+                            panel.workspace_guide.status =
+                                format!("Workspace guide unavailable: {error}");
                         }
                     }
                     cx.notify();
@@ -1441,7 +1712,8 @@ impl RustWorkbenchPanel {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.selected_problem_id.is_none()
+        if !self.operation_focus_requested
+            && self.selected_problem_id.is_none()
             && (self.pending_problem_key.is_some() || !self.problems.problems.is_empty())
         {
             self.status_message =
@@ -1480,6 +1752,7 @@ impl RustWorkbenchPanel {
 
         self.active_buffer = Some(buffer.clone());
         self.active_position = Some(position);
+        self.schedule_workspace_guide(cx);
         let source = buffer.read(cx).snapshot().text();
         let request_key = ModelRequestKey {
             source_hash: ownership_source_hash(&source),
@@ -1748,9 +2021,37 @@ fn ownership_model_matches_source(model: &OwnershipModel, source: &str) -> bool 
         || model.source_hash == ownership_source_hash(source)
 }
 
+#[derive(Debug)]
+struct RusticToolchain {
+    sysroot: PathBuf,
+    cargo: PathBuf,
+    rustc: PathBuf,
+    backend: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GeneratedCCargoMetadata {
+    packages: Vec<GeneratedCCargoPackage>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GeneratedCCargoPackage {
+    name: String,
+    manifest_path: PathBuf,
+    targets: Vec<GeneratedCCargoTarget>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct GeneratedCCargoTarget {
+    name: String,
+    kind: Vec<String>,
+    src_path: PathBuf,
+}
+
 async fn generate_c_artifact(
     source_path: PathBuf,
     source_hash: String,
+    focus_label: Option<String>,
 ) -> anyhow::Result<GeneratedCArtifact> {
     let manifest_path = source_path
         .ancestors()
@@ -1759,55 +2060,48 @@ async fn generate_c_artifact(
         .ok_or_else(|| {
             anyhow::anyhow!("No Cargo.toml was found above {}.", source_path.display())
         })?;
-    let target_dir = paths::data_dir()
-        .join("rust-workbench")
+    let toolchain = resolve_rustic_toolchain().await?;
+    let package = generated_c_package_metadata(&toolchain, &manifest_path).await?;
+    let target = select_generated_c_target(&package, &source_path);
+    let target_names = target
+        .as_ref()
+        .map(|target| vec![target.name.clone()])
+        .unwrap_or_else(|| {
+            package
+                .targets
+                .iter()
+                .map(|target| target.name.clone())
+                .collect()
+        });
+    let target_description = target
+        .as_ref()
+        .map(|target| target.name.clone())
+        .unwrap_or_else(|| package.name.clone());
+    let cache_identity = format!(
+        "{}|{}|{}",
+        manifest_path.display(),
+        target_description,
+        toolchain.sysroot.display()
+    );
+    let target_dir = paths::temp_dir()
         .join("generated-c")
-        .join(&source_hash);
+        .join(ownership_source_hash(&cache_identity));
     std::fs::create_dir_all(&target_dir)?;
-
-    let (cargo, backend) = if let Some(custom_cargo) =
-        std::env::var_os("RUST_WORKBENCH_RUSTIC_CARGO").map(PathBuf::from)
-    {
-        if !custom_cargo.is_file() {
-            anyhow::bail!(
-                "RUST_WORKBENCH_RUSTIC_CARGO points to a missing file: {}",
-                custom_cargo.display()
-            );
-        }
-        (custom_cargo, "custom rustc_codegen_c toolchain".to_owned())
-    } else {
-        let mut locate = async_process::Command::new("rustup");
-        locate
-            .args(["which", "--toolchain", "rustic", "cargo"])
-            .kill_on_drop(true);
-        let located = locate.output().await?;
-        if !located.status.success() {
-            anyhow::bail!(
-                "The verified `rustic` toolchain is not installed. Install a pinned rustc_codegen_c release, or set RUST_WORKBENCH_RUSTIC_CARGO to its cargo executable. Conceptual C remains available."
-            );
-        }
-        let cargo = PathBuf::from(String::from_utf8_lossy(&located.stdout).trim());
-        (
-            cargo,
-            "rustc_codegen_c via rustup toolchain `rustic`".to_owned(),
-        )
-    };
-
-    let mut command = async_process::Command::new(&cargo);
+    let started = Instant::now();
+    let mut command = async_process::Command::new(&toolchain.cargo);
     command
-        .args([
-            "build",
-            "-Z",
-            "build-std",
-            "--manifest-path",
-            manifest_path.to_string_lossy().as_ref(),
-        ])
-        .env("RUSTUP_TOOLCHAIN", "rustic")
-        .env("RUSTC_BOOTSTRAP", "1")
+        .args(["build", "--manifest-path"])
+        .arg(&manifest_path);
+    if let Some(target) = target.as_ref() {
+        add_generated_c_target_argument(&mut command, target);
+    }
+    configure_rustic_command(&mut command, &toolchain)?;
+    command
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("CARGO_PROFILE_DEV_OPT_LEVEL", "0")
         .env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1")
         .env("CARGO_PROFILE_DEV_DEBUG", "1")
+        .env("CARGO_INCREMENTAL", "1")
         .kill_on_drop(true);
     let output = command.output().await?;
     if !output.status.success() {
@@ -1824,62 +2118,304 @@ async fn generate_c_artifact(
             "Generated C is blocked because the experimental backend could not build this target:\n{diagnostic}"
         );
     }
-    let c_path = newest_generated_c_file(&target_dir).ok_or_else(|| {
-        anyhow::anyhow!(
-            "The backend completed but produced no .c artifact under {}.",
-            target_dir.display()
-        )
-    })?;
-    let code = std::fs::read_to_string(&c_path)?;
-    let code = generated_c_preview(code, &c_path, 400_000);
+    let units = collect_generated_c_units(&target_dir, &target_names, focus_label.as_deref())?;
     Ok(GeneratedCArtifact {
-        code: code.into(),
-        path: c_path,
+        units,
+        target: target_description.into(),
         source_hash,
-        backend: backend.into(),
+        backend: toolchain.backend.into(),
+        duration: started.elapsed(),
     })
 }
 
-fn generated_c_preview(code: String, c_path: &std::path::Path, byte_limit: usize) -> String {
-    if code.len() <= byte_limit {
-        return code;
+async fn resolve_rustic_toolchain() -> anyhow::Result<RusticToolchain> {
+    if let Some(sysroot) = std::env::var_os("RUST_WORKBENCH_RUSTIC_SYSROOT").map(PathBuf::from) {
+        return rustic_toolchain_from_sysroot(
+            sysroot,
+            "bundled, checksum-verified rustc_codegen_c",
+        );
+    }
+    if let Some(cargo) = std::env::var_os("RUST_WORKBENCH_RUSTIC_CARGO").map(PathBuf::from) {
+        let sysroot = cargo
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("RUST_WORKBENCH_RUSTIC_CARGO has no toolchain root"))?;
+        return rustic_toolchain_from_sysroot(
+            sysroot.to_path_buf(),
+            "custom rustc_codegen_c toolchain",
+        );
     }
 
-    let preview_end = code
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= byte_limit)
-        .last()
-        .unwrap_or(0);
-    format!(
-        "{}\n\n/* Rust Workbench truncated this preview. Open the full artifact at {}. */",
-        &code[..preview_end],
-        c_path.display()
-    )
+    let cargo = rustup_rustic_which("cargo").await?;
+    let rustc = rustup_rustic_which("rustc").await?;
+    let sysroot = cargo
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("rustup returned an invalid rustic Cargo path"))?
+        .to_path_buf();
+    if !rustc.is_file() {
+        anyhow::bail!("rustup's rustic rustc is missing: {}", rustc.display());
+    }
+    Ok(RusticToolchain {
+        sysroot,
+        cargo,
+        rustc,
+        backend: "rustc_codegen_c via rustup toolchain `rustic`".to_owned(),
+    })
 }
 
-fn newest_generated_c_file(root: &std::path::Path) -> Option<PathBuf> {
-    let mut directories = vec![root.to_path_buf()];
-    let mut candidates = Vec::new();
-    while let Some(directory) = directories.pop() {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                directories.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "c") {
-                let modified = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .ok();
-                candidates.push((modified, path));
-            }
+fn rustic_toolchain_from_sysroot(
+    sysroot: PathBuf,
+    backend: &str,
+) -> anyhow::Result<RusticToolchain> {
+    let sysroot = std::fs::canonicalize(&sysroot).unwrap_or(sysroot);
+    let cargo = sysroot.join("bin/cargo");
+    let rustc = sysroot.join("bin/rustc");
+    for (name, path) in [("Cargo", &cargo), ("rustc", &rustc)] {
+        if !path.is_file() {
+            anyhow::bail!(
+                "The generated-C {name} executable is missing at {}. Run `./workbench bootstrap generated-c` and rebuild the bundle.",
+                path.display()
+            );
         }
     }
-    candidates.sort_by_key(|(modified, _)| *modified);
-    candidates.pop().map(|(_, path)| path)
+    Ok(RusticToolchain {
+        sysroot,
+        cargo,
+        rustc,
+        backend: backend.to_owned(),
+    })
+}
+
+async fn rustup_rustic_which(tool: &str) -> anyhow::Result<PathBuf> {
+    let mut locate = async_process::Command::new("rustup");
+    locate
+        .args(["which", "--toolchain", "rustic", tool])
+        .kill_on_drop(true);
+    let located = locate.output().await?;
+    if !located.status.success() {
+        anyhow::bail!(
+            "The bundled generated-C toolchain is unavailable and rustup toolchain `rustic` is not installed. Run `./workbench bootstrap generated-c`; Conceptual C remains available."
+        );
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&located.stdout).trim(),
+    ))
+}
+
+fn configure_rustic_command(
+    command: &mut async_process::Command,
+    toolchain: &RusticToolchain,
+) -> anyhow::Result<()> {
+    let mut search_path = vec![toolchain.sysroot.join("bin")];
+    if let Some(existing) = std::env::var_os("PATH") {
+        search_path.extend(std::env::split_paths(&existing));
+    }
+    command
+        .env("RUSTC", &toolchain.rustc)
+        .env("PATH", std::env::join_paths(search_path)?)
+        .env_remove("RUSTDOC")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC_BOOTSTRAP");
+    Ok(())
+}
+
+async fn generated_c_package_metadata(
+    toolchain: &RusticToolchain,
+    manifest_path: &Path,
+) -> anyhow::Result<GeneratedCCargoPackage> {
+    let mut command = async_process::Command::new(&toolchain.cargo);
+    command
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--manifest-path",
+        ])
+        .arg(manifest_path)
+        .kill_on_drop(true);
+    configure_rustic_command(&mut command, toolchain)?;
+    let output = command.output().await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Cargo metadata failed before C generation:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let metadata: GeneratedCCargoMetadata = serde_json::from_slice(&output.stdout)?;
+    let expected_manifest =
+        std::fs::canonicalize(manifest_path).unwrap_or_else(|_| manifest_path.to_path_buf());
+    metadata
+        .packages
+        .into_iter()
+        .find(|package| {
+            std::fs::canonicalize(&package.manifest_path)
+                .unwrap_or_else(|_| package.manifest_path.clone())
+                == expected_manifest
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("Cargo metadata did not contain {}", manifest_path.display())
+        })
+}
+
+fn select_generated_c_target(
+    package: &GeneratedCCargoPackage,
+    source_path: &Path,
+) -> Option<GeneratedCCargoTarget> {
+    if let Some(exact) = package
+        .targets
+        .iter()
+        .find(|target| target.src_path == source_path)
+    {
+        return Some(exact.clone());
+    }
+    if let Some((_, containing)) = package
+        .targets
+        .iter()
+        .filter_map(|target| {
+            let root = match target.src_path.file_name().and_then(|name| name.to_str()) {
+                Some("lib.rs" | "main.rs" | "mod.rs") => target.src_path.parent()?.to_path_buf(),
+                _ => target.src_path.with_extension(""),
+            };
+            source_path
+                .starts_with(&root)
+                .then(|| (root.components().count(), target))
+        })
+        .max_by_key(|(depth, _)| *depth)
+    {
+        return Some(containing.clone());
+    }
+    if let Some(library) = package.targets.iter().find(|target| {
+        target
+            .kind
+            .iter()
+            .any(|kind| kind == "lib" || kind == "rlib")
+            && target
+                .src_path
+                .parent()
+                .is_some_and(|root| source_path.starts_with(root))
+    }) {
+        return Some(library.clone());
+    }
+    (package.targets.len() == 1).then(|| package.targets[0].clone())
+}
+
+fn add_generated_c_target_argument(
+    command: &mut async_process::Command,
+    target: &GeneratedCCargoTarget,
+) {
+    let kind = target.kind.first().map(String::as_str).unwrap_or("bin");
+    match kind {
+        "lib" | "rlib" | "cdylib" | "dylib" | "staticlib" | "proc-macro" => {
+            command.arg("--lib");
+        }
+        "example" => {
+            command.args(["--example", target.name.as_str()]);
+        }
+        "test" => {
+            command.args(["--test", target.name.as_str()]);
+        }
+        "bench" => {
+            command.args(["--bench", target.name.as_str()]);
+        }
+        _ => {
+            command.args(["--bin", target.name.as_str()]);
+        }
+    }
+}
+
+fn collect_generated_c_units(
+    target_dir: &Path,
+    target_names: &[String],
+    focus_label: Option<&str>,
+) -> anyhow::Result<Vec<GeneratedCTranslationUnit>> {
+    let deps = target_dir.join("debug/deps");
+    let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for entry in std::fs::read_dir(&deps)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "cannot read generated C directory {}: {error}",
+                deps.display()
+            )
+        })?
+        .flatten()
+    {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let belongs_to_target = target_names.iter().any(|target| {
+            let normalized = target.replace('-', "_");
+            name.starts_with(&format!("{normalized}-"))
+        });
+        if !belongs_to_target || !name.ends_with(".rcgu.c") || name == "native_stubs.c" {
+            continue;
+        }
+        let group = name.split('.').next().unwrap_or(name).to_owned();
+        groups.entry(group).or_default().push(path);
+    }
+
+    let Some((_, paths)) = groups.into_iter().max_by_key(|(_, paths)| {
+        paths
+            .iter()
+            .filter_map(|path| {
+                path.metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            })
+            .max()
+    }) else {
+        anyhow::bail!(
+            "The backend completed but produced no project-target C translation units under {}.",
+            deps.display()
+        );
+    };
+
+    let mut units = paths
+        .into_iter()
+        .map(|path| {
+            let code = read_generated_c_preview(&path, 400_000)?;
+            let label = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("translation-unit.c")
+                .to_owned();
+            Ok(GeneratedCTranslationUnit {
+                code: code.into(),
+                path,
+                label: label.into(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    units.sort_by(|left, right| {
+        let left_has_focus = focus_label.is_some_and(|focus| left.code.contains(focus));
+        let right_has_focus = focus_label.is_some_and(|focus| right.code.contains(focus));
+        right_has_focus
+            .cmp(&left_has_focus)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    Ok(units)
+}
+
+fn read_generated_c_preview(path: &Path, byte_limit: usize) -> anyhow::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut bytes = Vec::with_capacity(byte_limit.min(file_len as usize));
+    file.take(byte_limit as u64).read_to_end(&mut bytes)?;
+    let valid_len = std::str::from_utf8(&bytes)
+        .map(|_| bytes.len())
+        .unwrap_or_else(|error| error.valid_up_to());
+    bytes.truncate(valid_len);
+    let code = String::from_utf8(bytes).expect("validated generated C preview");
+    if file_len <= byte_limit as u64 {
+        Ok(code)
+    } else {
+        Ok(format!(
+            "{code}\n\n/* Rust Workbench truncated this preview. Open the full artifact at {}. */",
+            path.display()
+        ))
+    }
 }
 
 fn ownership_problems_match_source(problems: &OwnershipProblems, source: &str) -> bool {
@@ -2060,7 +2596,7 @@ fn ownership_source_hash(source: &str) -> String {
 }
 
 fn repair_is_compiler_validated(repair: &rust_analyzer_ext::OwnershipRepair) -> bool {
-    repair.compiler_validated || repair.validation_state == "validated"
+    repair.preview_complete && (repair.compiler_validated || repair.validation_state == "validated")
 }
 
 fn ownership_status(model: &OwnershipModel) -> String {
@@ -2178,6 +2714,7 @@ impl Render for RustWorkbenchPanel {
         let c_view_mode = self.c_view_mode;
         let c_generation_state = self.c_generation_state.clone();
         let generated_c = self.generated_c.clone();
+        let generated_c_unit_index = self.generated_c_unit_index;
         let exact_mode = self.exact_mode;
         let visual_step = self.visual_step;
         let topology_scene = self.topology_scene.clone();
@@ -2185,10 +2722,12 @@ impl Render for RustWorkbenchPanel {
         let selected_topology_element = self.selected_topology_element.clone();
         let preview_repair_id = self.preview_repair_id.clone();
         let show_repair_alternatives = self.show_repair_alternatives;
+        let workspace_guide = self.workspace_guide.clone();
+        let selected_intent_choice_id = self.selected_intent_choice_id.clone();
         let problem = self.selected_problem().cloned();
         let problem_count = self.problems.problems.len();
         let issue_list = self.problems.problems.clone();
-        let selected_problem_index = self.selected_problem_index().unwrap_or(0);
+        let selected_problem_index = self.selected_problem_index();
         let selected_problem_label = problem.as_ref().map(|problem| {
             let target = resolved_problem_target(problem, &self.model);
             if let Some(code) = problem.diagnostic_code.as_deref() {
@@ -2202,6 +2741,7 @@ impl Render for RustWorkbenchPanel {
         let display_preferences = self.display_preferences.clone();
         let show_display_controls = self.show_display_controls;
         let show_issue_list = self.show_issue_list;
+        let show_workspace_roots = self.show_workspace_roots;
         let panel_rem_size = window.rem_size() * (f32::from(font_scale_percent) / 100.0);
         let problem_status = self.problem_status.clone();
         let status_message = self.status_message.clone();
@@ -2292,6 +2832,11 @@ impl Render for RustWorkbenchPanel {
                                             panel.pending_model_key = None;
                                             panel.last_problem_key = None;
                                             panel.pending_problem_key = None;
+                                            panel.last_workspace_guide_key = None;
+                                            panel.pending_workspace_guide_key = None;
+                                            panel.workspace_guide =
+                                                OwnershipWorkspaceGuide::default();
+                                            panel.selected_intent_choice_id = None;
                                             panel.schedule_problem_scan(cx);
                                         })),
                                 ),
@@ -2322,9 +2867,9 @@ impl Render for RustWorkbenchPanel {
                                 v_flex()
                                     .items_center()
                                     .child(
-                                        Label::new(format!(
-                                            "Issue {} of {problem_count}",
-                                            selected_problem_index + 1
+                                        Label::new(selected_problem_index.map_or_else(
+                                            || format!("{problem_count} issues in file · explaining current call"),
+                                            |index| format!("Issue {} of {problem_count}", index + 1),
                                         ))
                                         .size(LabelSize::Small),
                                     )
@@ -2384,7 +2929,7 @@ impl Render for RustWorkbenchPanel {
                                 Label::new("Compiler issues in this file").size(LabelSize::Small),
                             )
                             .children(issue_list.into_iter().enumerate().map(|(index, issue)| {
-                                let selected = index == selected_problem_index;
+                                let selected = Some(index) == selected_problem_index;
                                 let code = issue
                                     .diagnostic_code
                                     .as_deref()
@@ -2426,6 +2971,16 @@ impl Render for RustWorkbenchPanel {
                         .child(
                             v_flex()
                                 .gap_2()
+                                .child(render_workspace_impact_tree(
+                                    &workspace_guide,
+                                    show_workspace_roots,
+                                    cx,
+                                ))
+                                .child(render_workspace_intent_question(
+                                    &workspace_guide,
+                                    selected_intent_choice_id.as_deref(),
+                                    cx,
+                                ))
                                 .child(render_beginner_flow(
                                     problem.as_ref(),
                                     &self.problems,
@@ -2436,6 +2991,7 @@ impl Render for RustWorkbenchPanel {
                                     repair_verification.as_ref(),
                                     preview_repair_id.as_deref(),
                                     show_repair_alternatives,
+                                    selected_intent_choice_id.as_deref(),
                                     exact_mode,
                                     cx,
                                 ))
@@ -2450,6 +3006,7 @@ impl Render for RustWorkbenchPanel {
                                     c_view_mode,
                                     c_generation_state,
                                     generated_c,
+                                    generated_c_unit_index,
                                     cx,
                                 ))
                                 .into_any_element(),
@@ -2585,6 +3142,237 @@ fn visual_event_title(kind: &str) -> &'static str {
     }
 }
 
+fn workspace_site_caption(site: &OwnershipWorkspaceSite) -> String {
+    let path = site
+        .location
+        .uri
+        .to_file_path()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| site.location.uri.as_str().to_owned());
+    format!(
+        "{} · {path}:{}",
+        site.label,
+        site.location.range.start.line + 1
+    )
+}
+
+fn render_workspace_site(
+    id: SharedString,
+    marker: &'static str,
+    site: &OwnershipWorkspaceSite,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    let site_for_click = site.clone();
+    v_flex()
+        .gap_0p5()
+        .child(
+            Button::new(id, format!("{marker} {}", workspace_site_caption(site))).on_click(
+                cx.listener(move |panel, _, window, cx| {
+                    panel.open_workspace_site(site_for_click.clone(), window, cx);
+                }),
+            ),
+        )
+        .child(
+            Label::new(format!("    {}", site.relationship))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
+fn render_workspace_impact_tree(
+    guide: &OwnershipWorkspaceGuide,
+    show_workspace_roots: bool,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    let cluster = selected_workspace_cluster(guide);
+    let Some(cluster) = cluster else {
+        return div().into_any_element();
+    };
+    let impact_count = cluster.impacts.len();
+    let caller_count = cluster.related_constraints.len();
+    let mut card = v_flex()
+        .p_3()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().status().error)
+        .child(
+            h_flex()
+                .justify_between()
+                .gap_2()
+                .child(Label::new("Workspace cause and impact").size(LabelSize::Small))
+                .child(
+                    Label::new(format!(
+                        "{} file{}",
+                        cluster.affected_files,
+                        if cluster.affected_files == 1 { "" } else { "s" }
+                    ))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                ),
+        )
+        .child(Label::new(cluster.title.clone()).size(LabelSize::Large))
+        .child(
+            Label::new(cluster.summary.clone())
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .child(
+            Label::new(
+                "Read downward: the root creates the constraint; arrows are places affected by it.",
+            )
+            .size(LabelSize::XSmall)
+            .color(Color::Muted),
+        )
+        .child(render_workspace_site(
+            SharedString::from(format!("workspace-root-{}", cluster.id)),
+            "ROOT ●",
+            &cluster.root,
+            cx,
+        ));
+
+    if impact_count > 0 {
+        card = card
+            .child(
+                Label::new(format!("Affected compiler sites ({impact_count})"))
+                    .size(LabelSize::XSmall),
+            )
+            .children(
+                cluster
+                    .impacts
+                    .iter()
+                    .take(6)
+                    .enumerate()
+                    .map(|(index, site)| {
+                        render_workspace_site(
+                            SharedString::from(format!("workspace-impact-{}-{index}", cluster.id)),
+                            if site.selected { "↳ SELECTED" } else { "↳" },
+                            site,
+                            cx,
+                        )
+                    }),
+            );
+    }
+    if caller_count > 0 {
+        card = card
+            .child(
+                Label::new(format!(
+                    "Callers constrained by a signature change ({caller_count})"
+                ))
+                .size(LabelSize::XSmall),
+            )
+            .children(cluster.related_constraints.iter().take(4).enumerate().map(
+                |(index, site)| {
+                    render_workspace_site(
+                        SharedString::from(format!("workspace-constraint-{}-{index}", cluster.id)),
+                        "⇢ CALLER",
+                        site,
+                        cx,
+                    )
+                },
+            ));
+    }
+    let other_root_count = guide.clusters.len().saturating_sub(1);
+    if other_root_count > 0 {
+        card = card.child(
+            Button::new(
+                "toggle-workspace-ownership-roots",
+                if show_workspace_roots {
+                    "Hide other workspace roots".to_owned()
+                } else {
+                    format!("Other workspace roots ({other_root_count})")
+                },
+            )
+            .aria_expanded(show_workspace_roots)
+            .on_click(cx.listener(|panel, _, _window, cx| {
+                panel.show_workspace_roots = !panel.show_workspace_roots;
+                cx.notify();
+            })),
+        );
+    }
+    if show_workspace_roots {
+        card = card.children(
+            guide
+                .clusters
+                .iter()
+                .filter(|candidate| candidate.id != cluster.id)
+                .take(8)
+                .enumerate()
+                .map(|(index, candidate)| {
+                    render_workspace_site(
+                        SharedString::from(format!("workspace-other-root-{index}")),
+                        "○ ROOT",
+                        &candidate.root,
+                        cx,
+                    )
+                }),
+        );
+    }
+    card.when(cluster.truncated || guide.truncated, |this| {
+        this.child(
+            Label::new("More related sites exist; the view is bounded to keep editing responsive.")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+    })
+    .child(
+        Label::new(format!("Evidence: {}", cluster.precision))
+            .size(LabelSize::XSmall)
+            .color(Color::Muted),
+    )
+    .into_any_element()
+}
+
+fn render_workspace_intent_question(
+    guide: &OwnershipWorkspaceGuide,
+    selected_choice_id: Option<&str>,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    let Some(question) = guide.intent_question.as_ref() else {
+        return div().into_any_element();
+    };
+    let selected_consequence = selected_choice_id.and_then(|selected| {
+        question
+            .choices
+            .iter()
+            .find(|choice| choice.id == selected)
+            .map(|choice| choice.consequence.clone())
+    });
+    v_flex()
+        .p_3()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().status().info)
+        .child(Label::new("Choose the intended behavior").size(LabelSize::Small))
+        .child(Label::new(question.prompt.clone()).size(LabelSize::Small))
+        .children(question.choices.iter().map(|choice| {
+            let choice_id = choice.id.clone();
+            let selected = selected_choice_id == Some(choice.id.as_str());
+            Button::new(
+                SharedString::from(format!("workspace-intent-{}-{choice_id}", question.id)),
+                format!("{} {}", if selected { "●" } else { "○" }, choice.label),
+            )
+            .on_click(cx.listener(move |panel, _, _window, cx| {
+                panel.selected_intent_choice_id = Some(choice_id.clone());
+                cx.notify();
+            }))
+        }))
+        .when_some(selected_consequence, |this, consequence| {
+            this.child(
+                Label::new(format!("What this choice implies: {consequence}"))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+        })
+        .into_any_element()
+}
+
 fn render_beginner_flow(
     problem: Option<&OwnershipProblem>,
     problems: &OwnershipProblems,
@@ -2595,9 +3383,15 @@ fn render_beginner_flow(
     verification: Option<&RepairVerification>,
     preview_repair_id: Option<&str>,
     show_repair_alternatives: bool,
+    selected_intent_choice_id: Option<&str>,
     exact_mode: bool,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
+    if problem.is_none()
+        && let Some(operation) = model.operations.first()
+    {
+        return render_method_coach_flow(operation, cx);
+    }
     v_flex()
         .gap_2()
         .child(render_visual_problem_header(problem, model, cx))
@@ -2617,9 +3411,199 @@ fn render_beginner_flow(
             verification,
             preview_repair_id,
             show_repair_alternatives,
+            selected_intent_choice_id,
             exact_mode,
             cx,
         ))
+        .into_any_element()
+}
+
+fn render_method_coach_flow(
+    operation: &rust_analyzer_ext::OwnershipOperationInsight,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    let receiver = operation.receiver_flow.as_ref();
+    let returned = operation.return_flow.as_ref();
+    let range = operation.range;
+    v_flex()
+        .gap_2()
+        .child(
+            v_flex()
+                .p_3()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().status().info)
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            Label::new(format!("What {}() does", operation.name))
+                                .size(LabelSize::Large),
+                        )
+                        .child(
+                            Button::new(
+                                "show-method-coach-source",
+                                format!("line {}", range.start.line + 1),
+                            )
+                            .on_click(
+                                cx.listener(move |panel, _, _window, cx| {
+                                    panel.cue_range(range, cx)
+                                }),
+                            ),
+                        ),
+                )
+                .child(
+                    Label::new(operation.signature.clone())
+                        .size(LabelSize::Small)
+                        .buffer_font(cx),
+                )
+                .when(!operation.summary.is_empty(), |this| {
+                    this.child(Label::new(operation.summary.clone()).size(LabelSize::Small))
+                })
+                .child(Label::new("Follow the values through the call").size(LabelSize::Small))
+                .when_some(receiver, |this, receiver| {
+                    this.child(render_call_flow_row(
+                        "RECEIVER",
+                        &receiver.expression,
+                        &receiver.transfer,
+                        &receiver.after,
+                        cx,
+                    ))
+                })
+                .children(operation.argument_flows.iter().take(6).map(|argument| {
+                    render_call_flow_row(
+                        &format!(
+                            "ARGUMENT {} → {}",
+                            argument.index + 1,
+                            argument.parameter_type
+                        ),
+                        &argument.expression,
+                        &argument.transfer,
+                        &argument.after,
+                        cx,
+                    )
+                }))
+                .when_some(returned, |this, returned| {
+                    let source = returned
+                        .borrowed_from
+                        .as_deref()
+                        .map(|source| format!("borrowed from `{source}`"))
+                        .unwrap_or_else(|| "new result path".to_owned());
+                    this.child(
+                        v_flex()
+                            .p_2()
+                            .gap_1()
+                            .rounded_md()
+                            .bg(cx.theme().status().success_background.opacity(0.12))
+                            .child(
+                                Label::new("RETURN")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(format!(
+                                    "{}()  ──returns──▶  `{}`",
+                                    operation.name, returned.type_name
+                                ))
+                                .size(LabelSize::Small)
+                                .buffer_font(cx),
+                            )
+                            .child(
+                                Label::new(format!(
+                                    "{} · {source}. {}",
+                                    returned.kind.replace('_', " "),
+                                    returned.after
+                                ))
+                                .size(LabelSize::XSmall),
+                            ),
+                    )
+                })
+                .child(
+                    Label::new(format!(
+                        "Why this access is required: {}",
+                        operation.why_required
+                    ))
+                    .size(LabelSize::Small),
+                )
+                .child(provenance_badge(&operation.provenance)),
+        )
+        .when(!operation.effect_facts.is_empty(), |this| {
+            this.child(
+                v_flex()
+                    .p_3()
+                    .gap_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(Label::new("Effects you should expect").size(LabelSize::Large))
+                    .children(operation.effect_facts.iter().take(4).map(|effect| {
+                        Label::new(format!(
+                            "• {} — {}",
+                            effect.kind.replace('_', " "),
+                            effect.summary
+                        ))
+                        .size(LabelSize::Small)
+                    })),
+            )
+        })
+        .when(!operation.alternatives.is_empty(), |this| {
+            this.child(
+                v_flex()
+                    .p_3()
+                    .gap_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Label::new("Related APIs when your intent differs").size(LabelSize::Large),
+                    )
+                    .children(operation.alternatives.iter().take(4).map(|alternative| {
+                        v_flex()
+                            .gap_0p5()
+                            .child(
+                                Label::new(alternative.signature.clone())
+                                    .size(LabelSize::Small)
+                                    .buffer_font(cx),
+                            )
+                            .child(
+                                Label::new(alternative.behavior.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                    })),
+            )
+        })
+        .into_any_element()
+}
+
+fn render_call_flow_row(
+    role: &str,
+    expression: &str,
+    transfer: &str,
+    after: &str,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    v_flex()
+        .p_2()
+        .gap_1()
+        .rounded_md()
+        .bg(cx.theme().status().info_background.opacity(0.10))
+        .child(
+            Label::new(role.to_owned())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(
+            Label::new(format!(
+                "`{expression}`  ──{}──▶  call",
+                transfer.replace('_', " ")
+            ))
+            .size(LabelSize::Small)
+            .buffer_font(cx),
+        )
+        .child(Label::new(format!("After: {after}")).size(LabelSize::XSmall))
         .into_any_element()
 }
 
@@ -2651,6 +3635,7 @@ fn render_guided_fix_step(
     verification: Option<&RepairVerification>,
     preview_repair_id: Option<&str>,
     show_repair_alternatives: bool,
+    selected_intent_choice_id: Option<&str>,
     exact_mode: bool,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
@@ -2661,6 +3646,7 @@ fn render_guided_fix_step(
             model,
             preview_repair_id,
             show_repair_alternatives,
+            selected_intent_choice_id,
             exact_mode,
             cx,
         ))
@@ -5183,6 +6169,7 @@ fn render_detail_drawers(
     c_view_mode: CViewMode,
     c_generation_state: CGenerationState,
     generated_c: Option<GeneratedCArtifact>,
+    generated_c_unit_index: usize,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     let content = active.map(|drawer| match drawer {
@@ -5211,6 +6198,7 @@ fn render_detail_drawers(
             c_view_mode,
             c_generation_state,
             generated_c,
+            generated_c_unit_index,
             cx,
         ),
         DetailDrawer::Evidence => v_flex()
@@ -5340,7 +6328,7 @@ fn render_operation_insights(
     }
     v_flex()
         .gap_2()
-        .child(Label::new("Operations involved in this error").size(LabelSize::Large))
+        .child(Label::new("Operations in this explanation").size(LabelSize::Large))
         .child(
             Label::new("These cards come from resolved Rust signatures. Workspace-local bodies are followed through a bounded call graph; opaque library bodies are described from their public contract, documentation, and a conservative standard-library catalog.")
                 .size(LabelSize::XSmall)
@@ -5576,6 +6564,11 @@ fn render_display_controls(
         ("storage", "Stack / heap", preferences.show_storage),
         ("access", "Deref + access", preferences.show_access),
         ("wrappers", "Wrapper gates", preferences.show_wrappers),
+        (
+            "method_coach",
+            "Method coach",
+            preferences.show_method_coach,
+        ),
     ];
     v_flex()
         .px_3()
@@ -6493,30 +7486,70 @@ fn intent_recommendation(answers: IntentAnswers) -> &'static str {
     }
 }
 
+fn intent_repair_rank(choice: Option<&str>, strategy: &str, title: &str) -> u8 {
+    let text = format!("{strategy} {title}").to_ascii_lowercase();
+    let matches_any = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+    match choice {
+        Some("unique" | "end_first" | "borrow" | "transfer") => {
+            if strategy == "language_fix" {
+                0
+            } else {
+                2
+            }
+        }
+        Some("shared_local" | "shared_runtime") => {
+            if matches_any(&["ref_cell", "refcell", "rc_ref", "rc<refcell"]) {
+                0
+            } else if strategy == "language_fix" {
+                1
+            } else {
+                2
+            }
+        }
+        Some("shared_threads") => {
+            if matches_any(&["arc_mutex", "arc_rw", "arc<mutex", "arc<rwlock"]) {
+                0
+            } else if strategy == "language_fix" {
+                1
+            } else {
+                2
+            }
+        }
+        Some("duplicate_or_share" | "snapshot") => {
+            if matches_any(&["clone", "rc", "arc"]) {
+                0
+            } else {
+                1
+            }
+        }
+        _ => {
+            if strategy == "language_fix" {
+                0
+            } else {
+                1
+            }
+        }
+    }
+}
+
 fn render_guided_repairs(
     problem: Option<&OwnershipProblem>,
     model: &OwnershipModel,
     preview_repair_id: Option<&str>,
     show_alternatives: bool,
+    selected_intent_choice_id: Option<&str>,
     exact_mode: bool,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     let ideas = problem
         .map(|problem| learning_catalog::repair_ideas(&problem.category))
         .unwrap_or_default();
-    let preferred_repairs = model
-        .repairs
-        .iter()
-        .filter(|repair| repair.strategy == "language_fix")
-        .take(1)
-        .cloned()
-        .collect::<Vec<_>>();
-    let alternative_repairs = model
-        .repairs
-        .iter()
-        .filter(|repair| repair.strategy != "language_fix")
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut ranked_repairs = model.repairs.clone();
+    ranked_repairs.sort_by_key(|repair| {
+        intent_repair_rank(selected_intent_choice_id, &repair.strategy, &repair.title)
+    });
+    let preferred_repairs = ranked_repairs.iter().take(1).cloned().collect::<Vec<_>>();
+    let alternative_repairs = ranked_repairs.iter().skip(1).cloned().collect::<Vec<_>>();
     let preferred = preferred_repairs
         .is_empty()
         .then(|| problem.and_then(|problem| preferred_mutability_repair(problem, model)))
@@ -6531,7 +7564,9 @@ fn render_guided_repairs(
         .border_color(cx.theme().colors().border_variant)
         .child(Label::new("4 · Fix and result").size(LabelSize::Small))
         .child(
-            Label::new(if has_preferred {
+            Label::new(if selected_intent_choice_id.is_some() && !preferred_repairs.is_empty() {
+                "The first repair is ranked for the behavior you selected above. Check its edit scope and runtime trade-offs before applying it."
+            } else if has_preferred {
                 "Start with ordinary compile-time mutability. Shared-ownership wrappers are design alternatives, not automatic upgrades."
             } else if model.repairs.is_empty() {
                 "Start with the most direct design change. Automatic editing stays unavailable until the complete rewrite is compiler-validated."
@@ -7190,6 +8225,16 @@ fn render_repairs(
             let source_hash = source_hash.clone();
             let is_previewed = preview_repair_id == Some(repair.id.as_str());
             let preview_id = repair.id.clone();
+            let affected_files = if repair.affected_files.is_empty() {
+                "unknown file scope".to_owned()
+            } else {
+                format!(
+                    "{} file{} · {}",
+                    repair.affected_files.len(),
+                    if repair.affected_files.len() == 1 { "" } else { "s" },
+                    repair.affected_files.join(", ")
+                )
+            };
             v_flex()
                 .p_3()
                 .gap_2()
@@ -7211,6 +8256,18 @@ fn render_repairs(
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
+                .child(
+                    Label::new(format!("Edit scope: {affected_files}"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .when(!repair.preview_complete, |this| {
+                    this.child(
+                        Label::new("The complete workspace diff could not be loaded, so Apply is locked.")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                })
                 .child(
                     h_flex()
                         .gap_1()
@@ -7425,6 +8482,7 @@ fn render_c_view(
     mode: CViewMode,
     state: CGenerationState,
     artifact: Option<GeneratedCArtifact>,
+    generated_c_unit_index: usize,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     v_flex()
@@ -7456,7 +8514,7 @@ fn render_c_view(
         .child(if mode == CViewMode::Conceptual {
             render_conceptual_c_sketch(model, exact_mode, cx)
         } else {
-            render_generated_c(state, artifact, cx)
+            render_generated_c(state, artifact, generated_c_unit_index, cx)
         })
         .into_any_element()
 }
@@ -7464,6 +8522,7 @@ fn render_c_view(
 fn render_generated_c(
     state: CGenerationState,
     artifact: Option<GeneratedCArtifact>,
+    generated_c_unit_index: usize,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     let (status, color) = match &state {
@@ -7487,7 +8546,7 @@ fn render_generated_c(
         .child(Label::new("Actual generated C (experimental)").size(LabelSize::Large))
         .child(Label::new(status).size(LabelSize::Small).color(color))
         .child(
-            Label::new("This is low-level rustc_codegen_c output, not idiomatic C and not an ABI-equivalent teaching translation. Invalid Rust cannot be translated; use Conceptual for intent.")
+            Label::new("This is low-level rustc_codegen_c output for the selected Cargo target. Prebuilt std and dependency implementations are not expanded here. It is not idiomatic C or an ABI-equivalent teaching translation; use Conceptual for intent.")
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         )
@@ -7521,17 +8580,69 @@ fn render_generated_c(
                 }),
         )
         .when_some(artifact, |this, artifact| {
+            let unit_count = artifact.units.len();
+            let selected_index = generated_c_unit_index.min(unit_count.saturating_sub(1));
+            let selected_unit = artifact.units.get(selected_index).cloned();
             this.child(
                 Label::new(format!(
-                    "Backend: {}\nSource hash: {}\nArtifact: {}",
+                    "Backend: {}\nCargo target: {}\nTranslation units: {}\nGeneration: {:.2?}\nSource hash: {}",
                     artifact.backend,
+                    artifact.target,
+                    unit_count,
+                    artifact.duration,
                     artifact.source_hash,
-                    artifact.path.display()
                 ))
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
             )
-            .child(Label::new(artifact.code).size(LabelSize::XSmall).buffer_font(cx))
+            .when(unit_count > 1, |this| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("generated-c-unit-previous", "Previous C file").on_click(
+                                cx.listener(|panel, _, _window, cx| {
+                                    let count = panel
+                                        .generated_c
+                                        .as_ref()
+                                        .map_or(0, |artifact| artifact.units.len());
+                                    if count > 0 {
+                                        panel.generated_c_unit_index =
+                                            (panel.generated_c_unit_index + count - 1) % count;
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
+                        )
+                        .child(
+                            Label::new(format!("C file {} of {}", selected_index + 1, unit_count))
+                                .size(LabelSize::XSmall),
+                        )
+                        .child(
+                            Button::new("generated-c-unit-next", "Next C file").on_click(
+                                cx.listener(|panel, _, _window, cx| {
+                                    let count = panel
+                                        .generated_c
+                                        .as_ref()
+                                        .map_or(0, |artifact| artifact.units.len());
+                                    if count > 0 {
+                                        panel.generated_c_unit_index =
+                                            (panel.generated_c_unit_index + 1) % count;
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
+                        ),
+                )
+            })
+            .when_some(selected_unit, |this, unit| {
+                this.child(
+                    Label::new(format!("Selected generated file: {}", unit.path.display()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(unit.code).size(LabelSize::XSmall).buffer_font(cx))
+            })
         })
         .into_any_element()
 }
@@ -7873,6 +8984,156 @@ mod tests {
     }
 
     #[test]
+    fn workspace_guide_uses_the_server_selected_root_instead_of_the_first_cluster() {
+        let guide: OwnershipWorkspaceGuide = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1,
+            "status": "ready",
+            "revision": "revision-1",
+            "selectedClusterId": "root-b",
+            "clusters": [
+                {
+                    "id": "root-a",
+                    "rootProblemId": "problem-a",
+                    "title": "unrelated",
+                    "summary": "another error",
+                    "category": "moved_value",
+                    "diagnosticCode": "E0382",
+                    "root": {
+                        "problemId": "problem-a",
+                        "role": "root",
+                        "location": {
+                            "uri": "file:///workspace/src/a.rs",
+                            "range": {"start":{"line":1,"character":0},"end":{"line":1,"character":1}}
+                        },
+                        "label": "a",
+                        "relationship": "root",
+                        "precision": "compiler_diagnostic",
+                        "selected": false
+                    },
+                    "impacts": [],
+                    "relatedConstraints": [],
+                    "affectedFiles": 1,
+                    "precision": "compiler_diagnostic",
+                    "truncated": false
+                },
+                {
+                    "id": "root-b",
+                    "rootProblemId": "self-events-push",
+                    "title": "selected",
+                    "summary": "self.events needs mutable access",
+                    "category": "immutable_receiver",
+                    "diagnosticCode": "E0596",
+                    "root": {
+                        "problemId": "self-events-push",
+                        "role": "root",
+                        "location": {
+                            "uri": "file:///workspace/src/analytics.rs",
+                            "range": {"start":{"line":9,"character":8},"end":{"line":9,"character":24}}
+                        },
+                        "label": "self.events.push",
+                        "relationship": "push needs &mut Vec<T>, but this method only has &self",
+                        "precision": "compiler_exact",
+                        "selected": true
+                    },
+                    "impacts": [],
+                    "relatedConstraints": [],
+                    "affectedFiles": 1,
+                    "precision": "compiler_exact",
+                    "truncated": false
+                }
+            ],
+            "journey": [],
+            "intentQuestion": null,
+            "truncated": false
+        }))
+        .unwrap();
+
+        let selected = selected_workspace_cluster(&guide).unwrap();
+        assert_eq!(selected.root_problem_id, "self-events-push");
+        assert_eq!(selected.root.label, "self.events.push");
+        assert_eq!(selected.root.location.range.start.line, 9);
+    }
+
+    #[test]
+    fn workspace_intent_ranks_repairs_without_hiding_alternatives() {
+        assert!(
+            intent_repair_rank(Some("unique"), "language_fix", "Change &self to &mut self")
+                < intent_repair_rank(Some("unique"), "rc_ref_cell", "Use Rc<RefCell<_>>")
+        );
+        assert!(
+            intent_repair_rank(Some("shared_local"), "rc_ref_cell", "Use Rc<RefCell<_>>")
+                < intent_repair_rank(
+                    Some("shared_local"),
+                    "language_fix",
+                    "Change &self to &mut self"
+                )
+        );
+        assert!(
+            intent_repair_rank(Some("shared_threads"), "arc_mutex", "Use Arc<Mutex<_>>")
+                < intent_repair_rank(Some("shared_threads"), "rc", "Use Rc<_>")
+        );
+    }
+
+    #[test]
+    fn operation_focus_never_selects_an_unrelated_first_diagnostic() {
+        assert_eq!(default_problem_index(5, true), None);
+        assert_eq!(default_problem_index(5, false), Some(0));
+        assert_eq!(default_problem_index(0, false), None);
+    }
+
+    #[test]
+    fn schema_thirteen_operation_flows_round_trip_into_the_editor() {
+        let operation: rust_analyzer_ext::OwnershipOperationInsight =
+            serde_json::from_value(serde_json::json!({
+                "id": "push-1",
+                "range": {"start":{"line":7,"character":4},"end":{"line":7,"character":21}},
+                "name": "push",
+                "signature": "fn push(&mut self, value: String)",
+                "receiverType": "Vec<String>",
+                "requiredAccess": "mutable_borrow",
+                "availableAccess": "exclusive path available",
+                "whyRequired": "push changes the vector",
+                "documentation": null,
+                "effects": [],
+                "effectFacts": [],
+                "callChain": ["push"],
+                "alternatives": [],
+                "provenance": "signature_docs_and_trusted_catalog",
+                "truncated": false,
+                "summary": "push borrows the vector and moves the event",
+                "ownershipRelevant": true,
+                "receiverFlow": {
+                    "expression": "events",
+                    "range": {"start":{"line":7,"character":4},"end":{"line":7,"character":10}},
+                    "transfer": "mutable_borrow",
+                    "after": "usable again",
+                    "provenance": "resolved_self_parameter"
+                },
+                "argumentFlows": [{
+                    "index": 0,
+                    "expression": "event",
+                    "range": {"start":{"line":7,"character":16},"end":{"line":7,"character":21}},
+                    "parameterType": "String",
+                    "transfer": "move",
+                    "after": "original unavailable",
+                    "provenance": "resolved_parameter_type"
+                }],
+                "returnFlow": {
+                    "typeName": "()",
+                    "kind": "unit",
+                    "borrowedFrom": null,
+                    "after": "no returned value",
+                    "provenance": "resolved_return_type"
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(operation.receiver_flow.unwrap().expression, "events");
+        assert_eq!(operation.argument_flows[0].transfer, "move");
+        assert_eq!(operation.return_flow.unwrap().kind, "unit");
+    }
+
+    #[test]
     fn ownership_model_rejects_a_late_stale_response() {
         let source = "fn main() {}\n";
         let model = OwnershipModel {
@@ -7923,6 +9184,11 @@ mod tests {
             alternatives: Vec::new(),
             provenance: "resolved_signature".to_owned(),
             truncated: false,
+            summary: String::new(),
+            ownership_relevant: true,
+            receiver_flow: None,
+            argument_flows: Vec::new(),
+            return_flow: None,
         };
         let model = OwnershipModel {
             operations: vec![
@@ -8207,6 +9473,8 @@ mod tests {
             strategy: "rc".to_owned(),
             semantics: "shared ownership".to_owned(),
             diff: "- Box<T>\n+ Rc<T>".to_owned(),
+            affected_files: vec!["main.rs".to_owned()],
+            preview_complete: true,
             compiler_validated: false,
             validation_state: "candidate".to_owned(),
             effects: rust_analyzer_ext::OwnershipRepairEffects::default(),
@@ -8231,7 +9499,10 @@ mod tests {
                 "compilerValidated": true
             }))
             .unwrap();
-        assert!(repair_is_compiler_validated(&legacy));
+        assert!(
+            !repair_is_compiler_validated(&legacy),
+            "an older response without a complete-preview marker must fail closed"
+        );
     }
 
     #[test]
@@ -8332,6 +9603,7 @@ mod tests {
         assert_eq!(focus.inline_diagnostics, RustInlineDiagnosticMode::Selected);
         assert!(!focus.show_type_hints);
         assert!(focus.show_moves && focus.show_borrows && focus.show_invalid_uses);
+        assert!(focus.show_method_coach);
         assert!(!focus.show_last_uses && !focus.show_drops);
 
         let learn = RustOwnershipDisplayPreferences::learn();
@@ -8361,6 +9633,7 @@ mod tests {
         assert!(restored.show_ownership_coloring);
         assert_eq!(restored.mechanics_mode, RustMechanicsHintMode::SelectedPath);
         assert!(restored.show_layout && restored.show_storage);
+        assert!(restored.show_method_coach);
         assert!(!restored.enabled);
         assert!(restored.focus_rows.is_empty());
 
@@ -8372,6 +9645,7 @@ mod tests {
             "show_storage",
             "show_access",
             "show_wrappers",
+            "show_method_coach",
         ] {
             object.remove(field);
         }
@@ -8379,6 +9653,7 @@ mod tests {
             serde_json::from_value(legacy).unwrap();
         assert_eq!(restored_legacy.mechanics_mode, RustMechanicsHintMode::Off);
         assert!(!restored_legacy.show_layout);
+        assert!(!restored_legacy.show_method_coach);
     }
 
     #[cfg(any())]
@@ -8605,11 +9880,119 @@ mod tests {
 
     #[test]
     fn generated_c_preview_truncates_on_a_utf8_boundary() {
-        let preview =
-            generated_c_preview("abc€def".to_owned(), std::path::Path::new("artifact.c"), 4);
+        let temporary = tempfile::tempdir().unwrap();
+        let artifact = temporary.path().join("artifact.c");
+        std::fs::write(&artifact, "abc€def").unwrap();
+        let preview = read_generated_c_preview(&artifact, 4).unwrap();
         assert!(preview.starts_with("abc"));
         assert!(!preview.starts_with("abc€"));
         assert!(preview.contains("artifact.c"));
+    }
+
+    #[test]
+    fn generated_c_target_selection_prefers_exact_target_then_library_module() {
+        let package = GeneratedCCargoPackage {
+            name: "demo".to_owned(),
+            manifest_path: PathBuf::from("/demo/Cargo.toml"),
+            targets: vec![
+                GeneratedCCargoTarget {
+                    name: "demo".to_owned(),
+                    kind: vec!["lib".to_owned()],
+                    src_path: PathBuf::from("/demo/src/lib.rs"),
+                },
+                GeneratedCCargoTarget {
+                    name: "tool".to_owned(),
+                    kind: vec!["bin".to_owned()],
+                    src_path: PathBuf::from("/demo/src/bin/tool.rs"),
+                },
+            ],
+        };
+
+        let exact = select_generated_c_target(&package, Path::new("/demo/src/bin/tool.rs"))
+            .expect("exact bin target");
+        assert_eq!(exact.name, "tool");
+        let module = select_generated_c_target(&package, Path::new("/demo/src/analytics.rs"))
+            .expect("library module target");
+        assert_eq!(module.name, "demo");
+
+        let nested_package = GeneratedCCargoPackage {
+            name: "tools".to_owned(),
+            manifest_path: PathBuf::from("/tools/Cargo.toml"),
+            targets: vec![
+                GeneratedCCargoTarget {
+                    name: "alpha".to_owned(),
+                    kind: vec!["bin".to_owned()],
+                    src_path: PathBuf::from("/tools/src/bin/alpha/main.rs"),
+                },
+                GeneratedCCargoTarget {
+                    name: "beta".to_owned(),
+                    kind: vec!["bin".to_owned()],
+                    src_path: PathBuf::from("/tools/src/bin/beta/main.rs"),
+                },
+            ],
+        };
+        let nested =
+            select_generated_c_target(&nested_package, Path::new("/tools/src/bin/beta/worker.rs"))
+                .expect("nested bin module target");
+        assert_eq!(nested.name, "beta");
+    }
+
+    #[test]
+    fn generated_c_units_exclude_stubs_dependencies_and_stale_builds() {
+        let temporary = tempfile::tempdir().unwrap();
+        let deps = temporary.path().join("debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(deps.join("demo-old.dead.rcgu.c"), "void stale(void) {}").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(deps.join("demo-new.first.rcgu.c"), "void helper(void) {}").unwrap();
+        std::fs::write(
+            deps.join("demo-new.second.rcgu.c"),
+            "void teach_me(void) {}",
+        )
+        .unwrap();
+        std::fs::write(deps.join("native_stubs.c"), "void native(void) {}").unwrap();
+        std::fs::write(
+            deps.join("core-dependency.part.rcgu.c"),
+            "void core(void) {}",
+        )
+        .unwrap();
+
+        let units =
+            collect_generated_c_units(temporary.path(), &["demo".to_owned()], Some("teach_me"))
+                .unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(units[0].code.contains("teach_me"));
+        assert!(units.iter().all(|unit| !unit.code.contains("stale")));
+        assert!(units.iter().all(|unit| !unit.code.contains("native")));
+        assert!(units.iter().all(|unit| !unit.code.contains("core")));
+    }
+
+    #[test]
+    fn generated_c_live_smoke_when_bundled_toolchain_is_configured() {
+        if std::env::var_os("RUST_WORKBENCH_RUSTIC_SYSROOT").is_none() {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temporary.path().join("src")).unwrap();
+        std::fs::write(
+            temporary.path().join("Cargo.toml"),
+            "[package]\nname = \"workbench_c_live\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let source_path = temporary.path().join("src/main.rs");
+        let source = "fn workbench_live_marker() -> u32 { 42 }\nfn main() { println!(\"{}\", workbench_live_marker()); }\n";
+        std::fs::write(&source_path, source).unwrap();
+
+        let artifact = futures::executor::block_on(generate_c_artifact(
+            source_path,
+            ownership_source_hash(source),
+            Some("workbench_live_marker".to_owned()),
+        ))
+        .unwrap();
+        assert_eq!(artifact.target.as_ref(), "workbench_c_live");
+        assert!(!artifact.units.is_empty());
+        assert!(artifact.units[0].code.contains("workbench_live_marker"));
+        assert!(artifact.duration < Duration::from_secs(5));
     }
 
     #[test]

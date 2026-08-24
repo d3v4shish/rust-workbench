@@ -9,9 +9,9 @@
 use std::ops;
 
 use lsp_types::{
-    CodeActionKind, DocumentOnTypeFormattingParams, LspNotificationMethod, LspRequestMethod,
-    MessageDirection, Notification, PartialResultParams, Position, Range, Request,
-    TextDocumentIdentifier, Uri, WorkDoneProgressParams,
+    CodeActionKind, DocumentOnTypeFormattingParams, Location, LspNotificationMethod,
+    LspRequestMethod, MessageDirection, Notification, PartialResultParams, Position, Range,
+    Request, TextDocumentIdentifier, Uri, WorkDoneProgressParams,
 };
 use paths::Utf8PathBuf;
 use rustc_hash::FxHashMap;
@@ -79,6 +79,16 @@ impl Request for OwnershipProblemsRequest {
     const MESSAGE_DIRECTION: MessageDirection = MessageDirection::ClientToServer;
 }
 
+pub enum OwnershipWorkspaceGuideRequest {}
+
+impl Request for OwnershipWorkspaceGuideRequest {
+    type Params = OwnershipWorkspaceGuideParams;
+    type Result = OwnershipWorkspaceGuideResult;
+    const METHOD: LspRequestMethod<'_> =
+        LspRequestMethod::new("rust-analyzer/ownershipWorkspaceGuide");
+    const MESSAGE_DIRECTION: MessageDirection = MessageDirection::ClientToServer;
+}
+
 pub enum OwnershipRepairRequest {}
 
 impl Request for OwnershipRepairRequest {
@@ -121,6 +131,86 @@ pub struct OwnershipProblemsResult {
     pub status: String,
     pub source_hash: String,
     pub problems: Vec<OwnershipProblem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipWorkspaceGuideParams {
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+    pub selected_problem_id: Option<String>,
+    pub expected_revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipWorkspaceGuideResult {
+    pub schema_version: u32,
+    pub status: String,
+    pub revision: String,
+    pub selected_cluster_id: Option<String>,
+    pub clusters: Vec<OwnershipProblemCluster>,
+    pub journey: Vec<OwnershipJourneyFrame>,
+    pub intent_question: Option<OwnershipIntentQuestion>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipProblemCluster {
+    pub id: String,
+    pub root_problem_id: String,
+    pub title: String,
+    pub summary: String,
+    pub category: String,
+    pub diagnostic_code: Option<String>,
+    pub root: OwnershipWorkspaceSite,
+    pub impacts: Vec<OwnershipWorkspaceSite>,
+    pub related_constraints: Vec<OwnershipWorkspaceSite>,
+    pub affected_files: usize,
+    pub precision: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipWorkspaceSite {
+    pub problem_id: Option<String>,
+    pub role: String,
+    pub location: Location,
+    pub label: String,
+    pub relationship: String,
+    pub precision: String,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipJourneyFrame {
+    pub id: String,
+    pub kind: String,
+    pub location: Location,
+    pub label: String,
+    pub explanation: String,
+    pub transfer: String,
+    pub after: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipIntentQuestion {
+    pub id: String,
+    pub prompt: String,
+    pub choices: Vec<OwnershipIntentChoice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipIntentChoice {
+    pub id: String,
+    pub label: String,
+    pub consequence: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -272,6 +362,48 @@ pub struct OwnershipOperationInsight {
     pub alternatives: Vec<OwnershipOperationAlternative>,
     pub provenance: String,
     pub truncated: bool,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub ownership_relevant: bool,
+    #[serde(default)]
+    pub receiver_flow: Option<OwnershipOperationReceiver>,
+    #[serde(default)]
+    pub argument_flows: Vec<OwnershipOperationArgument>,
+    #[serde(default)]
+    pub return_flow: Option<OwnershipOperationReturn>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipOperationReceiver {
+    pub expression: String,
+    pub range: Range,
+    pub transfer: String,
+    pub after: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipOperationArgument {
+    pub index: usize,
+    pub expression: String,
+    pub range: Range,
+    pub parameter_type: String,
+    pub transfer: String,
+    pub after: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipOperationReturn {
+    pub type_name: String,
+    pub kind: String,
+    pub borrowed_from: Option<String>,
+    pub after: String,
+    pub provenance: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -531,6 +663,10 @@ pub struct OwnershipModelRepair {
     pub strategy: String,
     pub semantics: String,
     pub diff: String,
+    #[serde(default)]
+    pub affected_files: Vec<String>,
+    #[serde(default)]
+    pub preview_complete: bool,
     pub compiler_validated: bool,
     pub validation_state: String,
     pub effects: OwnershipModelRepairEffects,

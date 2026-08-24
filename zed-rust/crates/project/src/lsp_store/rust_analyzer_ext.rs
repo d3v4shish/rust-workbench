@@ -40,6 +40,14 @@ impl lsp::request::Request for OwnershipProblemsRequest {
     const METHOD: &'static str = "rust-analyzer/ownershipProblems";
 }
 
+pub enum OwnershipWorkspaceGuideRequest {}
+
+impl lsp::request::Request for OwnershipWorkspaceGuideRequest {
+    type Params = OwnershipWorkspaceGuideParams;
+    type Result = OwnershipWorkspaceGuide;
+    const METHOD: &'static str = "rust-analyzer/ownershipWorkspaceGuide";
+}
+
 pub enum OwnershipRepairRequest {}
 
 impl lsp::request::Request for OwnershipRepairRequest {
@@ -79,6 +87,86 @@ pub struct OwnershipProblems {
     pub status: String,
     pub source_hash: String,
     pub problems: Vec<OwnershipProblem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipWorkspaceGuideParams {
+    pub text_document: lsp::TextDocumentIdentifier,
+    pub position: lsp::Position,
+    pub selected_problem_id: Option<String>,
+    pub expected_revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipWorkspaceGuide {
+    pub schema_version: u32,
+    pub status: String,
+    pub revision: String,
+    pub selected_cluster_id: Option<String>,
+    pub clusters: Vec<OwnershipProblemCluster>,
+    pub journey: Vec<OwnershipJourneyFrame>,
+    pub intent_question: Option<OwnershipIntentQuestion>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipProblemCluster {
+    pub id: String,
+    pub root_problem_id: String,
+    pub title: String,
+    pub summary: String,
+    pub category: String,
+    pub diagnostic_code: Option<String>,
+    pub root: OwnershipWorkspaceSite,
+    pub impacts: Vec<OwnershipWorkspaceSite>,
+    pub related_constraints: Vec<OwnershipWorkspaceSite>,
+    pub affected_files: usize,
+    pub precision: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipWorkspaceSite {
+    pub problem_id: Option<String>,
+    pub role: String,
+    pub location: lsp::Location,
+    pub label: String,
+    pub relationship: String,
+    pub precision: String,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipJourneyFrame {
+    pub id: String,
+    pub kind: String,
+    pub location: lsp::Location,
+    pub label: String,
+    pub explanation: String,
+    pub transfer: String,
+    pub after: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipIntentQuestion {
+    pub id: String,
+    pub prompt: String,
+    pub choices: Vec<OwnershipIntentChoice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipIntentChoice {
+    pub id: String,
+    pub label: String,
+    pub consequence: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -234,6 +322,48 @@ pub struct OwnershipOperationInsight {
     pub alternatives: Vec<OwnershipOperationAlternative>,
     pub provenance: String,
     pub truncated: bool,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub ownership_relevant: bool,
+    #[serde(default)]
+    pub receiver_flow: Option<OwnershipOperationReceiver>,
+    #[serde(default)]
+    pub argument_flows: Vec<OwnershipOperationArgument>,
+    #[serde(default)]
+    pub return_flow: Option<OwnershipOperationReturn>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipOperationReceiver {
+    pub expression: String,
+    pub range: lsp::Range,
+    pub transfer: String,
+    pub after: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipOperationArgument {
+    pub index: usize,
+    pub expression: String,
+    pub range: lsp::Range,
+    pub parameter_type: String,
+    pub transfer: String,
+    pub after: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipOperationReturn {
+    pub type_name: String,
+    pub kind: String,
+    pub borrowed_from: Option<String>,
+    pub after: String,
+    pub provenance: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -493,6 +623,10 @@ pub struct OwnershipRepair {
     pub strategy: String,
     pub semantics: String,
     pub diff: String,
+    #[serde(default)]
+    pub affected_files: Vec<String>,
+    #[serde(default)]
+    pub preview_complete: bool,
     pub compiler_validated: bool,
     #[serde(default = "candidate_validation_state")]
     pub validation_state: String,
@@ -675,6 +809,47 @@ pub fn ownership_problems(
             .await
             .into_response()
             .context("requesting ownership problems from rust-analyzer")
+    })
+}
+
+pub fn ownership_workspace_guide(
+    project: Entity<Project>,
+    buffer: Entity<Buffer>,
+    position: PointUtf16,
+    selected_problem_id: Option<String>,
+    expected_revision: Option<String>,
+    cx: &mut App,
+) -> Task<anyhow::Result<OwnershipWorkspaceGuide>> {
+    let request = project.read_with(cx, |project, cx| {
+        let server_id =
+            project.language_server_id_for_name(buffer.read(cx), &RUST_ANALYZER_NAME, cx)?;
+        let language_server = project
+            .lsp_store()
+            .read(cx)
+            .language_server_for_id(server_id)?;
+        let file = worktree::File::from_dyn(buffer.read(cx).file())?.as_local()?;
+        let uri = lsp::Uri::from_file_path(file.abs_path(cx)).ok()?;
+        Some(language_server.request::<OwnershipWorkspaceGuideRequest>(
+            OwnershipWorkspaceGuideParams {
+                text_document: lsp::TextDocumentIdentifier { uri },
+                position: language::point_to_lsp(position),
+                selected_problem_id,
+                expected_revision,
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        ))
+    });
+    let Some(request) = request else {
+        return Task::ready(Ok(OwnershipWorkspaceGuide {
+            status: "rust_analyzer_unavailable".to_owned(),
+            ..OwnershipWorkspaceGuide::default()
+        }));
+    };
+    cx.background_spawn(async move {
+        request
+            .await
+            .into_response()
+            .context("requesting the workspace ownership guide from rust-analyzer")
     })
 }
 

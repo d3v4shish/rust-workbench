@@ -33,7 +33,10 @@ use lsp_types::{
     TypeDefinitionRequest, Uri, WillRenameFilesRequest, WorkDoneProgressParams,
     WorkspaceSymbolRequest,
 };
-use rust_analyzer::lsp::ext::{OnEnterRequest, RunnablesParams, RunnablesRequest};
+use rust_analyzer::lsp::ext::{
+    OnEnterRequest, OwnershipProblemsRequest, OwnershipWorkspaceGuideParams,
+    OwnershipWorkspaceGuideRequest, RunnablesParams, RunnablesRequest,
+};
 use serde_json::json;
 use stdx::format_to_acc;
 
@@ -41,6 +44,127 @@ use test_utils::skip_slow_tests;
 use testdir::TestDir;
 
 use crate::support::{Project, project};
+
+#[test]
+fn ownership_workspace_guide_tracks_roots_without_name_based_cross_file_grouping() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "ownership-workspace-guide"
+version = "0.0.0"
+
+//- /src/lib.rs
+mod analytics;
+mod reports;
+
+//- /src/analytics.rs
+pub fn analyze() {
+    let values = vec![1, 2, 3];
+    let moved = values;
+    println!("{}", values.len());
+    drop(moved);
+
+    let mut current = String::from("daily");
+    let prefix = &current[..2];
+    current.push('!');
+    println!("{prefix}");
+}
+
+//- /src/reports.rs
+pub fn report() {
+    let values = String::from("report");
+    let moved = values;
+    println!("{values}");
+    drop(moved);
+
+    let mut current = vec![1, 2];
+    let first = &current[0];
+    current.clear();
+    println!("{first}");
+}
+"#,
+    )
+    .with_config(json!({ "checkOnSave": true }))
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    let diagnostics = server.wait_for_diagnostics();
+    assert!(
+        diagnostics.diagnostics.len() >= 2,
+        "expected ownership diagnostics before requesting the guide: {diagnostics:?}"
+    );
+
+    let analytics = server.doc_id("src/analytics.rs");
+    let problems = server.send_request::<OwnershipProblemsRequest>(analytics.clone());
+    let problems: rust_analyzer::lsp::ext::OwnershipProblemsResult =
+        serde_json::from_value(problems).expect("valid ownership problems response");
+    assert!(problems.problems.len() >= 2, "{problems:#?}");
+    let selected_problem_id = problems.problems[0].id.clone();
+    let params = OwnershipWorkspaceGuideParams {
+        text_document: analytics,
+        position: problems.problems[0].model_position,
+        selected_problem_id: Some(selected_problem_id.clone()),
+        expected_revision: None,
+    };
+    let first_request_started = Instant::now();
+    let response = server.send_request::<OwnershipWorkspaceGuideRequest>(params.clone());
+    let first_request_elapsed = first_request_started.elapsed();
+    let guide: rust_analyzer::lsp::ext::OwnershipWorkspaceGuideResult =
+        serde_json::from_value(response).expect("valid workspace guide response");
+
+    assert_eq!(guide.status, "ready");
+    assert!(!guide.revision.is_empty());
+    assert!(
+        first_request_elapsed.as_secs_f64() < 2.0,
+        "workspace guide exceeded the cold response budget: {first_request_elapsed:?}"
+    );
+    let selected_cluster = guide
+        .selected_cluster_id
+        .as_deref()
+        .and_then(|id| guide.clusters.iter().find(|cluster| cluster.id == id))
+        .expect("selected root-cause cluster");
+    assert_eq!(selected_cluster.root_problem_id, selected_problem_id);
+    assert_eq!(selected_cluster.root.role, "root");
+    assert!(selected_cluster.root.location.uri.as_str().ends_with("/src/analytics.rs"));
+    assert!(
+        guide.clusters.iter().any(|cluster| cluster
+            .root
+            .location
+            .uri
+            .as_str()
+            .ends_with("/src/reports.rs")),
+        "the workspace view should include ownership roots from another source file: {guide:#?}"
+    );
+    assert!(
+        guide
+            .clusters
+            .iter()
+            .filter(|cluster| cluster.root.label.contains("values"))
+            .all(|cluster| cluster.affected_files == 1),
+        "same-named locals in different files must not be merged: {guide:#?}"
+    );
+
+    let repeated_request_started = Instant::now();
+    let response =
+        server.send_request::<OwnershipWorkspaceGuideRequest>(OwnershipWorkspaceGuideParams {
+            expected_revision: Some(guide.revision.clone()),
+            ..params
+        });
+    let refreshed: rust_analyzer::lsp::ext::OwnershipWorkspaceGuideResult =
+        serde_json::from_value(response).expect("valid repeated workspace guide response");
+    let repeated_request_elapsed = repeated_request_started.elapsed();
+    assert_eq!(refreshed.revision, guide.revision);
+    assert_eq!(refreshed.selected_cluster_id, guide.selected_cluster_id);
+    assert!(
+        repeated_request_elapsed.as_secs_f64() < 1.0,
+        "workspace guide exceeded the warm response budget: {repeated_request_elapsed:?}"
+    );
+}
 
 #[test]
 fn completes_items_from_standard_library() {
@@ -117,6 +241,86 @@ fn f() {
     assert!(
         matches!(&hint.label, Label::InlayHintLabelPartList(parts) if parts[1].location.is_some())
     );
+}
+
+#[test]
+fn method_coach_is_compact_lazy_and_does_not_modify_normal_hover() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "method-coach"
+version = "0.0.0"
+
+//- /src/lib.rs
+struct Store(String);
+impl Store {
+    fn push(&mut self, value: String) { self.0 = value; }
+}
+fn f() {
+    let mut store = Store(String::new());
+    let event = String::from("event");
+    store.push(event);
+}
+"#,
+    )
+    .with_config(json!({
+        "ownership": {
+            "enable": true,
+            "methodCoach": { "enable": true }
+        }
+    }))
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    let response = server.send_request::<InlayHintRequest>(InlayHintParams {
+        range: Range::new(Position::new(0, 0), Position::new(9, 0)),
+        text_document: server.doc_id("src/lib.rs"),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    });
+    let hints = serde_json::from_value::<Option<Vec<InlayHint>>>(response).unwrap().unwrap();
+    let clue = hints
+        .into_iter()
+        .find(|hint| {
+            hint.data
+                .as_ref()
+                .and_then(|data| data.pointer("/rustWorkbench/category"))
+                .and_then(|category| category.as_str())
+                == Some("method_coach")
+                && hint
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.pointer("/rustWorkbench/operationName"))
+                    .and_then(|name| name.as_str())
+                    == Some("push")
+        })
+        .expect("ownership-relevant push call should have one method coach clue");
+    assert!(clue.tooltip.is_none(), "visible-range response must stay lightweight");
+    assert!(
+        matches!(&clue.label, Label::String(label) if label == "Explain · needs &mut · moves event")
+    );
+
+    let response = server.send_request::<InlayHintResolveRequest>(clue);
+    let resolved = serde_json::from_value::<InlayHint>(response).unwrap();
+    let tooltip = serde_json::to_string(&resolved.tooltip).unwrap();
+    assert!(tooltip.contains("Value before the call"), "{tooltip}");
+    assert!(tooltip.contains("original place is unavailable"), "{tooltip}");
+    assert!(tooltip.contains("Rust Learning Debugger"), "{tooltip}");
+
+    let response = server.send_request::<HoverRequest>(HoverParams {
+        text_document_position_params: TextDocumentPositionParams::new(
+            server.doc_id("src/lib.rs"),
+            Position::new(7, 11),
+        ),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    });
+    let hover = response.to_string();
+    assert!(!hover.contains("Rust Workbench"), "normal hover was customized: {hover}");
+    assert!(!hover.contains("Ownership timeline"), "normal hover was customized: {hover}");
 }
 
 #[test]

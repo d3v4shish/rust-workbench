@@ -111,7 +111,10 @@ pub use crate::{
     },
     move_item::Direction,
     navigation_target::{NavigationTarget, TryToNav, UpmappingResult},
-    ownership_insight::{OwnershipCallAlternative, OwnershipCallEffect, OwnershipCallInsight},
+    ownership_insight::{
+        OwnershipCallAlternative, OwnershipCallArgument, OwnershipCallEffect, OwnershipCallInsight,
+        OwnershipCallReceiver, OwnershipCallReturn,
+    },
     references::{FindAllRefsConfig, ReferenceSearchResult},
     rename::{RenameConfig, RenameError},
     runnables::{Runnable, RunnableKind, TestId, UpdateTest},
@@ -651,6 +654,14 @@ impl Analysis {
         positions: Vec<FilePosition>,
     ) -> Cancellable<Vec<OwnershipCallInsight>> {
         self.with_db(|db| ownership_insight::ownership_call_insights_for_positions(db, &positions))
+    }
+
+    /// Explains ownership-relevant calls in a visible source range.
+    pub fn ownership_call_insights_in_range(
+        &self,
+        file_range: FileRange,
+    ) -> Cancellable<Vec<OwnershipCallInsight>> {
+        self.with_db(|db| ownership_insight::ownership_call_insights_in_range(db, file_range))
     }
 
     /// Computes call hierarchy candidates for the given file position.

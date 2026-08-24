@@ -146,6 +146,7 @@ impl RustWorkbenchToolchain {
                     "access": true,
                     "wrappers": true,
                 },
+                "methodCoach": { "enable": true },
             },
             "assist": {
                 "ownershipWrapperSuggestions": { "enable": true },
@@ -2565,6 +2566,10 @@ mod tests {
         );
         assert_eq!(
             options.pointer("/ownership/mechanics/wrappers"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            options.pointer("/ownership/methodCoach/enable"),
             Some(&json!(true))
         );
         assert_eq!(

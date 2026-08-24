@@ -1,7 +1,7 @@
 //! This module is responsible for implementing handlers for Language Server
 //! Protocol. This module specifically handles requests.
 
-use std::{fs, io::Write as _, ops::Not, process::Stdio};
+use std::{collections::BTreeSet, fs, io::Write as _, ops::Not, process::Stdio};
 
 use anyhow::Context;
 
@@ -41,8 +41,8 @@ use crate::{
     },
     diagnostics::{
         Fix, OwnershipEvent, OwnershipEventKind, OwnershipState, OwnershipWrapperFix,
-        convert_diagnostic, ownership_diagnostics_for_file, ownership_events_for_file,
-        stable_source_hash,
+        convert_diagnostic, ownership_diagnostic_file_ids, ownership_diagnostics_for_file,
+        ownership_events_for_file, stable_source_hash,
     },
     global_state::{FetchWorkspaceRequest, GlobalState, GlobalStateSnapshot},
     line_index::{LineEndings, LineIndex},
@@ -1358,52 +1358,13 @@ pub(crate) fn handle_hover(
     };
     let file_range =
         try_default!(from_proto::file_range(&snap, &params.text_document, request_range)?);
-    let events = ownership_events_for_file(&snap.ownership_events, file_range.file_id);
-    let selected = events.iter().find(|event| {
-        event.range.start <= request_range.start && request_range.start <= event.range.end
-            || event.binding_range.start <= request_range.start
-                && request_range.start <= event.binding_range.end
-    });
     let line_index = snap.file_line_index(file_range.file_id)?;
-    let alternatives = ownership_alternatives(
-        &snap,
-        &params.text_document.uri,
-        file_range.file_id,
-        &line_index,
-        request_range,
-        selected,
-    )?;
-
     let hover_config = snap.config.hover(snap.minicore());
-    let info = match snap.analysis.hover(&hover_config, file_range)? {
-        None => {
-            let mut sections = Vec::new();
-            if let Some(alternatives) = alternatives {
-                sections.push(alternatives);
-            }
-            if let Some(selected) = selected {
-                sections.push(ownership_timeline(&events, selected));
-            }
-            if sections.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(lsp_ext::Hover {
-                hover: lsp_types::Hover {
-                    contents: Contents::MarkupContent(lsp_types::MarkupContent {
-                        kind: lsp_types::MarkupKind::Markdown,
-                        value: sections.join("\n\n---\n\n"),
-                    }),
-                    range: Some(selected.map_or(request_range, |event| event.range)),
-                },
-                actions: Vec::new(),
-            }));
-        }
-        Some(info) => info,
-    };
+    let Some(info) = snap.analysis.hover(&hover_config, file_range)? else { return Ok(None) };
 
     let range = to_proto::range(&line_index, info.range);
     let markup_kind = hover_config.format;
-    let mut hover = lsp_ext::Hover {
+    let hover = lsp_ext::Hover {
         hover: lsp_types::Hover {
             contents: Contents::MarkupContent(to_proto::markup_content(
                 info.info.markup,
@@ -1417,20 +1378,6 @@ pub(crate) fn handle_hover(
             prepare_hover_actions(&snap, &info.info.actions)
         },
     };
-
-    let mut ownership_sections = Vec::new();
-    if let Some(alternatives) = alternatives {
-        ownership_sections.push(alternatives);
-    }
-    if let Some(selected) = selected {
-        ownership_sections.push(ownership_timeline(&events, selected));
-    }
-    if !ownership_sections.is_empty() {
-        let Contents::MarkupContent(markup) = &mut hover.hover.contents else {
-            return Ok(Some(hover));
-        };
-        format_to!(markup.value, "\n\n---\n\n{}", ownership_sections.join("\n\n---\n\n"),);
-    }
 
     Ok(Some(hover))
 }
@@ -1529,14 +1476,22 @@ pub(crate) fn handle_ownership_model(
         .into_iter()
         .enumerate()
         .filter_map(|(index, fix)| {
-            let diff = ownership_fix_diff(&source, &line_index, &params.text_document.uri, fix)?;
-            let compiler_validated = fix.action.is_preferred.unwrap_or(false);
+            let preview = ownership_workspace_fix_diff(
+                &snap,
+                &source,
+                &line_index,
+                &params.text_document.uri,
+                fix,
+            )?;
+            let compiler_validated = fix.action.is_preferred.unwrap_or(false) && preview.complete;
             Some(lsp_ext::OwnershipModelRepair {
                 id: ownership_language_repair_id(index),
                 title: fix.action.title.clone(),
                 strategy: "language_fix".to_owned(),
                 semantics: "ordinary Rust ownership and compile-time checked access".to_owned(),
-                diff,
+                diff: preview.diff,
+                affected_files: preview.affected_files,
+                preview_complete: preview.complete,
                 compiler_validated,
                 validation_state: if compiler_validated {
                     "validated".to_owned()
@@ -1553,15 +1508,27 @@ pub(crate) fn handle_ownership_model(
     repairs.extend(validated_fixes.into_iter().enumerate().filter_map(|(index, fix)| {
         let strategy = fix.ownership_wrapper?;
         validated_strategies.push(strategy);
-        let diff = ownership_fix_diff(&source, &line_index, &params.text_document.uri, fix)?;
+        let preview = ownership_workspace_fix_diff(
+            &snap,
+            &source,
+            &line_index,
+            &params.text_document.uri,
+            fix,
+        )?;
         Some(lsp_ext::OwnershipModelRepair {
             id: ownership_repair_id(strategy, index),
             title: fix.action.title.clone(),
             strategy: ownership_wrapper_code(strategy).to_owned(),
             semantics: strategy.runtime_semantics().to_owned(),
-            diff,
-            compiler_validated: true,
-            validation_state: "validated".to_owned(),
+            diff: preview.diff,
+            affected_files: preview.affected_files,
+            preview_complete: preview.complete,
+            compiler_validated: preview.complete,
+            validation_state: if preview.complete {
+                "validated".to_owned()
+            } else {
+                "incomplete_preview".to_owned()
+            },
             effects: ownership_repair_effects(strategy),
             preview_graph: ownership_repair_preview_graph(
                 strategy,
@@ -1622,8 +1589,13 @@ pub(crate) fn handle_ownership_model(
         if validated_strategies.contains(&strategy) {
             continue;
         }
-        let Some(diff) = ownership_fix_diff(&source, &line_index, &params.text_document.uri, fix)
-        else {
+        let Some(preview) = ownership_workspace_fix_diff(
+            &snap,
+            &source,
+            &line_index,
+            &params.text_document.uri,
+            fix,
+        ) else {
             continue;
         };
         repairs.push(lsp_ext::OwnershipModelRepair {
@@ -1631,7 +1603,9 @@ pub(crate) fn handle_ownership_model(
             title: fix.action.title.trim_end_matches(" (unvalidated)").to_owned(),
             strategy: ownership_wrapper_code(strategy).to_owned(),
             semantics: strategy.runtime_semantics().to_owned(),
-            diff,
+            diff: preview.diff,
+            affected_files: preview.affected_files,
+            preview_complete: preview.complete,
             compiler_validated: false,
             validation_state: "candidate".to_owned(),
             effects: ownership_repair_effects(strategy),
@@ -1989,7 +1963,11 @@ pub(crate) fn handle_ownership_model(
         .collect();
     let mut operation_insights =
         snap.analysis.ownership_call_insights_for_positions(operation_positions)?;
-    operation_insights.sort_by_key(|operation| operation.range.start());
+    operation_insights.sort_by_key(|operation| {
+        let touches_cursor = operation.range.start() <= file_range.range.start()
+            && file_range.range.start() <= operation.range.end();
+        (!touches_cursor, operation.range.start(), operation.range.end())
+    });
     operation_insights.dedup_by_key(|operation| operation.range);
     response_truncated |= operation_insights.len() > 64;
     let operations = operation_insights
@@ -2034,6 +2012,37 @@ pub(crate) fn handle_ownership_model(
                 .collect(),
             provenance: operation.provenance,
             truncated: operation.truncated,
+            summary: operation.summary,
+            ownership_relevant: operation.ownership_relevant,
+            receiver_flow: operation.receiver_flow.map(|receiver| {
+                lsp_ext::OwnershipOperationReceiver {
+                    expression: receiver.expression,
+                    range: to_proto::range(&line_index, receiver.range),
+                    transfer: receiver.transfer,
+                    after: receiver.after,
+                    provenance: receiver.provenance,
+                }
+            }),
+            argument_flows: operation
+                .argument_flows
+                .into_iter()
+                .map(|argument| lsp_ext::OwnershipOperationArgument {
+                    index: argument.index,
+                    expression: argument.expression,
+                    range: to_proto::range(&line_index, argument.range),
+                    parameter_type: argument.parameter_type,
+                    transfer: argument.transfer,
+                    after: argument.after,
+                    provenance: argument.provenance,
+                })
+                .collect(),
+            return_flow: Some(lsp_ext::OwnershipOperationReturn {
+                type_name: operation.return_flow.type_name,
+                kind: operation.return_flow.kind,
+                borrowed_from: operation.return_flow.borrowed_from,
+                after: operation.return_flow.after,
+                provenance: operation.return_flow.provenance,
+            }),
         })
         .collect::<Vec<_>>();
     let mutation_requirement = ownership_mutation_requirement(
@@ -2063,7 +2072,7 @@ pub(crate) fn handle_ownership_model(
         .unwrap_or_else(|| ownership_value_trace(&events, &operations));
 
     Ok(lsp_ext::OwnershipModelResult {
-        schema_version: tutorial.schema_version.max(12),
+        schema_version: tutorial.schema_version.max(13),
         target_triple: tutorial.target_triple.clone(),
         precision: if exact { "compiler_exact" } else { "estimated" }.to_owned(),
         status: if events.is_empty() && !has_tutorial_facts && selected_diagnostic.is_none() {
@@ -2170,6 +2179,655 @@ pub(crate) fn handle_ownership_problems(
         source_hash: stable_source_hash(&source),
         problems,
     })
+}
+
+#[derive(Clone)]
+struct WorkspaceOwnershipProblem {
+    file_id: FileId,
+    uri: Uri,
+    problem: lsp_ext::OwnershipProblem,
+    cause_id: String,
+}
+
+pub(crate) fn handle_ownership_workspace_guide(
+    snap: GlobalStateSnapshot,
+    params: lsp_ext::OwnershipWorkspaceGuideParams,
+) -> anyhow::Result<lsp_ext::OwnershipWorkspaceGuideResult> {
+    const MAX_CLUSTERS: usize = 100;
+    const MAX_PROBLEMS: usize = 2_000;
+    const MAX_IMPACTS: usize = 50;
+    const MAX_RELATED_CONSTRAINTS: usize = 16;
+    const MAX_JOURNEY_FRAMES: usize = 16;
+
+    let active_file_id = try_default!(from_proto::file_id(&snap, &params.text_document.uri)?);
+    let active_source = snap.analysis.file_text(active_file_id)?;
+    let request_range = Range::new(params.position, params.position);
+    let mut entries = Vec::new();
+    for file_id in ownership_diagnostic_file_ids(&snap.ownership_diagnostics) {
+        let is_local = snap
+            .analysis
+            .source_root_id(file_id)
+            .and_then(|root| snap.analysis.is_local_source_root(root))
+            .unwrap_or(false);
+        if !is_local {
+            continue;
+        }
+        let uri = to_proto::url(&snap, file_id);
+        let events = ownership_events_for_file(&snap.ownership_events, file_id);
+        let tutorial = crate::diagnostics::ownership_tutorial_for_file(
+            &snap.ownership_tutorial_models,
+            file_id,
+        );
+        for diagnostic in ownership_diagnostics_for_file(&snap.ownership_diagnostics, file_id) {
+            let problem = ownership_problem_from_diagnostic(&diagnostic, &events, &tutorial);
+            let cause_id = ownership_problem_cause_id(&uri, &problem, &events);
+            entries.push(WorkspaceOwnershipProblem {
+                file_id,
+                uri: uri.clone(),
+                problem,
+                cause_id,
+            });
+        }
+    }
+    entries.sort_by(|left, right| {
+        let left_active = left.file_id == active_file_id;
+        let right_active = right.file_id == active_file_id;
+        (!left_active, left.uri.as_str(), left.problem.primary_range.start).cmp(&(
+            !right_active,
+            right.uri.as_str(),
+            right.problem.primary_range.start,
+        ))
+    });
+    let problems_truncated = entries.len() > MAX_PROBLEMS;
+    entries.truncate(MAX_PROBLEMS);
+
+    let selected_problem_id = params.selected_problem_id.as_deref().or_else(|| {
+        entries
+            .iter()
+            .find(|entry| {
+                entry.file_id == active_file_id
+                    && (ranges_touch(entry.problem.primary_range, request_range)
+                        || entry
+                            .problem
+                            .related_ranges
+                            .iter()
+                            .any(|range| ranges_touch(*range, request_range)))
+            })
+            .map(|entry| entry.problem.id.as_str())
+    });
+    let selected_cause_id = selected_problem_id.and_then(|selected| {
+        entries
+            .iter()
+            .find(|entry| entry.problem.id == selected)
+            .map(|entry| entry.cause_id.clone())
+    });
+
+    let mut seen_cause_ids = BTreeSet::new();
+    let mut cause_ids = Vec::new();
+    for entry in &entries {
+        if seen_cause_ids.insert(entry.cause_id.clone()) {
+            cause_ids.push(entry.cause_id.clone());
+        }
+    }
+    if let Some(selected) = selected_cause_id.as_deref()
+        && let Some(index) = cause_ids.iter().position(|cause| cause == selected)
+    {
+        cause_ids.swap(0, index);
+    }
+    let clusters_truncated = cause_ids.len() > MAX_CLUSTERS;
+    cause_ids.truncate(MAX_CLUSTERS);
+
+    let mut clusters = Vec::new();
+    for cause_id in cause_ids {
+        let grouped = entries.iter().filter(|entry| entry.cause_id == cause_id).collect::<Vec<_>>();
+        let Some(root) = grouped.iter().copied().min_by_key(|entry| {
+            (entry.problem.primary_range.start, entry.problem.primary_range.end)
+        }) else {
+            continue;
+        };
+        let root_events = ownership_events_for_file(&snap.ownership_events, root.file_id);
+        let mut impact_sites = grouped
+            .iter()
+            .map(|entry| {
+                ownership_problem_site(
+                    entry,
+                    "symptom",
+                    "rustc rejected this site because of the root event above",
+                    selected_problem_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        for related in &root.problem.related {
+            impact_sites.push(lsp_ext::OwnershipWorkspaceSite {
+                problem_id: None,
+                role: "evidence".to_owned(),
+                location: Location { uri: root.uri.clone(), range: related.range },
+                label: related.message.clone(),
+                relationship: "compiler-related span".to_owned(),
+                precision: "compiler_diagnostic".to_owned(),
+                selected: ranges_touch(related.range, request_range),
+            });
+        }
+        impact_sites.sort_by(|left, right| {
+            (left.location.uri.as_str(), left.location.range.start)
+                .cmp(&(right.location.uri.as_str(), right.location.range.start))
+        });
+        impact_sites
+            .dedup_by(|left, right| left.location == right.location && left.label == right.label);
+        let impacts_truncated = impact_sites.len() > MAX_IMPACTS;
+        impact_sites.truncate(MAX_IMPACTS);
+        let affected_files =
+            grouped.iter().map(|entry| entry.uri.as_str()).collect::<BTreeSet<_>>().len();
+        clusters.push(lsp_ext::OwnershipProblemCluster {
+            id: cause_id,
+            root_problem_id: root.problem.id.clone(),
+            title: ownership_cluster_title(&root.problem),
+            summary: ownership_cluster_summary(&root.problem, grouped.len()),
+            category: root.problem.category.clone(),
+            diagnostic_code: root.problem.diagnostic_code.clone(),
+            root: ownership_problem_root_site(root, &root_events, selected_problem_id),
+            impacts: impact_sites,
+            related_constraints: Vec::new(),
+            affected_files,
+            precision: if grouped.iter().any(|entry| entry.problem.precision == "estimated") {
+                "estimated"
+            } else if grouped.iter().any(|entry| entry.problem.precision == "compiler_diagnostic") {
+                "compiler_diagnostic"
+            } else {
+                "compiler_exact"
+            }
+            .to_owned(),
+            truncated: impacts_truncated,
+        });
+    }
+
+    let selected_cluster_id = selected_cause_id
+        .filter(|cause| clusters.iter().any(|cluster| cluster.id == *cause))
+        .or_else(|| clusters.first().map(|cluster| cluster.id.clone()));
+    let selected_cluster_category = selected_cluster_id.as_deref().and_then(|selected| {
+        clusters
+            .iter()
+            .find(|cluster| cluster.id == selected)
+            .map(|cluster| cluster.category.clone())
+    });
+    let mut journey = Vec::new();
+    if let Some(cluster_id) = selected_cluster_id.as_deref()
+        && let Some(root_entry) = entries.iter().find(|entry| {
+            entry.cause_id == cluster_id
+                && entry.problem.id
+                    == clusters
+                        .iter()
+                        .find(|cluster| cluster.id == cluster_id)
+                        .map(|cluster| cluster.root_problem_id.as_str())
+                        .unwrap_or_default()
+        })
+    {
+        journey = ownership_workspace_journey(&snap, root_entry, MAX_JOURNEY_FRAMES);
+        let constraints = ownership_incoming_call_constraints(
+            &snap,
+            root_entry.file_id,
+            root_entry.problem.primary_range,
+            selected_problem_id,
+            MAX_RELATED_CONSTRAINTS,
+        )?;
+        if let Some(cluster) = clusters.iter_mut().find(|candidate| candidate.id == cluster_id) {
+            cluster.related_constraints = constraints;
+            if journey.is_empty() {
+                journey.push(lsp_ext::OwnershipJourneyFrame {
+                    id: format!("{}-root", cluster.id),
+                    kind: "diagnostic".to_owned(),
+                    location: cluster.root.location.clone(),
+                    label: cluster.root.label.clone(),
+                    explanation: cluster.summary.clone(),
+                    transfer: "compiler diagnostic".to_owned(),
+                    after: "operation rejected".to_owned(),
+                    provenance: cluster.root.precision.clone(),
+                });
+            }
+        }
+    }
+    let journey_truncated = journey.len() > MAX_JOURNEY_FRAMES;
+    journey.truncate(MAX_JOURNEY_FRAMES);
+
+    let revision_material = entries
+        .iter()
+        .map(|entry| format!("{}:{}", entry.uri.as_str(), entry.problem.id))
+        .chain(std::iter::once(stable_source_hash(&active_source)))
+        .join("|");
+    let revision = stable_source_hash(&revision_material);
+    let status = if params.expected_revision.as_deref().is_some_and(|expected| expected != revision)
+    {
+        "refreshed"
+    } else if entries.is_empty() {
+        "ready_empty"
+    } else {
+        "ready"
+    };
+    Ok(lsp_ext::OwnershipWorkspaceGuideResult {
+        schema_version: 1,
+        status: status.to_owned(),
+        revision,
+        selected_cluster_id,
+        intent_question: selected_cluster_category.as_deref().and_then(ownership_intent_question),
+        clusters,
+        journey,
+        truncated: problems_truncated || clusters_truncated || journey_truncated,
+    })
+}
+
+fn ownership_problem_cause_id(
+    uri: &Uri,
+    problem: &lsp_ext::OwnershipProblem,
+    events: &[OwnershipEvent],
+) -> String {
+    let matching = events.iter().filter(|event| {
+        ranges_touch(event.range, problem.primary_range)
+            || ranges_touch(event.binding_range, problem.binding_range)
+            || ownership_name_refers_to_binding(&event.name, &problem.binding_name)
+            || ownership_name_refers_to_binding(&event.place, &problem.binding_name)
+    });
+    let body_id = matching.clone().map(|event| event.body_id).find(|body_id| *body_id != 0);
+    let loan_id = matching.clone().find_map(|event| event.loan_id);
+    let causal_range = matching
+        .filter(|event| {
+            matches!(
+                event.kind,
+                OwnershipEventKind::Move
+                    | OwnershipEventKind::PartialMove
+                    | OwnershipEventKind::BorrowShared
+                    | OwnershipEventKind::BorrowMutable
+                    | OwnershipEventKind::BorrowActivate
+            )
+        })
+        .map(|event| event.range)
+        .min_by_key(|range| (range.start, range.end))
+        .unwrap_or(problem.binding_range);
+    let family = match problem.category.as_str() {
+        "use_after_move"
+        | "partial_move"
+        | "move_while_borrowed"
+        | "move_out_of_borrowed_content" => "move",
+        "multiple_mutable_borrows"
+        | "mutable_while_shared"
+        | "use_while_mutably_borrowed"
+        | "assign_while_borrowed" => "loan",
+        "immutable_mutation" => "mutability",
+        "missing_lifetime"
+        | "returning_local_reference"
+        | "borrowed_value_too_short"
+        | "temporary_dropped_while_borrowed"
+        | "borrowed_data_escapes"
+        | "closure_may_outlive_borrow" => "lifetime",
+        "trait_requirement" => "trait_boundary",
+        _ => problem.category.as_str(),
+    };
+    let material = format!(
+        "{}|{}|{}|{}|{}:{}|{}",
+        uri.as_str(),
+        body_id.unwrap_or(0),
+        family,
+        loan_id.map_or_else(|| "none".to_owned(), |loan| loan.to_string()),
+        causal_range.start.line,
+        causal_range.start.character,
+        ownership_root_name(&problem.binding_name),
+    );
+    format!("cluster-{}", stable_source_hash(&material))
+}
+
+fn ownership_problem_site(
+    entry: &WorkspaceOwnershipProblem,
+    role: &str,
+    relationship: &str,
+    selected_problem_id: Option<&str>,
+) -> lsp_ext::OwnershipWorkspaceSite {
+    lsp_ext::OwnershipWorkspaceSite {
+        problem_id: Some(entry.problem.id.clone()),
+        role: role.to_owned(),
+        location: Location { uri: entry.uri.clone(), range: entry.problem.primary_range },
+        label: entry.problem.message.clone(),
+        relationship: relationship.to_owned(),
+        precision: entry.problem.precision.clone(),
+        selected: selected_problem_id == Some(entry.problem.id.as_str()),
+    }
+}
+
+fn ownership_problem_root_site(
+    entry: &WorkspaceOwnershipProblem,
+    events: &[OwnershipEvent],
+    selected_problem_id: Option<&str>,
+) -> lsp_ext::OwnershipWorkspaceSite {
+    let causal_event = events
+        .iter()
+        .filter(|event| {
+            (ranges_touch(event.range, entry.problem.primary_range)
+                || ranges_touch(event.binding_range, entry.problem.binding_range)
+                || ownership_name_refers_to_binding(&event.name, &entry.problem.binding_name)
+                || ownership_name_refers_to_binding(&event.place, &entry.problem.binding_name))
+                && matches!(
+                    event.kind,
+                    OwnershipEventKind::Move
+                        | OwnershipEventKind::PartialMove
+                        | OwnershipEventKind::BorrowShared
+                        | OwnershipEventKind::BorrowMutable
+                        | OwnershipEventKind::BorrowActivate
+                )
+        })
+        .min_by_key(|event| (event.range.start, event.range.end));
+    let Some(event) = causal_event else {
+        return ownership_problem_site(
+            entry,
+            "root",
+            "rustc reported the ownership constraint here",
+            selected_problem_id,
+        );
+    };
+    let label = match event.kind {
+        OwnershipEventKind::Move | OwnershipEventKind::PartialMove => event
+            .destination
+            .as_ref()
+            .map(|destination| format!("`{}` moves to {}", event.place, destination.label))
+            .unwrap_or_else(|| format!("ownership leaves `{}` here", event.place)),
+        OwnershipEventKind::BorrowShared => {
+            format!("a shared reference starts borrowing `{}` here", event.place)
+        }
+        OwnershipEventKind::BorrowMutable | OwnershipEventKind::BorrowActivate => {
+            format!("exclusive access to `{}` starts here", event.place)
+        }
+        _ => format!("the ownership constraint on `{}` starts here", event.place),
+    };
+    let relationship = match event.kind {
+        OwnershipEventKind::Move | OwnershipEventKind::PartialMove => {
+            "The destination now owns the value; the source binding is unavailable until reinitialized."
+        }
+        OwnershipEventKind::BorrowShared => {
+            "This view must keep observing a valid value, so conflicting mutation waits until its last use."
+        }
+        OwnershipEventKind::BorrowMutable | OwnershipEventKind::BorrowActivate => {
+            "Exclusive access blocks competing readers and writers for the active loan."
+        }
+        _ => "This compiler event establishes the constraint used by the later diagnostic.",
+    };
+    lsp_ext::OwnershipWorkspaceSite {
+        problem_id: Some(entry.problem.id.clone()),
+        role: "root".to_owned(),
+        location: Location { uri: entry.uri.clone(), range: event.range },
+        label,
+        relationship: relationship.to_owned(),
+        precision: if event.exact { "compiler_exact" } else { "estimated" }.to_owned(),
+        selected: selected_problem_id == Some(entry.problem.id.as_str())
+            && ranges_touch(event.range, entry.problem.primary_range),
+    }
+}
+
+fn ownership_cluster_title(problem: &lsp_ext::OwnershipProblem) -> String {
+    let target = &problem.binding_name;
+    match problem.category.as_str() {
+        "use_after_move" | "partial_move" => {
+            format!("`{target}` was transferred, then used again")
+        }
+        "multiple_mutable_borrows" => format!("`{target}` has two exclusive borrowers"),
+        "mutable_while_shared" | "assign_while_borrowed" => {
+            format!("`{target}` changes while an earlier view is still needed")
+        }
+        "move_while_borrowed" => format!("`{target}` moves while a view still points into it"),
+        "immutable_mutation" => format!("`{target}` cannot provide mutable access"),
+        "returning_local_reference"
+        | "borrowed_value_too_short"
+        | "temporary_dropped_while_borrowed" => {
+            format!("A reference to `{target}` would outlive its value")
+        }
+        "trait_requirement" => format!("`{target}` cannot cross this ownership boundary"),
+        _ => problem.message.clone(),
+    }
+}
+
+fn ownership_cluster_summary(
+    problem: &lsp_ext::OwnershipProblem,
+    diagnostic_count: usize,
+) -> String {
+    let count = if diagnostic_count == 1 {
+        "This is the compiler's root ownership diagnostic.".to_owned()
+    } else {
+        format!(
+            "{diagnostic_count} diagnostics share the same compiler ownership cause; fixing the root may clear the others."
+        )
+    };
+    let explanation = match problem.category.as_str() {
+        "use_after_move" | "partial_move" => {
+            "Ownership left the original binding, so Rust cannot use that binding as though it still contains the value."
+        }
+        "multiple_mutable_borrows" => {
+            "Exclusive access already exists, so another mutable reference could create two writers to the same value."
+        }
+        "mutable_while_shared" | "assign_while_borrowed" => {
+            "An earlier reference still needs the old value, while this operation would replace or mutate it."
+        }
+        "immutable_mutation" => {
+            "The operation requires exclusive mutable access, but the path to the value only supplies immutable or shared access."
+        }
+        _ => {
+            "The sites below are connected by compiler diagnostic, ownership-event, or resolved-call evidence."
+        }
+    };
+    format!("{explanation} {count}")
+}
+
+fn ownership_workspace_journey(
+    snap: &GlobalStateSnapshot,
+    root: &WorkspaceOwnershipProblem,
+    limit: usize,
+) -> Vec<lsp_ext::OwnershipJourneyFrame> {
+    let mut result = vec![lsp_ext::OwnershipJourneyFrame {
+        id: format!("{}-binding", root.problem.id),
+        kind: "binding".to_owned(),
+        location: Location { uri: root.uri.clone(), range: root.problem.binding_range },
+        label: format!("`{}` starts here", root.problem.binding_name),
+        explanation: "This binding is the source-level name whose ownership or access state Rust is tracking."
+            .to_owned(),
+        transfer: "binding".to_owned(),
+        after: "available".to_owned(),
+        provenance: root.problem.precision.clone(),
+    }];
+    let mut events = ownership_events_for_file(&snap.ownership_events, root.file_id)
+        .into_iter()
+        .filter(|event| {
+            ownership_name_refers_to_binding(&event.name, &root.problem.binding_name)
+                || ownership_name_refers_to_binding(&event.place, &root.problem.binding_name)
+                || root.problem.related_ranges.iter().any(|range| ranges_touch(*range, event.range))
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| (event.range.start, event.range.end));
+    for event in events {
+        if result.len() + 1 >= limit {
+            break;
+        }
+        let kind = ownership_kind_code(event.kind).to_owned();
+        let destination = event.destination.as_ref().map(|destination| destination.label.as_str());
+        let label = destination.map_or_else(
+            || format!("{} · `{}`", event.kind.label(), event.place),
+            |destination| format!("`{}` → {destination}", event.place),
+        );
+        let explanation = event.detail.clone().unwrap_or_else(|| match event.kind {
+            OwnershipEventKind::Move | OwnershipEventKind::PartialMove => {
+                "Ownership leaves the source place; the allocation is not implicitly duplicated."
+                    .to_owned()
+            }
+            OwnershipEventKind::BorrowShared => {
+                "A shared view is created. Reads remain allowed, but incompatible mutation must wait until its last use."
+                    .to_owned()
+            }
+            OwnershipEventKind::BorrowMutable | OwnershipEventKind::BorrowActivate => {
+                "Exclusive access is active, so no competing reader or writer may access the same place."
+                    .to_owned()
+            }
+            OwnershipEventKind::BorrowEnd => {
+                "The borrow is no longer used on this control-flow path, so the blocked access becomes available again."
+                    .to_owned()
+            }
+            _ => format!("Compiler MIR records `{kind}` for this place."),
+        });
+        result.push(lsp_ext::OwnershipJourneyFrame {
+            id: event.event_id,
+            kind: kind.clone(),
+            location: Location { uri: root.uri.clone(), range: event.range },
+            label,
+            explanation,
+            transfer: kind,
+            after: ownership_state_code(event.state).to_owned(),
+            provenance: if event.exact { "compiler_exact" } else { "estimated" }.to_owned(),
+        });
+    }
+    result.push(lsp_ext::OwnershipJourneyFrame {
+        id: format!("{}-diagnostic", root.problem.id),
+        kind: "rejected_operation".to_owned(),
+        location: Location { uri: root.uri.clone(), range: root.problem.primary_range },
+        label: root.problem.message.clone(),
+        explanation: ownership_cluster_summary(&root.problem, 1),
+        transfer: "conflict".to_owned(),
+        after: "operation rejected; the value itself may still be alive".to_owned(),
+        provenance: "compiler_diagnostic".to_owned(),
+    });
+    result.truncate(limit);
+    result
+}
+
+fn ownership_incoming_call_constraints(
+    snap: &GlobalStateSnapshot,
+    file_id: FileId,
+    diagnostic_range: Range,
+    selected_problem_id: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<lsp_ext::OwnershipWorkspaceSite>> {
+    let line_index = snap.file_line_index(file_id)?;
+    let offset = from_proto::offset(&line_index, diagnostic_range.start)?;
+    let syntax = snap.analysis.parse(file_id)?;
+    let Some(function_name_range) = syntax
+        .syntax()
+        .token_at_offset(offset)
+        .right_biased()
+        .and_then(|token| token.parent_ancestors().find_map(ast::Fn::cast))
+        .and_then(|function| function.name().map(|name| name.syntax().text_range()))
+    else {
+        return Ok(Vec::new());
+    };
+    let config = snap.config.call_hierarchy(snap.minicore());
+    let Some(callers) = snap
+        .analysis
+        .incoming_calls(&config, FilePosition { file_id, offset: function_name_range.start() })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut result = Vec::new();
+    for caller in callers {
+        let caller_name = caller.target.name.to_string();
+        for range in caller.ranges {
+            if result.len() >= limit {
+                return Ok(result);
+            }
+            let is_local = snap
+                .analysis
+                .source_root_id(range.file_id)
+                .and_then(|root| snap.analysis.is_local_source_root(root))
+                .unwrap_or(false);
+            if !is_local {
+                continue;
+            }
+            let call_line_index = snap.file_line_index(range.file_id)?;
+            result.push(lsp_ext::OwnershipWorkspaceSite {
+                problem_id: selected_problem_id.map(str::to_owned),
+                role: "caller_constraint".to_owned(),
+                location: Location {
+                    uri: to_proto::url(snap, range.file_id),
+                    range: to_proto::range(&call_line_index, range.range),
+                },
+                label: format!("Caller `{caller_name}` uses this function"),
+                relationship: "A signature or receiver repair may require this caller to change."
+                    .to_owned(),
+                precision: "resolved_call".to_owned(),
+                selected: false,
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn ownership_intent_question(category: &str) -> Option<lsp_ext::OwnershipIntentQuestion> {
+    let choice = |id: &str, label: &str, consequence: &str| lsp_ext::OwnershipIntentChoice {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        consequence: consequence.to_owned(),
+    };
+    match category {
+        "use_after_move" | "partial_move" | "move_while_borrowed" => {
+            Some(lsp_ext::OwnershipIntentQuestion {
+                id: "retain_after_transfer".to_owned(),
+                prompt: "Should the original caller still use this value after the call?"
+                    .to_owned(),
+                choices: vec![
+                    choice(
+                        "transfer",
+                        "No, transfer it",
+                        "Keep the move and stop using the original binding.",
+                    ),
+                    choice(
+                        "borrow",
+                        "Yes, lend it temporarily",
+                        "Change the call boundary to borrow when the callee does not need ownership.",
+                    ),
+                    choice(
+                        "duplicate_or_share",
+                        "Yes, duplicate or share",
+                        "Compare an independent clone with shared ownership and their runtime costs.",
+                    ),
+                ],
+            })
+        }
+        "immutable_mutation" => Some(lsp_ext::OwnershipIntentQuestion {
+            id: "mutation_owner".to_owned(),
+            prompt: "Who should be allowed to change this value?".to_owned(),
+            choices: vec![
+                choice(
+                    "unique",
+                    "One mutable owner",
+                    "Prefer `mut` or `&mut`; this keeps mutation checked at compile time.",
+                ),
+                choice(
+                    "shared_local",
+                    "Several same-thread owners",
+                    "Consider `Rc<RefCell<_>>`; borrow conflicts become runtime checks.",
+                ),
+                choice(
+                    "shared_threads",
+                    "Owners on multiple threads",
+                    "Consider `Arc<Mutex<_>>` or `Arc<RwLock<_>>`; locking changes runtime behavior.",
+                ),
+            ],
+        }),
+        "multiple_mutable_borrows" | "mutable_while_shared" | "assign_while_borrowed" => {
+            Some(lsp_ext::OwnershipIntentQuestion {
+                id: "old_view_needed".to_owned(),
+                prompt: "Is the earlier reference still needed after this mutation?".to_owned(),
+                choices: vec![
+                    choice(
+                        "end_first",
+                        "No, end it first",
+                        "Shorten the borrow or reorder operations before adding a wrapper.",
+                    ),
+                    choice(
+                        "snapshot",
+                        "Yes, keep a snapshot",
+                        "Copy or clone only the data that must survive the mutation.",
+                    ),
+                    choice(
+                        "shared_runtime",
+                        "Yes, share live state",
+                        "Interior mutability or locking may be appropriate, with runtime trade-offs.",
+                    ),
+                ],
+            })
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn handle_ownership_repair(
@@ -3608,45 +4266,6 @@ fn ownership_repair_id(strategy: OwnershipWrapperFix, index: usize) -> String {
     format!("{}-{index}", ownership_wrapper_code(strategy))
 }
 
-fn ownership_alternatives(
-    snap: &GlobalStateSnapshot,
-    uri: &Uri,
-    file_id: FileId,
-    line_index: &LineIndex,
-    request_range: Range,
-    selected: Option<&OwnershipEvent>,
-) -> anyhow::Result<Option<String>> {
-    let fixes = ownership_fixes_at(snap, file_id, request_range, selected);
-    if fixes.is_empty() {
-        return Ok(None);
-    }
-
-    let source = snap.analysis.file_text(file_id)?;
-    let mut rendered = String::from("**Ownership alternatives (compiler validated)**");
-    let mut seen = Vec::new();
-    let mut alternatives = 0;
-    for fix in fixes {
-        let Some(strategy) = fix.ownership_wrapper else { continue };
-        if strategy == OwnershipWrapperFix::All || seen.contains(&strategy) {
-            continue;
-        }
-        let Some(diff) = ownership_fix_diff(&source, line_index, uri, fix) else { continue };
-        seen.push(strategy);
-        alternatives += 1;
-        let title = fix.action.title.trim_end_matches(" (compiler validated)");
-        format_to!(
-            rendered,
-            "\n\n**{title}**  \n_{}_\n\n```diff\n{diff}\n```",
-            strategy.runtime_semantics(),
-        );
-    }
-    if alternatives == 0 {
-        return Ok(None);
-    }
-    rendered.push_str("\n\nPress `Ctrl+.` on the highlighted value to apply an alternative.");
-    Ok(Some(rendered))
-}
-
 fn ownership_fixes_at<'a>(
     snap: &'a GlobalStateSnapshot,
     file_id: FileId,
@@ -3792,6 +4411,86 @@ struct OwnershipPreviewEdit {
     end_line: u32,
 }
 
+struct OwnershipFixPreview {
+    diff: String,
+    affected_files: Vec<String>,
+    complete: bool,
+}
+
+fn ownership_fix_uris(fix: &Fix) -> Vec<Uri> {
+    let Some(edit) = fix.action.edit.as_ref() else { return Vec::new() };
+    let mut uris = edit
+        .changes
+        .iter()
+        .flat_map(|changes| changes.keys().cloned())
+        .chain(edit.document_changes.iter().flatten().filter_map(|change| match change {
+            lsp_ext::SnippetDocumentChangeOperation::Edit(edit) => {
+                Some(edit.text_document.text_document_identifier.uri.clone())
+            }
+            lsp_ext::SnippetDocumentChangeOperation::Change(
+                lsp_types::DocumentChange::TextDocumentEdit(edit),
+            ) => Some(edit.text_document.text_document_identifier.uri.clone()),
+            lsp_ext::SnippetDocumentChangeOperation::Change(_) => None,
+        }))
+        .collect::<Vec<_>>();
+    uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    uris.dedup();
+    uris
+}
+
+fn ownership_fix_file_label(uri: &Uri) -> String {
+    uri.to_file_path()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| uri.as_str().to_owned())
+}
+
+fn ownership_workspace_fix_diff(
+    snap: &GlobalStateSnapshot,
+    current_source: &str,
+    current_line_index: &LineIndex,
+    current_uri: &Uri,
+    fix: &Fix,
+) -> Option<OwnershipFixPreview> {
+    let uris = ownership_fix_uris(fix);
+    if uris.is_empty() {
+        return None;
+    }
+    let mut complete = true;
+    let mut sections = Vec::new();
+    let affected_files = uris.iter().map(ownership_fix_file_label).collect::<Vec<_>>();
+    for uri in &uris {
+        let diff = if uri == current_uri {
+            ownership_fix_diff(current_source, current_line_index, uri, fix)
+        } else {
+            let file_id = from_proto::file_id(snap, uri).ok().flatten();
+            file_id.and_then(|file_id| {
+                let source = snap.analysis.file_text(file_id).ok()?;
+                let line_index = snap.file_line_index(file_id).ok()?;
+                ownership_fix_diff(&source, &line_index, uri, fix)
+            })
+        };
+        if let Some(diff) = diff {
+            if uris.len() > 1 {
+                sections.push(format!(
+                    "--- {}\n+++ {}\n{diff}",
+                    ownership_fix_file_label(uri),
+                    ownership_fix_file_label(uri)
+                ));
+            } else {
+                sections.push(diff);
+            }
+        } else {
+            complete = false;
+        }
+    }
+    (!sections.is_empty()).then(|| OwnershipFixPreview {
+        diff: sections.join("\n\n"),
+        affected_files,
+        complete,
+    })
+}
+
 fn ownership_fix_diff(
     source: &str,
     line_index: &LineIndex,
@@ -3806,15 +4505,32 @@ fn ownership_fix_diff(
             .document_changes
             .as_ref()?
             .iter()
-            .filter_map(|change| match change {
+            .flat_map(|change| match change {
                 lsp_ext::SnippetDocumentChangeOperation::Edit(edit)
                     if &edit.text_document.text_document_identifier.uri == uri =>
                 {
-                    Some(edit.edits.iter().map(|edit| (edit.range, edit.new_text.clone())))
+                    edit.edits
+                        .iter()
+                        .map(|edit| (edit.range, edit.new_text.clone()))
+                        .collect::<Vec<_>>()
                 }
-                _ => None,
+                lsp_ext::SnippetDocumentChangeOperation::Change(
+                    lsp_types::DocumentChange::TextDocumentEdit(edit),
+                ) if &edit.text_document.text_document_identifier.uri == uri => edit
+                    .edits
+                    .iter()
+                    .map(|edit| match edit {
+                        lsp_types::Edit::TextEdit(edit) => (edit.range, edit.new_text.clone()),
+                        lsp_types::Edit::AnnotatedTextEdit(edit) => {
+                            (edit.text_edit.range, edit.text_edit.new_text.clone())
+                        }
+                        lsp_types::Edit::SnippetTextEdit(edit) => {
+                            (edit.range, edit.snippet.value.clone())
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
             })
-            .flatten()
             .collect::<Vec<_>>()
     };
     let mut edits = source_edits
@@ -3907,22 +4623,6 @@ fn ownership_diff_hunk(source: &str, edits: &[&OwnershipPreviewEdit]) -> Option<
         lines.push(format!(" {}", source.get(context_start..context_end)?));
     }
     Some(lines)
-}
-
-fn ownership_timeline(
-    events: &[crate::diagnostics::OwnershipEvent],
-    selected: &crate::diagnostics::OwnershipEvent,
-) -> String {
-    let timeline = events
-        .iter()
-        .filter(|event| event.name == selected.name)
-        .map(|event| {
-            let detail =
-                event.detail.as_deref().map(|detail| format!(" — {detail}")).unwrap_or_default();
-            format!("- line {}: **{}**{detail}", event.range.start.line + 1, event.kind.label(),)
-        })
-        .join("\n");
-    format!("**Ownership timeline for `{}` (compiler MIR)**\n\n{timeline}", selected.name)
 }
 
 pub(crate) fn handle_prepare_rename(
@@ -4479,8 +5179,81 @@ pub(crate) fn handle_inlay_hints(
             },
         ));
     }
+    if snap.config.ownership_method_coach_enabled(None) {
+        hints.extend(ownership_method_coach_hints(&snap, file_id, range, &line_index)?);
+    }
     hints.sort_by_key(|hint| hint.position);
     Ok(Some(hints))
+}
+
+fn ownership_method_coach_hints(
+    snap: &GlobalStateSnapshot,
+    file_id: FileId,
+    range: TextRange,
+    line_index: &LineIndex,
+) -> Cancellable<Vec<InlayHint>> {
+    let insights = snap.analysis.ownership_call_insights_in_range(FileRange { file_id, range })?;
+    Ok(insights
+        .into_iter()
+        .take(64)
+        .map(|insight| {
+            let call_range = to_proto::range(line_index, insight.range);
+            let operation_id = format!(
+                "method-coach-{}-{}-{}",
+                u32::from(insight.range.start()),
+                u32::from(insight.range.end()),
+                insight.name
+            );
+            InlayHint {
+                position: call_range.end,
+                label: lsp_types::Label::String(method_coach_label(&insight)),
+                kind: None,
+                text_edits: None,
+                // The visible-range response carries only source coordinates and a compact label.
+                // Explanatory prose is generated when this exact clue is hovered.
+                tooltip: None,
+                padding_left: Some(true),
+                padding_right: Some(false),
+                data: Some(json!({
+                    "rustWorkbench": {
+                        "version": 4,
+                        "category": "method_coach",
+                        "precision": insight.provenance,
+                        "operationId": operation_id,
+                        "operationName": insight.name,
+                        "fileId": file_id.index(),
+                        "fileVersion": snap.file_version(file_id),
+                        "focusRange": call_range,
+                    }
+                })),
+            }
+        })
+        .collect())
+}
+
+fn method_coach_label(insight: &ide::OwnershipCallInsight) -> String {
+    let access = match insight.required_access.as_str() {
+        "mutable_borrow" => "needs &mut",
+        "move" => "takes self",
+        _ if insight.argument_flows.iter().any(|argument| argument.transfer == "move") => {
+            "moves an input"
+        }
+        _ if matches!(
+            insight.return_flow.kind.as_str(),
+            "shared_reference" | "mutable_reference" | "guard" | "iterator_borrow"
+        ) =>
+        {
+            "returns access"
+        }
+        _ => "ownership effect",
+    };
+    let detail = insight
+        .argument_flows
+        .iter()
+        .find(|argument| argument.transfer == "move")
+        .map(|argument| format!(" · moves {}", argument.expression))
+        .unwrap_or_default();
+    format!("Explain · {access}{detail}")
 }
 
 #[derive(Clone, Copy)]
@@ -4712,6 +5485,14 @@ pub(crate) fn handle_inlay_hints_resolve(
     let Some(data) = original_hint.data.take() else {
         return Ok(original_hint);
     };
+    if let Some(tooltip) = resolve_method_coach_tooltip(&snap, &data)? {
+        original_hint.tooltip = Some(lsp_types::Tooltip::MarkupContent(lsp_types::MarkupContent {
+            kind: lsp_types::MarkupKind::Markdown,
+            value: tooltip,
+        }));
+        original_hint.data = Some(data);
+        return Ok(original_hint);
+    }
     if let Some(tooltip) = data.get("rustWorkbenchTooltip").and_then(|value| value.as_str()) {
         original_hint.tooltip = Some(lsp_types::Tooltip::MarkupContent(lsp_types::MarkupContent {
             kind: lsp_types::MarkupKind::Markdown,
@@ -4767,6 +5548,107 @@ pub(crate) fn handle_inlay_hints_resolve(
         .filter(|hint| hint.position == original_hint.position)
         .filter(|hint| hint.kind == original_hint.kind)
         .unwrap_or(original_hint))
+}
+
+fn resolve_method_coach_tooltip(
+    snap: &GlobalStateSnapshot,
+    data: &serde_json::Value,
+) -> anyhow::Result<Option<String>> {
+    let Some(metadata) = data.get("rustWorkbench") else { return Ok(None) };
+    if metadata.get("version").and_then(|value| value.as_u64()) != Some(4)
+        || metadata.get("category").and_then(|value| value.as_str()) != Some("method_coach")
+    {
+        return Ok(None);
+    }
+    let Some(raw_file_id) = metadata.get("fileId").and_then(|value| value.as_u64()) else {
+        return Ok(None);
+    };
+    let Ok(raw_file_id) = u32::try_from(raw_file_id) else { return Ok(None) };
+    let file_id = FileId::from_raw(raw_file_id);
+    if !snap.file_exists(file_id) {
+        return Ok(None);
+    }
+    let expected_version = metadata.get("fileVersion").and_then(|value| value.as_i64());
+    let current_version = snap.file_version(file_id).map(i64::from);
+    if expected_version != current_version {
+        tracing::warn!("Method coach inlay resolve data is outdated");
+        return Ok(None);
+    }
+    let Some(focus_range) = metadata.get("focusRange") else { return Ok(None) };
+    let focus_range: Range = serde_json::from_value(focus_range.clone())?;
+    let line_index = snap.file_line_index(file_id)?;
+    let source_range = from_proto::text_range(&line_index, focus_range)?;
+    let insights = snap
+        .analysis
+        .ownership_call_insights(FilePosition { file_id, offset: source_range.start() })?;
+    let operation_name = metadata.get("operationName").and_then(|value| value.as_str());
+    let insight = insights.into_iter().find(|insight| {
+        insight.range == source_range && operation_name.is_none_or(|name| insight.name == name)
+    });
+    Ok(insight.map(|insight| format_method_coach_tooltip(&insight)))
+}
+
+fn format_method_coach_tooltip(insight: &ide::OwnershipCallInsight) -> String {
+    let mut markdown = format!(
+        "**Rust Workbench · Method effect**\n\n`{}`\n\n{}\n\n",
+        insight.signature, insight.summary
+    );
+    markdown.push_str("| Value before the call | Crossing the call boundary | After the call |\n");
+    markdown.push_str("|---|---|---|\n");
+    if let Some(receiver) = &insight.receiver_flow {
+        format_to!(
+            markdown,
+            "| receiver `{}` | **{}** | {} |\n",
+            markdown_cell(&receiver.expression),
+            receiver.transfer.replace('_', " "),
+            markdown_cell(&receiver.after),
+        );
+    }
+    for argument in insight.argument_flows.iter().take(6) {
+        format_to!(
+            markdown,
+            "| argument `{}`: `{}` | **{}** into `{}` | {} |\n",
+            argument.index + 1,
+            markdown_cell(&argument.expression),
+            argument.transfer.replace('_', " "),
+            markdown_cell(&argument.parameter_type),
+            markdown_cell(&argument.after),
+        );
+    }
+    format_to!(
+        markdown,
+        "\n**Returned path**\n\n`{}` → **{}**{}\n\n{}\n\n",
+        insight.return_flow.type_name,
+        insight.return_flow.kind.replace('_', " "),
+        insight
+            .return_flow
+            .borrowed_from
+            .as_ref()
+            .map(|source| format!(" → borrows from `{source}`"))
+            .unwrap_or_default(),
+        insight.return_flow.after,
+    );
+    if !insight.effect_facts.is_empty() {
+        markdown.push_str("**What the operation can do**\n\n");
+        for effect in insight.effect_facts.iter().take(3) {
+            format_to!(
+                markdown,
+                "- **{}:** {} _({})_\n",
+                effect.kind.replace('_', " "),
+                effect.summary,
+                effect.certainty.replace('_', " "),
+            );
+        }
+        markdown.push('\n');
+    }
+    markdown.push_str(
+        "Click this clue to open the full **Rust Learning Debugger** at this exact call.",
+    );
+    markdown
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
 }
 
 fn rust_workbench_metadata_only_inlay_data(data: &serde_json::Value) -> bool {
@@ -5775,6 +6657,40 @@ fn ownership_wrapper_preview_renders_multipart_diff() {
 }
 
 #[test]
+fn ownership_wrapper_preview_enumerates_every_edited_file() {
+    let first_uri: Uri = "file:///test/src/analytics.rs".parse().unwrap();
+    let second_uri: Uri = "file:///test/src/report.rs".parse().unwrap();
+    let mut fix = ownership_preview_test_fix(
+        &first_uri,
+        OwnershipWrapperFix::Rc,
+        vec![lsp_types::TextEdit::new(
+            Range::new(Position::new(0, 4), Position::new(0, 7)),
+            "Rc<T>".into(),
+        )],
+    );
+    fix.action.edit.as_mut().unwrap().changes.as_mut().unwrap().insert(
+        second_uri.clone(),
+        vec![lsp_types::TextEdit::new(
+            Range::new(Position::new(0, 10), Position::new(0, 15)),
+            "value.clone()".into(),
+        )],
+    );
+
+    let uris = ownership_fix_uris(&fix);
+    assert_eq!(uris, vec![first_uri.clone(), second_uri.clone()]);
+    let first = "let Box<T> = value;\n";
+    let second = "let out = value;\n";
+    let first_diff =
+        ownership_fix_diff(first, &ownership_preview_test_line_index(first), &first_uri, &fix)
+            .unwrap();
+    let second_diff =
+        ownership_fix_diff(second, &ownership_preview_test_line_index(second), &second_uri, &fix)
+            .unwrap();
+    assert!(first_diff.contains("Rc<T>"), "{first_diff}");
+    assert!(second_diff.contains("value.clone()"), "{second_diff}");
+}
+
+#[test]
 fn ownership_wrapper_preview_rejects_overlapping_edits() {
     let source = "let value = Box::new(1);\n";
     let uri: Uri = "file:///test/src/main.rs".parse().unwrap();
@@ -6076,6 +6992,11 @@ fn ownership_value_trace_distinguishes_move_copy_and_rc_clone() {
         alternatives: Vec::new(),
         provenance: "resolved_signature".to_owned(),
         truncated: false,
+        summary: String::new(),
+        ownership_relevant: true,
+        receiver_flow: None,
+        argument_flows: Vec::new(),
+        return_flow: None,
     }];
 
     let trace = ownership_value_trace(&events, &operations);
@@ -6199,6 +7120,11 @@ fn bounded_ownership_model_protocol_marks_large_responses() {
             }],
             provenance: "signature_docs_and_trusted_catalog".to_owned(),
             truncated: false,
+            summary: String::new(),
+            ownership_relevant: true,
+            receiver_flow: None,
+            argument_flows: Vec::new(),
+            return_flow: None,
         }],
         mutation_requirement: Some(lsp_ext::OwnershipMutationRequirement {
             target_place: "self.events".to_owned(),
@@ -6295,6 +7221,11 @@ fn ownership_immutable_mutation_requirement_keeps_field_target_and_shared_self_d
         alternatives: Vec::new(),
         provenance: "resolved_signature".to_owned(),
         truncated: false,
+        summary: String::new(),
+        ownership_relevant: true,
+        receiver_flow: None,
+        argument_flows: Vec::new(),
+        return_flow: None,
     };
     let file = syntax::SourceFile::parse(source, syntax::Edition::CURRENT).ok().unwrap();
     let requirement =
@@ -6354,6 +7285,11 @@ fn ownership_immutable_mutation_requirement_follows_binding_to_later_call() {
         alternatives: Vec::new(),
         provenance: "resolved_signature".to_owned(),
         truncated: false,
+        summary: String::new(),
+        ownership_relevant: true,
+        receiver_flow: None,
+        argument_flows: Vec::new(),
+        return_flow: None,
     };
     let file = syntax::SourceFile::parse(source, syntax::Edition::CURRENT).ok().unwrap();
     let requirement =
@@ -6407,6 +7343,11 @@ fn ownership_immutable_mutation_requirement_names_shared_owner_receiver() {
         alternatives: Vec::new(),
         provenance: "resolved_signature".to_owned(),
         truncated: false,
+        summary: String::new(),
+        ownership_relevant: true,
+        receiver_flow: None,
+        argument_flows: Vec::new(),
+        return_flow: None,
     };
     let file = syntax::SourceFile::parse(source, syntax::Edition::CURRENT).ok().unwrap();
     let requirement =
@@ -6439,6 +7380,70 @@ fn ownership_model_protocol_accepts_pre_graph_responses() {
     let model: lsp_ext::OwnershipModelResult = serde_json::from_value(json).unwrap();
     assert!(model.conflict_graph.is_none());
     assert!(model.value_trace.is_empty());
+}
+
+#[test]
+fn method_coach_clue_is_compact_and_progressive_card_uses_structured_flows() {
+    let insight = ide::OwnershipCallInsight {
+        range: TextRange::new(TextSize::from(10), TextSize::from(34)),
+        name: "push".to_owned(),
+        signature: "fn push(&mut self, value: String)".to_owned(),
+        receiver_type: Some("Vec<String>".to_owned()),
+        required_access: "mutable_borrow".to_owned(),
+        available_access: "exclusive path available".to_owned(),
+        why_required: "push can change the vector's length and allocation".to_owned(),
+        documentation: None,
+        effects: vec!["Adds one element and may reallocate.".to_owned()],
+        effect_facts: vec![ide::OwnershipCallEffect {
+            kind: "allocation".to_owned(),
+            summary: "Adds one element and may reallocate.".to_owned(),
+            certainty: "trusted_standard_library_catalog".to_owned(),
+        }],
+        call_chain: vec!["push".to_owned()],
+        alternatives: Vec::new(),
+        provenance: "signature_docs_and_trusted_catalog".to_owned(),
+        truncated: false,
+        summary:
+            "`push` temporarily needs exclusive access and moves 1 argument(s); it returns `()`."
+                .to_owned(),
+        ownership_relevant: true,
+        receiver_flow: Some(ide::OwnershipCallReceiver {
+            expression: "events".to_owned(),
+            range: TextRange::new(TextSize::from(10), TextSize::from(16)),
+            transfer: "mutable_borrow".to_owned(),
+            after: "Usable again when the borrow ends.".to_owned(),
+            provenance: "resolved_self_parameter".to_owned(),
+        }),
+        argument_flows: vec![ide::OwnershipCallArgument {
+            index: 0,
+            expression: "event".to_owned(),
+            range: TextRange::new(TextSize::from(28), TextSize::from(33)),
+            parameter_type: "String".to_owned(),
+            transfer: "move".to_owned(),
+            after: "The original place is unavailable.".to_owned(),
+            provenance: "resolved_parameter_type".to_owned(),
+        }],
+        return_flow: ide::OwnershipCallReturn {
+            type_name: "()".to_owned(),
+            kind: "unit".to_owned(),
+            borrowed_from: None,
+            after: "Returns no value; the vector itself changes.".to_owned(),
+            provenance: "resolved_return_type".to_owned(),
+        },
+    };
+
+    let label = method_coach_label(&insight);
+    assert_eq!(label, "Explain · needs &mut · moves event");
+    assert!(label.len() < 64);
+    assert!(!label.contains("Usable again"));
+
+    let card = format_method_coach_tooltip(&insight);
+    assert!(card.contains("Value before the call"));
+    assert!(card.contains("receiver `events`"));
+    assert!(card.contains("argument `1`: `event`"));
+    assert!(card.contains("**move** into `String`"));
+    assert!(card.contains("The original place is unavailable"));
+    assert!(card.contains("Click this clue"));
 }
 
 #[test]

@@ -1,8 +1,9 @@
 use hir::{Access, CallableKind, Function, HirDisplay, Semantics};
-use ide_db::{FilePosition, FxHashSet, RootDatabase, documentation::HasDocs};
+use ide_db::{FilePosition, FileRange, FxHashSet, RootDatabase, documentation::HasDocs};
+use itertools::Itertools;
 use syntax::{
     AstNode, SourceFile, TextRange, TextSize,
-    ast::{self},
+    ast::{self, HasArgList},
 };
 
 const MAX_CALLS: usize = 16;
@@ -10,6 +11,9 @@ const MAX_BODY_DEPTH: usize = 4;
 const MAX_BODY_FUNCTIONS: usize = 64;
 const MAX_EFFECTS: usize = 256;
 const MAX_DOC_CHARS: usize = 600;
+const MAX_EXPRESSION_CHARS: usize = 120;
+const MAX_RANGE_CALLS: usize = 64;
+const MAX_RANGE_CANDIDATES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnershipCallAlternative {
@@ -36,6 +40,11 @@ pub struct OwnershipCallInsight {
     pub alternatives: Vec<OwnershipCallAlternative>,
     pub provenance: String,
     pub truncated: bool,
+    pub summary: String,
+    pub ownership_relevant: bool,
+    pub receiver_flow: Option<OwnershipCallReceiver>,
+    pub argument_flows: Vec<OwnershipCallArgument>,
+    pub return_flow: OwnershipCallReturn,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +52,35 @@ pub struct OwnershipCallEffect {
     pub kind: String,
     pub summary: String,
     pub certainty: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnershipCallReceiver {
+    pub expression: String,
+    pub range: TextRange,
+    pub transfer: String,
+    pub after: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnershipCallArgument {
+    pub index: usize,
+    pub expression: String,
+    pub range: TextRange,
+    pub parameter_type: String,
+    pub transfer: String,
+    pub after: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnershipCallReturn {
+    pub type_name: String,
+    pub kind: String,
+    pub borrowed_from: Option<String>,
+    pub after: String,
+    pub provenance: String,
 }
 
 pub(crate) fn ownership_call_insights(
@@ -77,6 +115,37 @@ pub(crate) fn ownership_call_insights_for_positions(
         .take(MAX_CALLS * positions.len().min(64))
         .filter_map(|call| explain_call(&sema, call))
         .collect()
+}
+
+pub(crate) fn ownership_call_insights_in_range(
+    db: &RootDatabase,
+    file_range: FileRange,
+) -> Vec<OwnershipCallInsight> {
+    let sema = Semantics::new(db);
+    let file = sema.parse_guess_edition(file_range.file_id);
+    let mut calls = file
+        .syntax()
+        .descendants()
+        .filter_map(|node| {
+            ast::MethodCallExpr::cast(node.clone())
+                .map(CallSyntax::Method)
+                .or_else(|| ast::CallExpr::cast(node).map(CallSyntax::Function))
+        })
+        .filter(|call| ranges_overlap(call.range(), file_range.range))
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|call| (call.range().start(), call.range().end()));
+    calls.dedup_by_key(|call| call.range());
+    calls
+        .into_iter()
+        .take(MAX_RANGE_CANDIDATES)
+        .filter_map(|call| explain_call(&sema, call))
+        .filter(|insight| insight.ownership_relevant)
+        .take(MAX_RANGE_CALLS)
+        .collect()
+}
+
+fn ranges_overlap(left: TextRange, right: TextRange) -> bool {
+    left.start() <= right.end() && right.start() <= left.end()
 }
 
 fn calls_at_position(file: &SourceFile, offset: TextSize) -> Vec<CallSyntax> {
@@ -130,6 +199,15 @@ impl CallSyntax {
             CallSyntax::Function(call) => call.syntax().text_range(),
         }
     }
+
+    fn arguments(&self) -> Vec<ast::Expr> {
+        match self {
+            CallSyntax::Method(call) => call.arg_list(),
+            CallSyntax::Function(call) => call.arg_list(),
+        }
+        .map(|arguments| arguments.args().collect())
+        .unwrap_or_default()
+    }
 }
 
 fn explain_call(
@@ -172,7 +250,8 @@ fn explain_call(
         &mut call_chain,
         &mut truncated,
     );
-    if effects.is_empty() {
+    let used_signature_contract = effects.is_empty();
+    if used_signature_contract {
         effects.extend(contract_effects(&required_access, function.is_async(db)));
     }
     if let Some(effect) = known_effect(receiver_type.as_deref(), &name) {
@@ -181,13 +260,15 @@ fn explain_call(
     effects.dedup();
     effects.truncate(MAX_EFFECTS);
     let catalog_effect = known_effect(receiver_type.as_deref(), &name);
-    let effect_facts = effects
+    let effect_facts: Vec<OwnershipCallEffect> = effects
         .iter()
         .map(|effect| OwnershipCallEffect {
             kind: effect_kind(effect, &required_access).to_owned(),
             summary: effect.clone(),
             certainty: if catalog_effect == Some(effect.as_str()) {
                 "trusted_standard_library_catalog"
+            } else if used_signature_contract {
+                "signature_contract"
             } else if function.module(db).krate(db).origin(db).is_local() {
                 "workspace_source_analysis"
             } else {
@@ -196,6 +277,83 @@ fn explain_call(
             .to_owned(),
         })
         .collect();
+    let receiver_flow = receiver.as_ref().map(|receiver| {
+        let receiver_is_copy =
+            sema.type_of_expr(receiver).is_some_and(|ty| ty.original.is_copy(db));
+        OwnershipCallReceiver {
+            expression: bounded_expression(receiver.syntax().text().to_string()),
+            range: receiver.syntax().text_range(),
+            transfer: required_access.clone(),
+            after: match required_access.as_str() {
+                "move" if receiver_is_copy => {
+                    "Copied into the call; the original receiver remains usable.".to_owned()
+                }
+                "move" => {
+                    "Moved into the call; this receiver place is unavailable afterward.".to_owned()
+                }
+                "mutable_borrow" => {
+                    "Exclusively borrowed for the call, then usable again when that borrow ends."
+                        .to_owned()
+                }
+                _ => "Shared-borrowed for the call, then usable again when that borrow ends."
+                    .to_owned(),
+            },
+            provenance: "resolved_self_parameter".to_owned(),
+        }
+    });
+    let parameter_types = function.params_without_self(db);
+    let argument_flows = call
+        .arguments()
+        .into_iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            let parameter_type = parameter_types
+                .get(index)
+                .map(|parameter| parameter.ty().display(db, display_target).to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let is_copy = sema.type_of_expr(&argument).is_some_and(|ty| ty.original.is_copy(db));
+            let transfer = parameter_transfer(&parameter_type, is_copy);
+            OwnershipCallArgument {
+                index,
+                expression: bounded_expression(argument.syntax().text().to_string()),
+                range: argument.syntax().text_range(),
+                parameter_type,
+                transfer: transfer.to_owned(),
+                after: transfer_after(transfer),
+                provenance: if transfer == "unknown" {
+                    "unresolved_argument_contract"
+                } else {
+                    "resolved_parameter_type"
+                }
+                .to_owned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let return_type = function.ret_type(db).display(db, display_target).to_string();
+    let return_kind = return_kind(&return_type, receiver_type.as_deref(), &name);
+    let borrowed_from = match return_kind {
+        "shared_reference" | "mutable_reference" | "guard" | "iterator_borrow"
+            if receiver.is_some() =>
+        {
+            receiver_flow.as_ref().map(|receiver| receiver.expression.clone())
+        }
+        _ => None,
+    };
+    let return_flow = OwnershipCallReturn {
+        type_name: return_type.clone(),
+        kind: return_kind.to_owned(),
+        borrowed_from,
+        after: return_explanation(return_kind, &return_type),
+        provenance: "resolved_return_type".to_owned(),
+    };
+    let ownership_relevant = call_is_ownership_relevant(
+        &required_access,
+        &argument_flows,
+        &return_flow,
+        &effect_facts,
+        &name,
+    );
+    let summary = call_summary(&name, &required_access, &argument_flows, &return_flow);
 
     Some(OwnershipCallInsight {
         range,
@@ -216,7 +374,150 @@ fn explain_call(
             "signature_docs_and_trusted_catalog".to_owned()
         },
         truncated,
+        summary,
+        ownership_relevant,
+        receiver_flow,
+        argument_flows,
+        return_flow,
     })
+}
+
+fn bounded_expression(expression: String) -> String {
+    let compact = expression.split_whitespace().join(" ");
+    let mut bounded = compact.chars().take(MAX_EXPRESSION_CHARS).collect::<String>();
+    if compact.chars().count() > MAX_EXPRESSION_CHARS {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn parameter_transfer(parameter_type: &str, is_copy: bool) -> &'static str {
+    let parameter_type = parameter_type.trim_start();
+    if parameter_type.starts_with("&mut ") {
+        "mutable_borrow"
+    } else if parameter_type.starts_with('&') {
+        "shared_borrow"
+    } else if parameter_type == "unknown" {
+        "unknown"
+    } else if is_copy {
+        "copy"
+    } else {
+        "move"
+    }
+}
+
+fn transfer_after(transfer: &str) -> String {
+    match transfer {
+        "mutable_borrow" => {
+            "Exclusively borrowed during the call; usable again after the borrow ends.".to_owned()
+        }
+        "shared_borrow" => {
+            "Shared-borrowed during the call; ownership stays with the caller.".to_owned()
+        }
+        "copy" => "Copied into the parameter; the original remains usable.".to_owned(),
+        "move" => {
+            "Ownership moves into the parameter; the original place is unavailable.".to_owned()
+        }
+        _ => "The analyzer could not prove how this argument crosses the call boundary.".to_owned(),
+    }
+}
+
+fn return_kind(return_type: &str, receiver_type: Option<&str>, name: &str) -> &'static str {
+    let ty = return_type.trim();
+    if ty == "()" {
+        "unit"
+    } else if ty.contains("RefMut<")
+        || ty.contains("Ref<")
+        || ty.contains("MutexGuard<")
+        || ty.contains("RwLockReadGuard<")
+        || ty.contains("RwLockWriteGuard<")
+    {
+        "guard"
+    } else if ty.contains("&mut ") {
+        "mutable_reference"
+    } else if ty.contains('&') {
+        "shared_reference"
+    } else if matches!(name, "iter" | "iter_mut" | "drain") && receiver_type.is_some() {
+        "iterator_borrow"
+    } else if ty.starts_with("Option<") {
+        "option"
+    } else if ty.starts_with("Result<") {
+        "result"
+    } else if ty == "unknown" {
+        "unknown"
+    } else {
+        "owned"
+    }
+}
+
+fn return_explanation(kind: &str, return_type: &str) -> String {
+    match kind {
+        "unit" => "Returns no value; any observable result is an effect on existing state."
+            .to_owned(),
+        "shared_reference" => {
+            "Returns shared access tied to an input lifetime; it does not create a new owner."
+                .to_owned()
+        }
+        "mutable_reference" => {
+            "Returns exclusive access tied to an input lifetime; the source remains borrowed while it is live."
+                .to_owned()
+        }
+        "guard" => "Returns a runtime access guard; keep it only as long as the protected access is needed."
+            .to_owned(),
+        "iterator_borrow" => "Returns an iterator that keeps its source borrowed while the iterator is live."
+            .to_owned(),
+        "option" => format!("Returns `{return_type}` so absence is represented explicitly."),
+        "result" => format!("Returns `{return_type}` so failure is represented explicitly."),
+        "owned" => format!("Returns a new owned value of type `{return_type}`."),
+        _ => "The analyzer could not classify the returned value.".to_owned(),
+    }
+}
+
+fn call_is_ownership_relevant(
+    required_access: &str,
+    arguments: &[OwnershipCallArgument],
+    returned: &OwnershipCallReturn,
+    effects: &[OwnershipCallEffect],
+    name: &str,
+) -> bool {
+    if required_access == "shared_borrow"
+        && arguments.is_empty()
+        && matches!(name, "len" | "is_empty" | "capacity" | "strong_count" | "weak_count")
+    {
+        return false;
+    }
+    required_access != "shared_borrow"
+        || arguments
+            .iter()
+            .any(|argument| matches!(argument.transfer.as_str(), "move" | "mutable_borrow"))
+        || matches!(
+            returned.kind.as_str(),
+            "shared_reference" | "mutable_reference" | "guard" | "iterator_borrow"
+        )
+        || effects.iter().any(|effect| {
+            effect.kind != "behavior"
+                && !(required_access == "shared_borrow"
+                    && effect.kind == "borrow"
+                    && effect.certainty == "signature_contract")
+        })
+        || matches!(name, "clone" | "downgrade" | "upgrade" | "make_mut")
+}
+
+fn call_summary(
+    name: &str,
+    required_access: &str,
+    arguments: &[OwnershipCallArgument],
+    returned: &OwnershipCallReturn,
+) -> String {
+    let receiver = match required_access {
+        "mutable_borrow" => "temporarily needs exclusive access",
+        "move" => "takes ownership of its receiver",
+        "shared_borrow" => "reads through shared access",
+        _ => "follows its parameter ownership contracts",
+    };
+    let moved = arguments.iter().filter(|argument| argument.transfer == "move").count();
+    let moved = if moved == 0 { String::new() } else { format!(" and moves {moved} argument(s)") };
+    format!("`{name}` {receiver}{moved}; it returns `{}`.", returned.type_name)
 }
 
 fn effect_kind(effect: &str, required_access: &str) -> &'static str {
@@ -231,7 +532,7 @@ fn effect_kind(effect: &str, required_access: &str) -> &'static str {
         "runtime_check"
     } else if effect.contains("consume") || required_access == "move" {
         "ownership_transfer"
-    } else if effect.contains("borrow") || required_access.ends_with("borrow") {
+    } else if effect.contains("borrow") {
         "borrow"
     } else if effect.contains("mutat") || effect.contains("assign") || effect.contains("replace") {
         "mutation"
@@ -777,5 +1078,98 @@ impl Analytics {
         let push = insights.iter().find(|insight| insight.name == "push").unwrap();
         assert_eq!(push.required_access, "mutable_borrow");
         assert_eq!(push.receiver_type.as_deref(), Some("Events"));
+    }
+
+    #[test]
+    fn visible_range_reports_real_value_flows_and_skips_neutral_metadata_reads() {
+        let (analysis, range) = fixture::range(
+            r#"
+struct Store(String);
+impl Store {
+    fn push(&mut self, value: String) {}
+    fn peek(&self) -> &String { &self.0 }
+    fn len(&self) -> usize { 0 }
+    fn inspect(&self) {}
+}
+fn main() {$0
+    let mut store = Store(String::new());
+    let value = String::from("event");
+    store.push(value);
+    let current = store.peek();
+    let count = store.len();
+    store.inspect();
+$0}
+"#,
+        );
+        let insights = analysis.ownership_call_insights_in_range(range).unwrap();
+
+        let push = insights.iter().find(|insight| insight.name == "push").unwrap();
+        assert_eq!(push.receiver_flow.as_ref().unwrap().expression, "store");
+        assert_eq!(push.receiver_flow.as_ref().unwrap().transfer, "mutable_borrow");
+        assert_eq!(push.argument_flows[0].expression, "value");
+        assert_eq!(push.argument_flows[0].transfer, "move");
+        assert!(push.argument_flows[0].after.contains("unavailable"));
+        assert_eq!(push.return_flow.kind, "unit");
+
+        let peek = insights.iter().find(|insight| insight.name == "peek").unwrap();
+        assert_eq!(peek.return_flow.kind, "shared_reference");
+        assert_eq!(peek.return_flow.borrowed_from.as_deref(), Some("store"));
+        assert!(!insights.iter().any(|insight| insight.name == "len"));
+        assert!(!insights.iter().any(|insight| insight.name == "inspect"));
+    }
+
+    #[test]
+    fn visible_range_method_coach_work_is_strictly_bounded() {
+        let mut source = String::from(
+            r#"
+struct Store(i32);
+impl Store { fn update(&mut self, value: i32) { self.0 = value; } }
+fn main() {
+    let mut store = Store(0);
+$0
+"#,
+        );
+        for value in 0..160 {
+            source.push_str(&format!("    store.update({value});\n"));
+        }
+        source.push_str("$0}\n");
+        let (analysis, range) = fixture::range(&source);
+        let started = std::time::Instant::now();
+        let insights = analysis.ownership_call_insights_in_range(range).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(insights.len(), super::MAX_RANGE_CALLS);
+        assert!(insights.iter().all(|insight| insight.name == "update"));
+        // This is an unoptimized unit-test build and can share a busy linker/cache host with the
+        // Zed suite. Keep the wall-clock guard loose enough to avoid load-only failures; the
+        // release-mode Workbench benchmark owns the interactive latency budget.
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "bounded visible-range method analysis took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn interior_mutability_guard_is_shown_as_runtime_access_from_the_receiver() {
+        let (analysis, position) = fixture::position(
+            r#"
+struct RefCell<T>(T);
+struct RefMut<'a, T>(&'a mut T);
+impl<T> RefCell<T> {
+    fn borrow_mut(&self) -> RefMut<'_, T> { loop {} }
+}
+fn main() {
+    let cell = RefCell(1_i32);
+    let guard = cell.borrow_$0mut();
+}
+"#,
+        );
+        let insights = analysis.ownership_call_insights(position).unwrap();
+        let borrow_mut = insights.iter().find(|insight| insight.name == "borrow_mut").unwrap();
+
+        assert_eq!(borrow_mut.required_access, "shared_borrow");
+        assert_eq!(borrow_mut.return_flow.kind, "guard");
+        assert_eq!(borrow_mut.return_flow.borrowed_from.as_deref(), Some("cell"));
+        assert!(borrow_mut.effect_facts.iter().any(|effect| effect.kind == "runtime_check"));
     }
 }

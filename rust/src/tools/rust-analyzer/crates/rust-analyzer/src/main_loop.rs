@@ -1759,6 +1759,7 @@ impl GlobalState {
             .on_identity::<RETRY, lsp_ext::CodeActionResolveRequest, _>(handlers::handle_code_action_resolve)
             .on::<NO_RETRY, lsp_ext::HoverRequest>(handlers::handle_hover)
             .on::<NO_RETRY, lsp_ext::OwnershipProblemsRequest>(handlers::handle_ownership_problems)
+            .on::<NO_RETRY, lsp_ext::OwnershipWorkspaceGuideRequest>(handlers::handle_ownership_workspace_guide)
             .on::<NO_RETRY, lsp_ext::OwnershipRepairRequest>(handlers::handle_ownership_repair)
             .on::<NO_RETRY, lsp_ext::OwnershipModelRequest>(handlers::handle_ownership_model)
             .on::<NO_RETRY, lsp_ext::ExternalDocsRequest>(handlers::handle_open_docs)

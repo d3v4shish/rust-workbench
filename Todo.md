@@ -1136,6 +1136,167 @@ Acceptance criteria:
       bundle gates pass.
 - [x] Final changes remain local and unpushed.
 
+## On-demand method coach — implemented 2026-08-19
+
+### COACH-001 — Structured call-boundary facts [P0]
+
+- [x] Resolve the receiver expression and self contract.
+- [x] Classify each argument as shared borrow, mutable borrow, copy, move, or
+      unknown from the resolved parameter and expression types.
+- [x] Classify the return as unit, owned, borrowed, guard, iterator borrow,
+      option, result, or unknown and record its source when proven.
+- [x] Keep provenance on every structured flow and avoid inventing unresolved
+      facts.
+
+Acceptance criteria:
+
+- [x] `push(String)` reports mutable receiver access plus an argument move.
+- [x] a borrowed return points back to its receiver.
+- [x] neutral metadata reads such as `len` are omitted.
+
+### COACH-002 — Compact progressive editor clue [P0]
+
+- [x] Emit at most one `method_coach` clue per relevant call.
+- [x] Keep the initial inlay response metadata-only and generate the teaching
+      card lazily on resolve.
+- [x] Preserve normal rust-analyzer method hover without Workbench sections.
+- [x] Add an independent Method coach display toggle.
+
+Acceptance criteria:
+
+- [x] The full LSP integration test observes the compact clue, lazy tooltip,
+      moved-value explanation, and unchanged normal hover.
+- [x] visible-range analysis is capped at 64 calls and the 160-call stress
+      fixture remains below the 100 ms debug-test budget.
+
+### COACH-003 — Exact sidebar handoff [P0]
+
+- [x] Move the source cursor to the clicked inlay anchor before opening the
+      guide.
+- [x] Keep operation focus from falling back to an unrelated first diagnostic.
+- [x] Render a beginner call-flow card with receiver/argument arrows, after-call
+      usability, return relationship, effects, alternatives, and provenance.
+- [x] Round-trip schema-13 structured operation facts into Zed.
+
+Acceptance criteria:
+
+- [x] A valid call remains selected even when the file contains other errors.
+- [x] Existing diagnostic navigation resumes after the learner explicitly
+      selects an issue.
+- [x] UI latency and full Rust guide unit suites pass.
+
+## Milestone 14: Offline, verified Generated C
+
+### CGEN-001 — Pin and bundle rustc_codegen_c [P0]
+
+- [x] Pin `release-1.94.1-2` and GitHub's recorded asset SHA-256.
+- [x] Add atomic `./workbench bootstrap generated-c` installation.
+- [x] Bundle a runtime-pruned Cargo, rustc, prebuilt std, and licenses.
+- [x] Remove the global rustup `rustic` dependency from packaged operation.
+
+Acceptance criteria:
+
+- [x] Doctor reports the exact release, versions, and archive verification.
+- [x] A relocated bundle can generate C without host rustup, rustc, or Cargo.
+- [x] The package manifest records release and binary/archive checksums.
+
+### CGEN-002 — Generate the correct project C quickly [P0]
+
+- [x] Pair rustic Cargo with its exact rustc and sanitize inherited overrides.
+- [x] Select the active Cargo target through metadata.
+- [x] Use prebuilt std instead of `-Z build-std`.
+- [x] Reuse a stable project/target/toolchain cache.
+- [x] Filter stubs, dependencies, std, and stale crate hashes.
+
+Acceptance criteria:
+
+- [x] A dependency-free cold smoke generates project C in under five seconds.
+- [x] No `core` or `std` C translation units are produced.
+- [x] Cancellation retains `kill_on_drop` process termination.
+
+### CGEN-003 — Present translation units honestly [P1]
+
+- [x] Show target, backend, duration, unit count, source hash, and exact path.
+- [x] Prefer the unit containing the selected function when available.
+- [x] Navigate and open each real translation unit without concatenating it.
+- [x] Keep previews bounded to 400 KB per selected unit.
+
+Acceptance criteria:
+
+- [x] `native_stubs.c` is never presented as the user's generated code.
+- [x] Multiple real units are independently navigable.
+- [x] Conceptual C remains available when compilation is invalid or fails.
+
+## Milestone 15: Workspace-wide ownership roots and safe repairs
+
+### WSG-001 — Cluster ownership diagnostics across local workspace files [P0]
+
+- [x] Add the bounded `rust-analyzer/ownershipWorkspaceGuide` protocol.
+- [x] Derive causal identities from URI, MIR body, loan, event range, category,
+      and root binding instead of matching variable names.
+- [x] Keep dependency bodies out of the workspace graph and expose only
+      resolved local caller constraints.
+- [x] Preserve a stable revision and the selected cluster across refreshes.
+
+Acceptance criteria:
+
+- [x] Same-named locals in separate files do not merge.
+- [x] A selected downstream diagnostic resolves to the earliest diagnostic in
+      its compiler-backed cause cluster.
+- [x] Root, symptoms, related spans, and caller constraints carry explicit
+      precision/provenance labels.
+- [x] Responses are capped at 2,000 problems, 100 clusters, 50 impacts per
+      cluster, 16 caller constraints, and 16 journey frames.
+
+### WSG-002 — Show one navigable root-to-impact flow in Zed [P0]
+
+- [x] Keep the selected diagnostic locked while asynchronous workspace and
+      model requests complete.
+- [x] Render a compact root → affected sites → caller constraints tree above
+      the existing local ownership explanation.
+- [x] Navigate every visible workspace site to its source line.
+- [x] Keep other workspace roots collapsed by default and bounded when opened.
+- [x] Ask one semantic-intent question and rank, without hiding, repairs for
+      the selected answer.
+
+Acceptance criteria:
+
+- [x] Clicking `self.events.push` cannot fall back to a generic `self` guide.
+- [x] A move root is shown at the transfer event while the rejected later use
+      remains a selected symptom.
+- [x] Active-file changes, source edits, and artifact refreshes reject stale
+      responses and reset incompatible intent state.
+
+### WSG-003 — Fail closed for workspace edits [P0]
+
+- [x] Enumerate every URI in both `changes` and `documentChanges` code actions.
+- [x] Build and label a per-file diff for all loadable edited files.
+- [x] Include the affected-file list and preview completeness in the analyzer
+      protocol and Zed UI.
+- [x] Keep Apply hidden unless rustc validated the rewrite and the complete
+      workspace preview loaded.
+
+Acceptance criteria:
+
+- [x] Older protocol responses without `previewComplete` cannot unlock Apply.
+- [x] Overlapping edits and missing edited files fail closed.
+- [x] Compiler validation continues to use isolated Cargo target output and
+      source overlays without modifying the user's workspace first.
+
+### WSG-004 — Correctness and performance qualification [P0]
+
+- [x] Add a real multi-file LSP slow test with move and borrow errors.
+- [x] Add Zed protocol selection, repair ranking, and fail-closed unit tests.
+- [x] Benchmark the workspace-guide request separately over 100 warm requests.
+- [x] Rebuild the release analyzer and editor used by the launcher.
+
+Acceptance criteria:
+
+- [x] `./workbench doctor` and `./workbench test quick` pass.
+- [x] The real multi-file slow test passes and repeats the same revision/root.
+- [x] Workspace-guide p95 remains below 20 ms and max below 100 ms.
+- [x] No ownership artifact event-loop stall is observed.
+
 ## Prioritized next phase — not required for the first release
 
 ### NEXT-001 — Closure capture visualizer [P2]
@@ -1247,3 +1408,4 @@ document and link their repository-relative paths.
 | 2026-08-19 | `d5853abfb` | Final correctness | `./workbench test quick`; `./workbench test full`; exact-target and wrapper scenarios | [`evidence/visual-workbench/final-qualification-2026-08-19.md`](evidence/visual-workbench/final-qualification-2026-08-19.md) | Passed |
 | 2026-08-19 | `d5853abfb` | Final performance and memory | `./workbench test performance` (three runs); UI benchmarks; 16-minute live session | [`evidence/visual-workbench/final-performance-2026-08-18.json`](evidence/visual-workbench/final-performance-2026-08-18.json) | Passed |
 | 2026-08-19 | `d5853abfb` | Bundle verification | Package staging smoke; relocated archive smoke; `./workbench test bundle --archive …` | [`evidence/visual-workbench/final-qualification-2026-08-19.md`](evidence/visual-workbench/final-qualification-2026-08-19.md) | Passed |
+| 2026-08-20 | `45611354f0` + working tree | Workspace ownership guide | Multi-file LSP test; Zed unit suite; quick gate; release analyzer/editor build; 100-request benchmark | [`evidence/visual-workbench/workspace-guide-2026-08-20.md`](evidence/visual-workbench/workspace-guide-2026-08-20.md) | Passed |

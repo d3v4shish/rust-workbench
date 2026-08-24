@@ -800,6 +800,10 @@ config_data! {
         /// Show wrapper/gate composition clues.
         ownership_mechanics_wrappers: bool = true,
 
+        /// Show one compact, on-demand method-effect clue for ownership-relevant calls. Detailed
+        /// prose is computed lazily only when the learner hovers the clue.
+        ownership_methodCoach_enable | ownership_method_coach_enable: bool = false,
+
         /// Whether to warn when a rename will cause conflicts (change the meaning of the code).
         rename_showConflicts: bool = true,
     }
@@ -1908,6 +1912,10 @@ impl Config {
 
     pub(crate) fn ownership_mechanics_enabled(&self, source_root: Option<SourceRootId>) -> bool {
         *self.ownership_enable(source_root) && *self.ownership_mechanics_enable(source_root)
+    }
+
+    pub(crate) fn ownership_method_coach_enabled(&self, source_root: Option<SourceRootId>) -> bool {
+        *self.ownership_enable(source_root) && *self.ownership_methodCoach_enable(source_root)
     }
 
     pub(crate) fn ownership_mechanics_category_enabled(
@@ -4523,7 +4531,8 @@ mod tests {
                     "storage": true,
                     "access": true,
                     "wrappers": false
-                }
+                },
+                "methodCoach": { "enable": true }
             }
         }));
         (config, _, _) = config.apply_change(change);
@@ -4532,6 +4541,7 @@ mod tests {
         assert!(config.ownership_mechanics_category_enabled(None, "storage"));
         assert!(config.ownership_mechanics_category_enabled(None, "access"));
         assert!(!config.ownership_mechanics_category_enabled(None, "wrapper"));
+        assert!(config.ownership_method_coach_enabled(None));
     }
 
     #[test]

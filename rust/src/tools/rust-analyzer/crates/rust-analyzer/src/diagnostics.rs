@@ -507,6 +507,17 @@ pub(crate) fn ownership_diagnostics_for_file(
     result
 }
 
+pub(crate) fn ownership_diagnostic_file_ids(diagnostics: &OwnershipDiagnostics) -> Vec<FileId> {
+    let mut result = diagnostics
+        .iter()
+        .flat_map(|flycheck| flycheck.values())
+        .flat_map(|package| package.keys().copied())
+        .collect::<Vec<_>>();
+    result.sort_unstable();
+    result.dedup();
+    result
+}
+
 pub(crate) fn ownership_tutorial_for_file(
     models: &OwnershipTutorialModels,
     file_id: FileId,

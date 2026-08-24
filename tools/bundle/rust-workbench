@@ -5,6 +5,7 @@ bundle_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 editor="$bundle_root/libexec/rust-workbench"
 analyzer="$bundle_root/libexec/rust-analyzer"
 toolchain="$bundle_root/toolchain"
+rustic_toolchain="$bundle_root/toolchains/rustic"
 native="$bundle_root/native"
 
 export RUST_WORKBENCH_BUNDLE_ROOT="$bundle_root"
@@ -13,6 +14,7 @@ export RUST_WORKBENCH_RUSTC="$toolchain/bin/rustc"
 export RUST_WORKBENCH_RUSTDOC="$toolchain/bin/rustdoc"
 export RUST_WORKBENCH_CARGO="$toolchain/bin/cargo"
 export RUST_WORKBENCH_RUST_SRC="$toolchain/lib/rustlib/src/rust/library"
+export RUST_WORKBENCH_RUSTIC_SYSROOT="$rustic_toolchain"
 export RUSTUP_AUTO_INSTALL=0
 unset RUSTUP_TOOLCHAIN RUSTC_BOOTSTRAP || true
 
@@ -64,7 +66,7 @@ doctor() {
   fi
 
   local component
-  for component in "$editor" "$analyzer" "$toolchain/bin/rustc" "$toolchain/bin/cargo" "$native/bin/cc"; do
+  for component in "$editor" "$analyzer" "$toolchain/bin/rustc" "$toolchain/bin/cargo" "$rustic_toolchain/bin/rustc" "$rustic_toolchain/bin/cargo" "$native/bin/cc"; do
     if [[ -x "$component" ]]; then
       echo "OK executable: $component"
     else
@@ -83,9 +85,23 @@ doctor() {
       echo "OK shared-library closure"
     fi
   fi
+  if command -v sha256sum >/dev/null 2>&1 && [[ -f "$bundle_root/checksums.sha256" ]]; then
+    if (cd "$bundle_root" && sha256sum --check --quiet checksums.sha256); then
+      echo "OK packaged component checksums"
+    else
+      echo "FAILED packaged component checksums" >&2
+      failed=1
+    fi
+  else
+    echo "MISSING sha256sum or bundle checksum manifest" >&2
+    failed=1
+  fi
 
   "$toolchain/bin/rustc" -Vv | sed -n '1,3p'
   "$toolchain/bin/cargo" -V
+  echo "Generated C backend:"
+  "$rustic_toolchain/bin/rustc" -Vv | sed -n '1,3p'
+  "$rustic_toolchain/bin/cargo" -V
   "$analyzer" --version
   "$native/bin/cc" --version | sed -n '1p'
 
@@ -117,6 +133,17 @@ case "${1:-}" in
       echo "usage: rust-workbench --run-toolchain COMMAND [ARG ...]" >&2
       exit 2
     fi
+    exec "$@"
+    ;;
+  --run-generated-c-toolchain)
+    shift
+    if [[ $# -eq 0 ]]; then
+      echo "usage: rust-workbench --run-generated-c-toolchain COMMAND [ARG ...]" >&2
+      exit 2
+    fi
+    export RUSTC="$rustic_toolchain/bin/rustc"
+    unset RUSTDOC RUSTUP_TOOLCHAIN RUSTC_BOOTSTRAP || true
+    export PATH="$rustic_toolchain/bin:$PATH"
     exec "$@"
     ;;
 esac

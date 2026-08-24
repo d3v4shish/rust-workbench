@@ -607,10 +607,8 @@ impl Editor {
             .cloned()
     }
 
-    /// Returns true only when the pointer is over a semantic Rust mechanics
-    /// clue. The source anchor has already been selected by normal editor mouse
-    /// handling, so the workbench can use it to retain the exact field/place.
-    pub(crate) fn rust_mechanics_hint_at_point(
+    /// Returns true only when the pointer is over a semantic Rust Workbench clue.
+    pub(crate) fn rust_workbench_hint_at_point(
         &mut self,
         snapshot: &EditorSnapshot,
         point_for_position: &PointForPosition,
@@ -673,6 +671,7 @@ impl Editor {
                         | InlayHintKind::MechanicsStorage
                         | InlayHintKind::MechanicsAccess
                         | InlayHintKind::MechanicsWrapper
+                        | InlayHintKind::MethodCoach
                 )
             })
     }
@@ -1021,6 +1020,7 @@ impl Editor {
                                     | InlayHintKind::MechanicsStorage
                                     | InlayHintKind::MechanicsAccess
                                     | InlayHintKind::MechanicsWrapper
+                                    | InlayHintKind::MethodCoach
                             )
                         );
                 if !enabled
@@ -1112,6 +1112,10 @@ fn rust_workbench_hint_allowed(
                 return false;
             }
             rust_mechanics_category_allowed(preferences, kind)
+        }
+        InlayHintKind::MethodCoach => {
+            preferences.show_method_coach
+                && preferences.allows_row(hint.position.to_point(buffer_snapshot).row)
         }
     }
 }

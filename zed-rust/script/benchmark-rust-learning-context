@@ -586,6 +586,33 @@ def main():
                     warmup_deadline,
                 )
 
+            guide_params = {
+                "textDocument": {"uri": source_uri},
+                "position": params["position"],
+                "selectedProblemId": model.get("selectedProblemId"),
+                "expectedRevision": None,
+            }
+            guide = request_stable(
+                client,
+                "rust-analyzer/ownershipWorkspaceGuide",
+                guide_params,
+                warmup_deadline,
+            )
+            if (guide or {}).get("status") not in ("ready", "ready_empty"):
+                raise RuntimeError(f"workspace ownership guide was not ready: {guide!r}")
+            if model.get("selectedProblemId") and not (guide or {}).get(
+                "selectedClusterId"
+            ):
+                raise RuntimeError("workspace ownership guide omitted the selected root cluster")
+            guide_params["expectedRevision"] = (guide or {}).get("revision")
+            for _ in range(10):
+                request_stable(
+                    client,
+                    "rust-analyzer/ownershipWorkspaceGuide",
+                    guide_params,
+                    warmup_deadline,
+                )
+
             durations = []
             response_bytes = []
             for _ in range(args.runs):
@@ -598,12 +625,40 @@ def main():
                 )
                 durations.append((time.perf_counter_ns() - started) / 1_000_000)
                 response_bytes.append(len(json.dumps(model, separators=(",", ":"))))
+            guide_durations = []
+            guide_response_bytes = []
+            for _ in range(args.runs):
+                started = time.perf_counter_ns()
+                guide = request_stable(
+                    client,
+                    "rust-analyzer/ownershipWorkspaceGuide",
+                    guide_params,
+                    time.monotonic() + args.ready_timeout,
+                )
+                guide_durations.append(
+                    (time.perf_counter_ns() - started) / 1_000_000
+                )
+                guide_response_bytes.append(
+                    len(json.dumps(guide, separators=(",", ":")))
+                )
             result = {
                 "runs": args.runs,
                 "median_ms": round(statistics.median(durations), 3),
                 "p95_ms": round(percentile(durations, 0.95), 3),
                 "max_ms": round(max(durations), 3),
                 "median_response_bytes": int(statistics.median(response_bytes)),
+                "workspace_guide_median_ms": round(
+                    statistics.median(guide_durations), 3
+                ),
+                "workspace_guide_p95_ms": round(
+                    percentile(guide_durations, 0.95), 3
+                ),
+                "workspace_guide_max_ms": round(max(guide_durations), 3),
+                "workspace_guide_median_response_bytes": int(
+                    statistics.median(guide_response_bytes)
+                ),
+                "workspace_guide_clusters": len((guide or {}).get("clusters", [])),
+                "workspace_guide_truncated": bool((guide or {}).get("truncated")),
                 "events": len(model.get("events", [])),
                 "selected_place": model.get("selectedPlace"),
                 "selected_problem_id": model.get("selectedProblemId"),
@@ -720,6 +775,16 @@ def main():
             raise RuntimeError(f"p95 {result['p95_ms']}ms exceeds {args.assert_p95_ms}ms")
         if result["max_ms"] > args.assert_max_ms:
             raise RuntimeError(f"max {result['max_ms']}ms exceeds {args.assert_max_ms}ms")
+        if result["workspace_guide_p95_ms"] > args.assert_p95_ms:
+            raise RuntimeError(
+                "workspace guide p95 "
+                f"{result['workspace_guide_p95_ms']}ms exceeds {args.assert_p95_ms}ms"
+            )
+        if result["workspace_guide_max_ms"] > args.assert_max_ms:
+            raise RuntimeError(
+                "workspace guide max "
+                f"{result['workspace_guide_max_ms']}ms exceeds {args.assert_max_ms}ms"
+            )
         if saved_baseline is not None:
             limit = args.assert_baseline_regression_percent
             if median_regression > limit or p95_regression > limit:

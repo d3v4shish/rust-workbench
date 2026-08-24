@@ -158,6 +158,14 @@ It is not ABI-equivalent output. Generated C is lazy, uses a saved valid input,
 and runs outside the UI thread. Invalid or stale Rust is not presented as a
 successful C translation.
 
+The Linux bundle includes a pinned, checksum-verified rustc_codegen_c toolchain
+and does not require a global rustup `rustic` installation. Generated C builds
+only the selected project target against the toolchain's prebuilt standard
+library. The drawer lists the target's real `.rcgu.c` translation units and
+filters backend stubs, dependencies, standard-library output, and stale build
+hashes. External Cargo dependencies may still need an existing local cache or
+network access.
+
 ## Repeatable acceptance check {#rust-learning-manual-check}
 
 Use `rust-ownership-stress-lab` from the workspace root.
