@@ -4,7 +4,8 @@ mod ownership_topology;
 
 use ownership_diagram::render_topology_scene;
 use ownership_topology::{
-    OwnershipTopologyScene, TopologyColumn, derive_ownership_topology_scene,
+    OwnershipTopologyScene, TopologyColumn, beginner_memory_role, beginner_memory_state,
+    derive_beginner_memory_path, derive_ownership_topology_scene,
     derive_ownership_topology_scene_with_limits, topology_column, topology_column_title,
     topology_edge_active_at_step, topology_state_at_step,
 };
@@ -982,6 +983,20 @@ impl RustWorkbenchPanel {
             self.cue_range(range, cx);
         }
         cx.notify();
+    }
+
+    fn inspect_topology_element_and_focus(
+        &mut self,
+        element_id: String,
+        summary: String,
+        range: Option<lsp::Range>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.inspect_topology_element(element_id, summary, None, cx);
+        if let Some(range) = range {
+            self.focus_range_in_editor(range, window, cx);
+        }
     }
 
     fn preview_repair(&mut self, repair_id: String, cx: &mut Context<Self>) {
@@ -4164,7 +4179,7 @@ fn render_visual_memory_map(
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     if let Some(scene) = topology_scene {
-        return render_topology_scene(scene.clone(), selected_topology_element, cx);
+        return render_beginner_memory_path(scene, selected_topology_element, cx);
     }
     if let Some(graph) = &model.conflict_graph {
         let snapshot = graph
@@ -4287,6 +4302,156 @@ fn render_visual_memory_map(
                 .bindings
                 .iter()
                 .map(|binding| render_structured_memory_chain(binding, cx)),
+        )
+        .into_any_element()
+}
+
+fn render_beginner_memory_path(
+    scene: &OwnershipTopologyScene,
+    selected_topology_element: Option<&str>,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    let path = derive_beginner_memory_path(scene);
+    if path.stages.is_empty() {
+        return empty_card("No storage layers are available for this issue yet.");
+    }
+
+    v_flex()
+        .py_2()
+        .gap_2()
+        .child(Label::new("How this value is built").size(LabelSize::Large))
+        .child(
+            Label::new(
+                "Follow the path from the variable name to each wrapper and the storage it controls.",
+            )
+            .size(LabelSize::Small)
+            .color(Color::Muted),
+        )
+        .children(path.stages.into_iter().enumerate().map(|(stage_index, stage)| {
+            let relation = stage.relation_from_previous.join(" · ");
+            let branch_count = stage.nodes.len();
+            v_flex()
+                .gap_1()
+                .when(!relation.is_empty(), |this| {
+                    this.child(
+                        Label::new(format!("↓ {relation}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
+                .when(branch_count > 1, |this| {
+                    this.child(
+                        Label::new(format!(
+                            "{} paths at the same layer",
+                            branch_count
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Info),
+                    )
+                })
+                .children(stage.nodes.into_iter().enumerate().map(|(branch_index, node)| {
+                    let role = beginner_memory_role(&node);
+                    let state = beginner_memory_state(&node.state);
+                    let color = visual_state_label_color(&node.state);
+                    let selected = selected_topology_element == Some(node.id.as_str());
+                    let node_id = node.id.clone();
+                    let range = node.range;
+                    let storage = match node.storage.as_str() {
+                        "heap" => "heap storage".to_owned(),
+                        "inline" => "stored inside the previous layer".to_owned(),
+                        "stack" => "local storage".to_owned(),
+                        other => other.replace('_', " "),
+                    };
+                    let summary = format!(
+                        "Inspecting {} `{}`: {}.",
+                        role.to_lowercase(),
+                        node.label,
+                        state.to_lowercase()
+                    );
+                    let provenance = if node.provenance == "compiler_exact" {
+                        "compiler-backed layer"
+                    } else if node.provenance == "derived" {
+                        "derived from compiler/source facts"
+                    } else {
+                        "conceptual storage layer"
+                    };
+                    v_flex()
+                        .w_full()
+                        .p_2()
+                        .gap_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if selected {
+                            cx.theme().status().info
+                        } else {
+                            cx.theme().colors().border_variant
+                        })
+                        .bg(match node.storage.as_str() {
+                            "heap" => cx.theme().status().success_background.opacity(0.08),
+                            "inline" => cx.theme().status().info_background.opacity(0.08),
+                            _ => cx.theme().colors().panel_background,
+                        })
+                        .child(
+                            Button::new(
+                                SharedString::from(format!(
+                                    "beginner-memory-{stage_index}-{branch_index}-{}",
+                                    node.id
+                                )),
+                                format!("{role} · {}", node.label),
+                            )
+                            .toggle_state(selected)
+                            .aria_label(format!(
+                                "Inspect {role}: {}; type {}; {state}",
+                                node.label, node.type_name
+                            ))
+                            .on_click(cx.listener(move |panel, _, window, cx| {
+                                panel.inspect_topology_element_and_focus(
+                                    node_id.clone(),
+                                    summary.clone(),
+                                    range,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                        )
+                        .child(
+                            Label::new(node.type_name)
+                                .size(LabelSize::XSmall)
+                                .buffer_font(cx),
+                        )
+                        .child(
+                            Label::new(format!("{state} · {storage}"))
+                                .size(LabelSize::XSmall)
+                                .color(color),
+                        )
+                        .child(
+                            Label::new(provenance)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                }))
+        }))
+        .when(!scene.access_lines.is_empty(), |this| {
+            this.child(Label::new("Access path").size(LabelSize::Small))
+                .children(scene.access_lines.iter().cloned().map(|line| {
+                    Label::new(line)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                }))
+        })
+        .when(path.truncated, |this| {
+            this.child(
+                Label::new("More storage layers exist; this beginner path is bounded.")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Warning),
+            )
+        })
+        .child(
+            Label::new(
+                "This view shows ownership structure, not runtime addresses or guessed reference counts.",
+            )
+            .size(LabelSize::XSmall)
+            .color(Color::Muted),
         )
         .into_any_element()
 }

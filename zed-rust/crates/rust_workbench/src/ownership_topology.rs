@@ -74,6 +74,177 @@ pub(super) struct OwnershipTopologyScene {
     pub legacy_limited: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BeginnerMemoryStage {
+    pub relation_from_previous: Vec<String>,
+    pub nodes: Vec<TopologyNode>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct BeginnerMemoryPath {
+    pub stages: Vec<BeginnerMemoryStage>,
+    pub truncated: bool,
+}
+
+pub(super) fn beginner_memory_role(node: &TopologyNode) -> &'static str {
+    match node.kind.as_str() {
+        "binding" => "Local variable",
+        "handle" => "Inline owner handle",
+        "control_block" => "Shared heap allocation",
+        "borrow_flag" | "gate" => "Runtime borrow gate",
+        "buffer" => "Heap element buffer",
+        "lock_state" => "Runtime lock state",
+        "guard" => "Temporary access guard",
+        "wrapper" if node.label.contains("Vec") || node.type_name.starts_with("Vec<") => {
+            "Inline collection header"
+        }
+        "wrapper" => "Inline wrapper",
+        "heap_allocation" | "allocation" => "Heap allocation",
+        _ if node.storage == "heap" => "Heap value",
+        _ if node.storage == "inline" => "Inline value",
+        _ => "Value layer",
+    }
+}
+
+pub(super) fn beginner_relation_label(relation: &str) -> String {
+    match relation {
+        "stores" => "holds this handle".to_owned(),
+        "wraps" => "wraps".to_owned(),
+        "owns" => "owns".to_owned(),
+        "shares_allocation" => "shares ownership of".to_owned(),
+        "weak_reference" => "weakly observes".to_owned(),
+        "contains" => "contains".to_owned(),
+        "guards_access" => "controls access to".to_owned(),
+        "owns_buffer" => "owns the element storage".to_owned(),
+        "points_to" => "points to".to_owned(),
+        "borrow_shared" => "temporarily reads".to_owned(),
+        "borrow_mutable" => "temporarily edits".to_owned(),
+        "reborrow" => "borrows again from".to_owned(),
+        "moved_to" => "transferred control to".to_owned(),
+        other => other.replace('_', " "),
+    }
+}
+
+pub(super) fn beginner_memory_state(state: &str) -> String {
+    if state.contains("reject") || state.contains("invalid") || state.contains("blocked") {
+        "Operation blocked here".to_owned()
+    } else if state.contains("mutable") || state.contains("exclusive") {
+        "Exclusive edit access is active".to_owned()
+    } else if state.contains("borrow") || state.contains("read-only") {
+        "Temporary read access is active".to_owned()
+    } else if state.contains("move") || state.contains("unavailable") {
+        "Control moved to another place".to_owned()
+    } else if state.contains("drop") || state.contains("dead") {
+        "This layer has been cleaned up".to_owned()
+    } else if state.contains("available") || state.contains("alive") {
+        "Available to use".to_owned()
+    } else {
+        format!("Current state: {}", state.replace('_', " "))
+    }
+}
+
+pub(super) fn derive_beginner_memory_path(
+    scene: &OwnershipTopologyScene,
+) -> BeginnerMemoryPath {
+    if scene.nodes.is_empty() {
+        return BeginnerMemoryPath {
+            stages: Vec::new(),
+            truncated: scene.truncated,
+        };
+    }
+
+    let node_order = scene
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut distance = BTreeMap::<String, usize>::new();
+    let mut queue = VecDeque::new();
+    for node in scene.nodes.iter().filter(|node| node.kind == "binding") {
+        distance.insert(node.id.clone(), 0);
+        queue.push_back(node.id.clone());
+    }
+    if queue.is_empty() {
+        let first = &scene.nodes[0];
+        distance.insert(first.id.clone(), 0);
+        queue.push_back(first.id.clone());
+    }
+
+    while let Some(source) = queue.pop_front() {
+        let source_distance = distance[&source];
+        let mut outgoing = scene
+            .edges
+            .iter()
+            .filter(|edge| edge.source == source)
+            .collect::<Vec<_>>();
+        outgoing.sort_by(|left, right| {
+            relation_priority(&left.label)
+                .cmp(&relation_priority(&right.label))
+                .then_with(|| {
+                    node_order
+                        .get(left.target.as_str())
+                        .cmp(&node_order.get(right.target.as_str()))
+                })
+        });
+        for edge in outgoing {
+            if !distance.contains_key(&edge.target) {
+                distance.insert(edge.target.clone(), source_distance + 1);
+                queue.push_back(edge.target.clone());
+            }
+        }
+    }
+
+    let mut next_distance = distance.values().copied().max().unwrap_or(0) + 1;
+    for node in &scene.nodes {
+        if !distance.contains_key(&node.id) {
+            distance.insert(node.id.clone(), next_distance);
+            next_distance += 1;
+        }
+    }
+
+    let mut grouped = BTreeMap::<usize, Vec<TopologyNode>>::new();
+    for node in &scene.nodes {
+        grouped
+            .entry(distance[&node.id])
+            .or_default()
+            .push(node.clone());
+    }
+
+    let stages = grouped
+        .into_iter()
+        .map(|(stage_distance, mut nodes)| {
+            nodes.sort_by_key(|node| node_order.get(node.id.as_str()).copied());
+            let node_ids = nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut relations = scene
+                .edges
+                .iter()
+                .filter(|edge| {
+                    node_ids.contains(edge.target.as_str())
+                        && distance
+                            .get(&edge.source)
+                            .is_some_and(|source_distance| *source_distance < stage_distance)
+                })
+                .map(|edge| beginner_relation_label(&edge.label))
+                .collect::<Vec<_>>();
+            relations.sort();
+            relations.dedup();
+            BeginnerMemoryStage {
+                relation_from_previous: relations,
+                nodes,
+            }
+        })
+        .collect();
+
+    BeginnerMemoryPath {
+        stages,
+        truncated: scene.truncated,
+    }
+}
+
 pub(super) fn topology_column(kind: &str, storage: &str) -> TopologyColumn {
     if storage == "heap"
         || matches!(
@@ -594,4 +765,171 @@ pub(super) fn derive_ownership_topology_scene_with_limits(
         truncated,
         legacy_limited: model.compiler_schema_version > 0 && model.compiler_schema_version < 7,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: &str, kind: &str, storage: &str, label: &str, type_name: &str) -> TopologyNode {
+        TopologyNode {
+            id: id.to_owned(),
+            place: "value".to_owned(),
+            label: label.to_owned(),
+            type_name: type_name.to_owned(),
+            detail: storage.to_owned(),
+            kind: kind.to_owned(),
+            storage: storage.to_owned(),
+            state: "available".to_owned(),
+            provenance: "compiler_exact".to_owned(),
+            column: topology_column(kind, storage),
+            range: None,
+            rect: TopologyRect::default(),
+        }
+    }
+
+    fn edge(id: &str, source: &str, target: &str, label: &str) -> TopologyEdge {
+        TopologyEdge {
+            id: id.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+            label: label.to_owned(),
+            provenance: "compiler_exact".to_owned(),
+            active: true,
+            range: None,
+            route: Vec::new(),
+            label_position: (0, 0),
+        }
+    }
+
+    fn scene(nodes: Vec<TopologyNode>, edges: Vec<TopologyEdge>) -> OwnershipTopologyScene {
+        OwnershipTopologyScene {
+            nodes,
+            edges,
+            ..OwnershipTopologyScene::default()
+        }
+    }
+
+    #[test]
+    fn beginner_path_keeps_every_nested_wrapper_layer_in_order() {
+        let scene = scene(
+            vec![
+                node(
+                    "binding",
+                    "binding",
+                    "stack",
+                    "variable value",
+                    "Rc<RefCell<Vec<i32>>>",
+                ),
+                node(
+                    "rc-handle",
+                    "handle",
+                    "inline",
+                    "Rc handle",
+                    "Rc<RefCell<Vec<i32>>>",
+                ),
+                node(
+                    "rc-allocation",
+                    "control_block",
+                    "heap",
+                    "Rc allocation",
+                    "RefCell<Vec<i32>>",
+                ),
+                node(
+                    "refcell",
+                    "borrow_flag",
+                    "inline",
+                    "RefCell borrow gate",
+                    "RefCell<Vec<i32>>",
+                ),
+                node(
+                    "vec-header",
+                    "wrapper",
+                    "inline",
+                    "Vec header",
+                    "Vec<i32>",
+                ),
+                node(
+                    "vec-buffer",
+                    "buffer",
+                    "heap",
+                    "Vec element buffer",
+                    "i32",
+                ),
+            ],
+            vec![
+                edge("e1", "binding", "rc-handle", "stores"),
+                edge("e2", "rc-handle", "rc-allocation", "shares_allocation"),
+                edge("e3", "rc-allocation", "refcell", "contains"),
+                edge("e4", "refcell", "vec-header", "guards_access"),
+                edge("e5", "vec-header", "vec-buffer", "owns_buffer"),
+            ],
+        );
+
+        let path = derive_beginner_memory_path(&scene);
+        assert_eq!(path.stages.len(), 6);
+        assert_eq!(
+            path.stages
+                .iter()
+                .map(|stage| beginner_memory_role(&stage.nodes[0]))
+                .collect::<Vec<_>>(),
+            [
+                "Local variable",
+                "Inline owner handle",
+                "Shared heap allocation",
+                "Runtime borrow gate",
+                "Inline collection header",
+                "Heap element buffer",
+            ]
+        );
+        assert_eq!(
+            path.stages
+                .iter()
+                .skip(1)
+                .map(|stage| stage.relation_from_previous[0].as_str())
+                .collect::<Vec<_>>(),
+            [
+                "holds this handle",
+                "shares ownership of",
+                "contains",
+                "controls access to",
+                "owns the element storage",
+            ]
+        );
+    }
+
+    #[test]
+    fn beginner_path_groups_aliases_before_their_shared_allocation() {
+        let scene = scene(
+            vec![
+                node("a", "binding", "stack", "variable a", "Rc<String>"),
+                node("b", "binding", "stack", "variable b", "Rc<String>"),
+                node("ha", "handle", "inline", "Rc handle a", "Rc<String>"),
+                node("hb", "handle", "inline", "Rc handle b", "Rc<String>"),
+                node(
+                    "allocation",
+                    "control_block",
+                    "heap",
+                    "shared Rc allocation",
+                    "String",
+                ),
+            ],
+            vec![
+                edge("e1", "a", "ha", "stores"),
+                edge("e2", "b", "hb", "stores"),
+                edge("e3", "ha", "allocation", "shares_allocation"),
+                edge("e4", "hb", "allocation", "shares_allocation"),
+            ],
+        );
+
+        let path = derive_beginner_memory_path(&scene);
+        assert_eq!(path.stages.len(), 3);
+        assert_eq!(path.stages[0].nodes.len(), 2);
+        assert_eq!(path.stages[1].nodes.len(), 2);
+        assert_eq!(path.stages[2].nodes.len(), 1);
+        assert_eq!(
+            path.stages[2].relation_from_previous,
+            ["shares ownership of"]
+        );
+    }
 }
