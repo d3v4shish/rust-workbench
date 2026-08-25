@@ -1,6 +1,7 @@
 pub(crate) struct ConceptLesson {
     pub id: &'static str,
     pub title: &'static str,
+    #[allow(dead_code)]
     pub one_line: &'static str,
     pub rule: &'static str,
     pub memory_model: &'static str,

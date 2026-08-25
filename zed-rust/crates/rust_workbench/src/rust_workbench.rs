@@ -75,6 +75,37 @@ const MAX_PANEL_FONT_SCALE_PERCENT: u16 = 180;
 const PANEL_FONT_SCALE_STEP_PERCENT: i16 = 10;
 struct OwnershipStudioCue;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LearningView {
+    #[default]
+    Story,
+    Memory,
+    Timeline,
+    Fixes,
+}
+
+impl LearningView {
+    const ALL: [Self; 4] = [Self::Story, Self::Memory, Self::Timeline, Self::Fixes];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Story => "Story",
+            Self::Memory => "Memory",
+            Self::Timeline => "Timeline",
+            Self::Fixes => "Fix choices",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Story => "story",
+            Self::Memory => "memory",
+            Self::Timeline => "timeline",
+            Self::Fixes => "fixes",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DetailDrawer {
     Why,
@@ -257,6 +288,7 @@ pub struct RustWorkbenchPanel {
     show_display_controls: bool,
     show_issue_list: bool,
     show_workspace_roots: bool,
+    learning_view: LearningView,
     active_detail_drawer: Option<DetailDrawer>,
     expanded_operations: BTreeSet<String>,
     repair_verification: Option<RepairVerification>,
@@ -543,6 +575,7 @@ impl RustWorkbenchPanel {
                     show_display_controls: false,
                     show_issue_list: false,
                     show_workspace_roots: false,
+                    learning_view: LearningView::default(),
                     active_detail_drawer: None,
                     expanded_operations: BTreeSet::new(),
                     repair_verification: None,
@@ -778,6 +811,15 @@ impl RustWorkbenchPanel {
             return;
         };
         self.select_problem_index(index, false, cx);
+        self.focus_range_in_editor(range, window, cx);
+    }
+
+    fn focus_range_in_editor(
+        &mut self,
+        range: lsp::Range,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.cue_range(range, cx);
 
         let (Some(buffer), Some(editor)) = (
@@ -2195,6 +2237,7 @@ impl Render for RustWorkbenchPanel {
         let show_display_controls = self.show_display_controls;
         let show_issue_list = self.show_issue_list;
         let show_workspace_roots = self.show_workspace_roots;
+        let learning_view = self.learning_view;
         let panel_rem_size = window.rem_size() * (f32::from(font_scale_percent) / 100.0);
         let problem_status = self.problem_status.clone();
         let status_message = self.status_message.clone();
@@ -2438,16 +2481,9 @@ impl Render for RustWorkbenchPanel {
                                     show_repair_alternatives,
                                     selected_intent_choice_id.as_deref(),
                                     exact_mode,
-                                    cx,
-                                ))
-                                .child(render_workspace_impact_tree(
+                                    learning_view,
                                     &workspace_guide,
                                     show_workspace_roots,
-                                    cx,
-                                ))
-                                .child(render_workspace_intent_question(
-                                    &workspace_guide,
-                                    selected_intent_choice_id.as_deref(),
                                     cx,
                                 ))
                                 .child(render_detail_drawers(
@@ -2845,6 +2881,7 @@ fn render_workspace_intent_question(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_beginner_flow(
     problem: Option<&OwnershipProblem>,
     problems: &OwnershipProblems,
@@ -2857,6 +2894,9 @@ fn render_beginner_flow(
     show_repair_alternatives: bool,
     selected_intent_choice_id: Option<&str>,
     exact_mode: bool,
+    learning_view: LearningView,
+    workspace_guide: &OwnershipWorkspaceGuide,
+    show_workspace_roots: bool,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     if problem.is_none()
@@ -2864,29 +2904,269 @@ fn render_beginner_flow(
     {
         return render_method_coach_flow(operation, cx);
     }
-    v_flex()
+    let mut content = v_flex()
         .gap_2()
-        .child(render_visual_problem_header(problem, model, cx))
-        .child(render_beginner_concept(problem, cx))
-        .child(render_guided_visual_step(
+        .child(render_learning_view_tabs(learning_view, cx));
+    content = match learning_view {
+        LearningView::Story => content.child(render_beginner_story(problem, model, cx)),
+        LearningView::Memory => content.child(render_guided_visual_step(
             problem,
             model,
             topology_scene,
             selected_topology_element,
             selected_step,
             cx,
-        ))
-        .child(render_guided_fix_step(
-            problem,
-            problems,
-            model,
-            verification,
-            preview_repair_id,
-            show_repair_alternatives,
-            selected_intent_choice_id,
-            exact_mode,
+        )),
+        LearningView::Timeline => {
+            let moments = visual_moments(problem, model);
+            let selected_step = selected_step.min(moments.len().saturating_sub(1));
+            let selected_moment = moments.get(selected_step).cloned();
+            content.child(render_visual_timeline(
+                &moments,
+                selected_step,
+                selected_moment,
+                cx,
+            ))
+        }
+        LearningView::Fixes => content
+            .child(render_workspace_intent_question(
+                workspace_guide,
+                selected_intent_choice_id,
+                cx,
+            ))
+            .child(render_guided_fix_step(
+                problem,
+                problems,
+                model,
+                verification,
+                preview_repair_id,
+                show_repair_alternatives,
+                selected_intent_choice_id,
+                exact_mode,
+                cx,
+            ))
+            .child(render_workspace_impact_tree(
+                workspace_guide,
+                show_workspace_roots,
+                cx,
+            )),
+    };
+    content.into_any_element()
+}
+
+fn render_learning_view_tabs(
+    selected_view: LearningView,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .gap_1()
+        .flex_wrap()
+        .children(LearningView::ALL.into_iter().map(|view| {
+            Button::new(
+                SharedString::from(format!("rust-learning-view-{}", view.id())),
+                view.label(),
+            )
+            .toggle_state(view == selected_view)
+            .aria_label(format!("Show the {} learning view", view.label()))
+            .on_click(cx.listener(move |panel, _, _window, cx| {
+                panel.learning_view = view;
+                cx.notify();
+            }))
+        }))
+        .into_any_element()
+}
+
+fn render_beginner_story(
+    problem: Option<&OwnershipProblem>,
+    model: &OwnershipModel,
+    cx: &mut Context<RustWorkbenchPanel>,
+) -> AnyElement {
+    let Some(problem) = problem else {
+        return empty_card(
+            "Select a compiler issue to see what existed before it, what changed, and what Rust protects.",
+        );
+    };
+    let facts = guided_issue_facts(problem, model);
+    let narrative = learning_catalog::beginner_narrative(&problem.category, &facts.target);
+    let range = problem.primary_range;
+    let source_quality = if problem.precision == "compiler_exact" {
+        "compiler exact"
+    } else {
+        "source estimate"
+    };
+    let diagnostic_code = problem.diagnostic_code.as_deref().unwrap_or("rustc");
+
+    v_flex()
+        .p_3()
+        .gap_3()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().colors().border_variant)
+        .child(
+            h_flex()
+                .gap_2()
+                .justify_between()
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(Label::new(narrative.title).size(LabelSize::Large))
+                        .child(
+                            Label::new(format!(
+                                "{diagnostic_code} · line {} · {source_quality}",
+                                range.start.line + 1
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        ),
+                )
+                .child(
+                    Button::new("beginner-story-show-code", "Show in code")
+                        .aria_label("Center this issue in the Rust editor")
+                        .on_click(cx.listener(move |panel, _, window, cx| {
+                            panel.focus_range_in_editor(range, window, cx);
+                        })),
+                ),
+        )
+        .child(render_story_step(
+            "1",
+            "Before",
+            narrative.before,
+            Color::Success,
             cx,
         ))
+        .child(render_story_connector("then this operation happened", cx))
+        .child(render_story_step(
+            "2",
+            "Operation",
+            narrative.operation,
+            Color::Warning,
+            cx,
+        ))
+        .child(render_story_connector("so Rust sees this state now", cx))
+        .child(render_story_step(
+            "3",
+            "Now",
+            narrative.now,
+            Color::Error,
+            cx,
+        ))
+        .child(
+            v_flex()
+                .gap_2()
+                .pt_2()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(Label::new("A useful comparison").size(LabelSize::Small))
+                .child(render_story_explanation(
+                    "What may feel familiar",
+                    narrative.common_expectation,
+                    cx,
+                ))
+                .child(render_story_explanation(
+                    "Rust's model",
+                    narrative.rust_model,
+                    cx,
+                )),
+        )
+        .child(
+            v_flex()
+                .p_2()
+                .gap_1()
+                .rounded_sm()
+                .bg(cx.theme().status().info_background.opacity(0.14))
+                .child(Label::new("Intuition").size(LabelSize::Small))
+                .child(Label::new(narrative.intuition).size(LabelSize::Small)),
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .child(Label::new("Rust words in plain language").size(LabelSize::Small))
+                .children(narrative.vocabulary.into_iter().map(|entry| {
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(
+                            Label::new(entry.term)
+                                .size(LabelSize::XSmall)
+                                .buffer_font(cx),
+                        )
+                        .child(
+                            Label::new(entry.meaning)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                })),
+        )
+        .child(
+            Label::new(format!("Common trap: {}", narrative.misconception))
+                .size(LabelSize::XSmall)
+                .color(Color::Warning),
+        )
+        .when(model.truncated, |this| {
+            this.child(
+                Label::new(
+                    "This explanation is complete, but the compiler model behind the technical views was bounded for responsiveness.",
+                )
+                .size(LabelSize::XSmall)
+                .color(Color::Warning),
+            )
+        })
+        .into_any_element()
+}
+
+fn render_story_step(
+    number: &'static str,
+    label: &'static str,
+    explanation: String,
+    color: Color,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .p_2()
+        .gap_2()
+        .items_start()
+        .rounded_sm()
+        .bg(match color {
+            Color::Error => cx.theme().status().error_background.opacity(0.10),
+            Color::Warning => cx.theme().status().warning_background.opacity(0.10),
+            _ => cx.theme().status().success_background.opacity(0.10),
+        })
+        .child(
+            Label::new(number)
+                .size(LabelSize::Large)
+                .color(color),
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .child(Label::new(label).size(LabelSize::Small).color(color))
+                .child(Label::new(explanation).size(LabelSize::Small)),
+        )
+        .into_any_element()
+}
+
+fn render_story_connector(label: &'static str, _cx: &App) -> AnyElement {
+    Label::new(format!("↓ {label}"))
+        .size(LabelSize::XSmall)
+        .color(Color::Muted)
+        .into_any_element()
+}
+
+fn render_story_explanation(
+    label: &'static str,
+    explanation: String,
+    _cx: &App,
+) -> AnyElement {
+    v_flex()
+        .gap_0p5()
+        .child(
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(Label::new(explanation).size(LabelSize::Small))
         .into_any_element()
 }
 
@@ -3676,50 +3956,6 @@ fn render_state_card(title: &str, badge: &str, body: String, color: Color, cx: &
         .into_any_element()
 }
 
-fn render_beginner_concept(
-    problem: Option<&OwnershipProblem>,
-    cx: &mut Context<RustWorkbenchPanel>,
-) -> AnyElement {
-    let Some(problem) = problem else {
-        return empty_card("A short core-rule explanation will appear for the selected issue.");
-    };
-    let concept_ids = learning_catalog::lesson_ids_for_problem(
-        &problem.category,
-        problem.diagnostic_code.as_deref(),
-    );
-    let Some(concept_id) = concept_ids.first() else {
-        return empty_card(
-            "The compiler facts above are available, but this issue has no bundled beginner explanation yet.",
-        );
-    };
-    let Some(lesson) = learning_catalog::lesson(concept_id) else {
-        return empty_card("The bundled beginner explanation could not be loaded.");
-    };
-    v_flex()
-        .p_3()
-        .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(cx.theme().status().info)
-        .bg(cx.theme().status().info_background.opacity(0.08))
-        .child(Label::new(format!("2 · Rule · {}", lesson.title)).size(LabelSize::Small))
-        .child(Label::new(lesson.one_line).size(LabelSize::Small))
-        .child(
-            Label::new(format!("{} Why: {}", lesson.rule, lesson.why))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        )
-        .child(
-            Label::new(format!(
-                "Memory picture: {} Watch for: {}",
-                lesson.memory_model, lesson.misconception
-            ))
-            .size(LabelSize::XSmall)
-            .color(Color::Warning),
-        )
-        .into_any_element()
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GuidedIssueFacts {
     target: String,
@@ -3787,95 +4023,6 @@ fn guided_issue_facts(problem: &OwnershipProblem, model: &OwnershipModel) -> Gui
         required_access,
         state_summary,
     }
-}
-
-fn render_visual_problem_header(
-    problem: Option<&OwnershipProblem>,
-    model: &OwnershipModel,
-    cx: &mut Context<RustWorkbenchPanel>,
-) -> AnyElement {
-    let Some(problem) = problem else {
-        return empty_card(
-            "Open a Rust file with a supported compiler diagnostic, then select the highlighted line.",
-        );
-    };
-    let facts = guided_issue_facts(problem, model);
-    let (_, what, _) = problem_story(&problem.category, &facts.target);
-    let diagnostic = if problem.message.is_empty() {
-        problem
-            .diagnostic_code
-            .clone()
-            .unwrap_or_else(|| "compiler diagnostic".to_owned())
-    } else {
-        problem.message.clone()
-    };
-    v_flex()
-        .p_2()
-        .gap_1()
-        .rounded_md()
-        .border_1()
-        .border_color(cx.theme().status().error)
-        .bg(cx.theme().status().error_background.opacity(0.12))
-        .child(
-            h_flex()
-                .gap_2()
-                .justify_between()
-                .child(
-                    v_flex()
-                        .gap_0p5()
-                        .child(Label::new("1 · Problem").size(LabelSize::Small))
-                        .child(Label::new(facts.headline.clone()).size(LabelSize::Small))
-                        .child(
-                            Label::new(format!(
-                                "{} · {}",
-                                problem.diagnostic_code.as_deref().unwrap_or("rustc"),
-                                if problem.precision == "compiler_exact" {
-                                    "compiler exact"
-                                } else {
-                                    "source estimate"
-                                }
-                            ))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                        ),
-                )
-                .child(
-                    Button::new("visual-jump-to-error", "Show in code").on_click(cx.listener({
-                        let range = problem.primary_range;
-                        move |panel, _, _window, cx| panel.cue_range(range, cx)
-                    })),
-                ),
-        )
-        .child(Label::new(diagnostic).size(LabelSize::XSmall).color(Color::Error))
-        .child(Label::new(what).size(LabelSize::XSmall))
-        .child(
-            h_flex()
-                .gap_1()
-                .flex_wrap()
-                .child(Label::new(format!("Target · `{}`", facts.target)).size(LabelSize::XSmall))
-                .when_some(facts.access_route, |this, route| {
-                    this.child(Label::new(format!("Access route · `{route}`")).size(LabelSize::XSmall))
-                })
-                .when_some(facts.operation, |this, operation| {
-                    this.child(Label::new(format!("Attempt · {operation}()")).size(LabelSize::XSmall))
-                })
-                .when_some(facts.required_access, |this, access| {
-                    this.child(Label::new(format!("Needs · {access}")).size(LabelSize::XSmall))
-                }),
-        )
-        .child(
-            Label::new(facts.state_summary)
-                .size(LabelSize::Small)
-                .color(Color::Success),
-        )
-        .when(model.truncated, |this| {
-            this.child(
-                Label::new("The compiler model reached a display bound. Expand code context deliberately instead of rendering an unbounded graph.")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Warning),
-            )
-        })
-        .into_any_element()
 }
 
 fn render_visual_timeline(
