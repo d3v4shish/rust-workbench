@@ -2867,13 +2867,171 @@ fn render_workspace_impact_tree(
     .into_any_element()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BeginnerIntentChoice {
+    id: &'static str,
+    label: &'static str,
+    consequence: &'static str,
+}
+
+const MOVE_INTENT_CHOICES: &[BeginnerIntentChoice] = &[
+    BeginnerIntentChoice {
+        id: "borrow",
+        label: "Only temporary access is needed",
+        consequence: "Prefer borrowing so the current owner stays responsible for the value.",
+    },
+    BeginnerIntentChoice {
+        id: "transfer",
+        label: "Ownership should transfer",
+        consequence: "Use the new owner after the move and stop using the previous path.",
+    },
+    BeginnerIntentChoice {
+        id: "duplicate_or_share",
+        label: "Both places must keep using it",
+        consequence: "Choose explicitly between independent cloned data and shared ownership.",
+    },
+];
+
+const BORROW_INTENT_CHOICES: &[BeginnerIntentChoice] = &[
+    BeginnerIntentChoice {
+        id: "end_first",
+        label: "The first access can finish sooner",
+        consequence: "Shorten or reorganize the borrow while keeping compile-time access checks.",
+    },
+    BeginnerIntentChoice {
+        id: "snapshot",
+        label: "A separate snapshot is acceptable",
+        consequence: "Copy or clone only the data that must be used independently.",
+    },
+    BeginnerIntentChoice {
+        id: "shared_runtime",
+        label: "Overlapping shared mutation is required",
+        consequence: "Use a runtime-checked cell or lock and accept its runtime behavior.",
+    },
+];
+
+const MUTATION_INTENT_CHOICES: &[BeginnerIntentChoice] = &[
+    BeginnerIntentChoice {
+        id: "unique",
+        label: "One owner should edit it directly",
+        consequence: "Prefer an ordinary mutable binding or exclusive mutable reference.",
+    },
+    BeginnerIntentChoice {
+        id: "shared_local",
+        label: "Several local owners must edit it",
+        consequence: "Single-threaded shared mutation needs an explicit runtime-checked wrapper.",
+    },
+    BeginnerIntentChoice {
+        id: "shared_threads",
+        label: "Several threads must edit it",
+        consequence: "Cross-thread shared mutation needs atomic ownership and synchronization.",
+    },
+];
+
+const LIFETIME_INTENT_CHOICES: &[BeginnerIntentChoice] = &[
+    BeginnerIntentChoice {
+        id: "borrow",
+        label: "The result may depend on an existing owner",
+        consequence: "Connect the reference lifetime to an input that already lives long enough.",
+    },
+    BeginnerIntentChoice {
+        id: "transfer",
+        label: "The result must live independently",
+        consequence: "Return or store an owned value so no external lifetime is required.",
+    },
+];
+
+const CAPTURE_INTENT_CHOICES: &[BeginnerIntentChoice] = &[
+    BeginnerIntentChoice {
+        id: "borrow",
+        label: "The callable runs inside this scope",
+        consequence: "Keep execution within the lifetime of the borrowed environment.",
+    },
+    BeginnerIntentChoice {
+        id: "transfer",
+        label: "The callable must outlive this scope",
+        consequence: "Move the required captures into the callable, cloning only when independence is needed.",
+    },
+];
+
+const CONTRACT_INTENT_CHOICES: &[BeginnerIntentChoice] = &[
+    BeginnerIntentChoice {
+        id: "unique",
+        label: "Keep the current API contract",
+        consequence: "Change the supplied value or operation to satisfy the existing contract directly.",
+    },
+    BeginnerIntentChoice {
+        id: "transfer",
+        label: "Change the surrounding contract",
+        consequence: "Update the signature or representation, then account for affected callers.",
+    },
+];
+
+fn beginner_intent_choices(category: &str) -> &'static [BeginnerIntentChoice] {
+    match category {
+        "use_after_move" | "partial_move" | "move_out_of_borrowed_content" => {
+            MOVE_INTENT_CHOICES
+        }
+        "multiple_mutable_borrows"
+        | "mutable_while_shared"
+        | "move_while_borrowed"
+        | "assign_while_borrowed"
+        | "use_while_mutably_borrowed" => BORROW_INTENT_CHOICES,
+        "immutable_mutation" => MUTATION_INTENT_CHOICES,
+        "missing_lifetime"
+        | "returning_local_reference"
+        | "borrowed_value_too_short"
+        | "temporary_dropped_while_borrowed" => LIFETIME_INTENT_CHOICES,
+        "closure_may_outlive_borrow" | "borrowed_data_escapes" => CAPTURE_INTENT_CHOICES,
+        _ => CONTRACT_INTENT_CHOICES,
+    }
+}
+
 fn render_workspace_intent_question(
+    problem: Option<&OwnershipProblem>,
     guide: &OwnershipWorkspaceGuide,
     selected_choice_id: Option<&str>,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     let Some(question) = guide.intent_question.as_ref() else {
-        return div().into_any_element();
+        let Some(problem) = problem else {
+            return div().into_any_element();
+        };
+        let choices = beginner_intent_choices(&problem.category);
+        let selected_consequence = selected_choice_id.and_then(|selected| {
+            choices
+                .iter()
+                .find(|choice| choice.id == selected)
+                .map(|choice| choice.consequence)
+        });
+        return v_flex()
+            .p_3()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().status().info)
+            .child(Label::new("What do you need this value to do?").size(LabelSize::Large))
+            .children(choices.iter().map(|choice| {
+                let choice_id = choice.id.to_owned();
+                let selected = selected_choice_id == Some(choice.id);
+                Button::new(
+                    SharedString::from(format!("beginner-intent-{}", choice.id)),
+                    format!("{} {}", if selected { "●" } else { "○" }, choice.label),
+                )
+                .toggle_state(selected)
+                .on_click(cx.listener(move |panel, _, _window, cx| {
+                    panel.selected_intent_choice_id = Some(choice_id.clone());
+                    cx.notify();
+                }))
+            }))
+            .when_some(selected_consequence, |this, consequence| {
+                this.child(
+                    Label::new(consequence)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .into_any_element();
     };
     let selected_consequence = selected_choice_id.and_then(|selected| {
         question
@@ -2888,7 +3046,7 @@ fn render_workspace_intent_question(
         .rounded_md()
         .border_1()
         .border_color(cx.theme().status().info)
-        .child(Label::new("Choose the intended behavior").size(LabelSize::Small))
+        .child(Label::new("What do you need this value to do?").size(LabelSize::Large))
         .child(Label::new(question.prompt.clone()).size(LabelSize::Small))
         .children(question.choices.iter().map(|choice| {
             let choice_id = choice.id.clone();
@@ -2897,6 +3055,7 @@ fn render_workspace_intent_question(
                 SharedString::from(format!("workspace-intent-{}-{choice_id}", question.id)),
                 format!("{} {}", if selected { "●" } else { "○" }, choice.label),
             )
+            .toggle_state(selected)
             .on_click(cx.listener(move |panel, _, _window, cx| {
                 panel.selected_intent_choice_id = Some(choice_id.clone());
                 cx.notify();
@@ -2961,6 +3120,7 @@ fn render_beginner_flow(
         }
         LearningView::Fixes => content
             .child(render_workspace_intent_question(
+                problem,
                 workspace_guide,
                 selected_intent_choice_id,
                 cx,
@@ -6457,7 +6617,7 @@ fn render_guided_repairs(
         .rounded_md()
         .border_1()
         .border_color(cx.theme().colors().border_variant)
-        .child(Label::new("4 · Fix and result").size(LabelSize::Small))
+        .child(Label::new("Repairs for that intent").size(LabelSize::Large))
         .child(
             Label::new(if selected_intent_choice_id.is_some() && !preferred_repairs.is_empty() {
                 "The first repair is ranked for the behavior you selected above. Check its edit scope and runtime trade-offs before applying it."
@@ -7809,6 +7969,41 @@ mod tests {
             intent_repair_rank(Some("shared_threads"), "arc_mutex", "Use Arc<Mutex<_>>")
                 < intent_repair_rank(Some("shared_threads"), "rc", "Use Rc<_>")
         );
+    }
+
+    #[test]
+    fn beginner_fix_choices_cover_each_design_shape() {
+        assert_eq!(
+            beginner_intent_choices("use_after_move")
+                .iter()
+                .map(|choice| choice.id)
+                .collect::<Vec<_>>(),
+            ["borrow", "transfer", "duplicate_or_share"]
+        );
+        assert_eq!(
+            beginner_intent_choices("multiple_mutable_borrows")
+                .iter()
+                .map(|choice| choice.id)
+                .collect::<Vec<_>>(),
+            ["end_first", "snapshot", "shared_runtime"]
+        );
+        assert_eq!(
+            beginner_intent_choices("immutable_mutation")
+                .iter()
+                .map(|choice| choice.id)
+                .collect::<Vec<_>>(),
+            ["unique", "shared_local", "shared_threads"]
+        );
+        for category in [
+            "returning_local_reference",
+            "closure_may_outlive_borrow",
+            "type_mismatch",
+        ] {
+            assert!(
+                beginner_intent_choices(category).len() >= 2,
+                "missing beginner intent choices for {category}"
+            );
+        }
     }
 
     #[test]
