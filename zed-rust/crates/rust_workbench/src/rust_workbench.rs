@@ -29,7 +29,7 @@ use gpui::{
 };
 use language::{Buffer, point_from_lsp, point_to_lsp};
 use project::{
-    Project,
+    Project, ProjectItem,
     lsp_store::rust_analyzer_ext::{
         self, OwnershipBinding, OwnershipLoanPoint, OwnershipModel, OwnershipProblem,
         OwnershipProblemCluster, OwnershipProblems, OwnershipWorkspaceGuide,
@@ -470,19 +470,43 @@ impl RustWorkbenchPanel {
                     },
                 );
                 let project_subscription = cx.subscribe(&project, |panel, _, event, cx| {
-                    if let project::Event::OwnershipModelChanged { uri, .. } = event
-                        && panel.owns_active_uri(uri, cx)
-                    {
-                        panel.last_model_key = None;
-                        panel.pending_model_key = None;
-                        panel.last_problem_key = None;
-                        panel.pending_problem_key = None;
-                        panel.validating_repair_id = None;
-                        panel.last_workspace_guide_key = None;
-                        panel.pending_workspace_guide_key = None;
-                        panel.workspace_guide = OwnershipWorkspaceGuide::default();
-                        panel.selected_intent_choice_id = None;
-                        panel.schedule_problem_scan(cx);
+                    match event {
+                        project::Event::OwnershipModelChanged { uri, .. }
+                            if panel.owns_active_uri(uri, cx) =>
+                        {
+                            panel.last_model_key = None;
+                            panel.pending_model_key = None;
+                            panel.last_problem_key = None;
+                            panel.pending_problem_key = None;
+                            panel.validating_repair_id = None;
+                            panel.last_workspace_guide_key = None;
+                            panel.pending_workspace_guide_key = None;
+                            panel.workspace_guide = OwnershipWorkspaceGuide::default();
+                            panel.selected_intent_choice_id = None;
+                            panel.schedule_problem_scan(cx);
+                        }
+                        // Cargo diagnostics can finish without an ownership-model artifact when
+                        // type checking fails before MIR is available. Rescan here so the early
+                        // native diagnostic snapshot cannot remain locked in the panel.
+                        project::Event::DiskBasedDiagnosticsFinished { .. }
+                            if panel.active_buffer.is_some() =>
+                        {
+                            panel.last_problem_key = None;
+                            panel.pending_problem_key = None;
+                            panel.schedule_problem_scan(cx);
+                        }
+                        project::Event::DiagnosticsUpdated { paths, .. }
+                            if panel
+                                .active_buffer
+                                .as_ref()
+                                .and_then(|buffer| buffer.read(cx).project_path(cx))
+                                .is_some_and(|active_path| paths.contains(&active_path)) =>
+                        {
+                            panel.last_problem_key = None;
+                            panel.pending_problem_key = None;
+                            panel.schedule_problem_scan(cx);
+                        }
+                        _ => {}
                     }
                 });
                 Self {
