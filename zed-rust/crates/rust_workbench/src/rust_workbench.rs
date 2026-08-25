@@ -244,10 +244,10 @@ pub fn init(cx: &mut App) {
                 panel.update(cx, |panel, cx| panel.select_relative_visual_step(1, cx));
             }
         });
-        workspace.register_action(|workspace, _: &FocusVisualStepSource, _window, cx| {
+        workspace.register_action(|workspace, _: &FocusVisualStepSource, window, cx| {
             if let Some(panel) = workspace.panel::<RustWorkbenchPanel>(cx) {
                 panel.update(cx, |panel, cx| {
-                    panel.select_visual_step(panel.visual_step, cx)
+                    panel.select_visual_step_and_focus(panel.visual_step, window, cx)
                 });
             }
         });
@@ -855,8 +855,8 @@ impl RustWorkbenchPanel {
         });
     }
 
-    fn select_visual_step(&mut self, index: usize, cx: &mut Context<Self>) {
-        let range = self
+    fn visual_step_range(&self, index: usize) -> Option<lsp::Range> {
+        self
             .model
             .memory_graph
             .snapshots
@@ -874,14 +874,30 @@ impl RustWorkbenchPanel {
                 visual_moments(self.selected_problem(), &self.model)
                     .get(index)
                     .map(|moment| moment.range)
-            });
-        let Some(range) = range else {
+            })
+    }
+
+    fn select_visual_step(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(range) = self.visual_step_range(index) else {
             return;
         };
         self.visual_step = index;
         self.update_topology_scene_step(index);
         self.cue_range(range, cx);
         cx.notify();
+    }
+
+    fn select_visual_step_and_focus(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(range) = self.visual_step_range(index) else {
+            return;
+        };
+        self.select_visual_step(index, cx);
+        self.focus_range_in_editor(range, window, cx);
     }
 
     fn select_relative_visual_step(&mut self, direction: isize, cx: &mut Context<Self>) {
@@ -2274,8 +2290,8 @@ impl Render for RustWorkbenchPanel {
                     panel.select_relative_visual_step(1, cx);
                 }))
                 .on_action(
-                    cx.listener(|panel, _: &FocusVisualStepSource, _window, cx| {
-                        panel.select_visual_step(panel.visual_step, cx);
+                    cx.listener(|panel, _: &FocusVisualStepSource, window, cx| {
+                        panel.select_visual_step_and_focus(panel.visual_step, window, cx);
                     }),
                 )
                 .size_full()
@@ -4074,8 +4090,13 @@ fn render_visual_timeline(
                         visual_phase_label(&moment.phase, index)
                     };
                     Button::new(SharedString::from(format!("visual-moment-{index}")), label)
-                        .on_click(cx.listener(move |panel, _, _window, cx| {
-                            panel.select_visual_step(index, cx);
+                        .aria_label(format!(
+                            "Show moment {} in the Rust editor: {}",
+                            index + 1,
+                            moment.title
+                        ))
+                        .on_click(cx.listener(move |panel, _, window, cx| {
+                            panel.select_visual_step_and_focus(index, window, cx);
                         }))
                 })),
         )
@@ -4100,9 +4121,9 @@ fn render_visual_timeline(
                     .child(Label::new(moment.explanation).size(LabelSize::Small))
                     .child(
                         Label::new(format!(
-                            "Source: line {} · state: {}",
+                            "Line {} · {}",
                             moment.range.start.line + 1,
-                            moment.state.replace('_', " ")
+                            visual_state_plain_label(&moment.state)
                         ))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
@@ -4110,6 +4131,24 @@ fn render_visual_timeline(
             )
         })
         .into_any_element()
+}
+
+fn visual_state_plain_label(state: &str) -> &'static str {
+    if state.contains("reject") || state.contains("invalid") || state.contains("blocked") {
+        "Operation blocked"
+    } else if state.contains("mutable") || state.contains("exclusive") {
+        "Exclusive edit access active"
+    } else if state.contains("borrow") || state.contains("read-only") {
+        "Temporary read access active"
+    } else if state.contains("move") || state.contains("unavailable") {
+        "Control transferred"
+    } else if state.contains("drop") || state.contains("dead") {
+        "Value cleaned up"
+    } else if state.contains("available") || state.contains("alive") {
+        "Available to use"
+    } else {
+        "Ownership state changed"
+    }
 }
 
 fn visual_phase_label(phase: &str, index: usize) -> String {
@@ -8907,5 +8946,24 @@ mod tests {
         assert_eq!(trace_arrow_label("clone"), "clone returns");
         assert_eq!(trace_arrow_label("borrow_shared"), "shared reference");
         assert_eq!(trace_arrow_label("borrow_mutable"), "exclusive reference");
+    }
+
+    #[test]
+    fn timeline_states_lead_with_plain_language() {
+        assert_eq!(visual_state_plain_label("available"), "Available to use");
+        assert_eq!(
+            visual_state_plain_label("borrowed_shared"),
+            "Temporary read access active"
+        );
+        assert_eq!(
+            visual_state_plain_label("borrowed_mutable"),
+            "Exclusive edit access active"
+        );
+        assert_eq!(visual_state_plain_label("moved"), "Control transferred");
+        assert_eq!(visual_state_plain_label("dropped"), "Value cleaned up");
+        assert_eq!(
+            visual_state_plain_label("operation_rejected"),
+            "Operation blocked"
+        );
     }
 }

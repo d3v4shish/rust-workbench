@@ -90,11 +90,12 @@ fn render_topology_node(
             .aria_label(accessible_name.clone())
             .aria_description("Select this value layer and reveal its source range")
             .tooltip(ui::Tooltip::text(accessible_name))
-            .on_click(cx.listener(move |panel, _, _window, cx| {
-                panel.inspect_topology_element(
+            .on_click(cx.listener(move |panel, _, window, cx| {
+                panel.inspect_topology_element_and_focus(
                     node_id.clone(),
                     inspection_summary.clone(),
                     range,
+                    window,
                     cx,
                 )
             })),
@@ -318,8 +319,14 @@ pub(super) fn render_topology_scene(
                     .aria_label(summary.clone())
                     .aria_description("Select this ownership relation and reveal its source")
                     .tooltip(ui::Tooltip::text(summary.clone()))
-                    .on_click(cx.listener(move |panel, _, _window, cx| {
-                        panel.inspect_topology_element(edge_id.clone(), summary.clone(), range, cx)
+                    .on_click(cx.listener(move |panel, _, window, cx| {
+                        panel.inspect_topology_element_and_focus(
+                            edge_id.clone(),
+                            summary.clone(),
+                            range,
+                            window,
+                            cx,
+                        )
                     }))
                 })),
             )
