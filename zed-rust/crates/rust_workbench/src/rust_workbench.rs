@@ -1428,34 +1428,9 @@ impl RustWorkbenchPanel {
                     match result {
                         Ok(guide) => {
                             panel.last_workspace_guide_key = Some(request_key.clone());
-                            let root_problem_id = selected_workspace_cluster(&guide)
-                                .map(|cluster| cluster.root_problem_id.clone());
                             panel.workspace_guide = guide;
-
-                            // A clicked diagnostic can be only a downstream symptom. If rustc's
-                            // causal identity points to a root in this file, lock the detailed
-                            // model to that root while retaining the clicked symptom for the tree.
-                            if let Some(root_problem_id) = root_problem_id
-                                && panel.selected_problem_id.as_deref()
-                                    != Some(root_problem_id.as_str())
-                                && panel
-                                    .problems
-                                    .problems
-                                    .iter()
-                                    .any(|problem| problem.id == root_problem_id)
-                            {
-                                panel.selected_problem_id = Some(root_problem_id);
-                                panel.selection_epoch = panel.selection_epoch.wrapping_add(1);
-                                panel.last_model_key = None;
-                                panel.pending_model_key = None;
-                                panel.model = OwnershipModel::default();
-                                panel.topology_scene = None;
-                                panel.full_topology_scene = None;
-                                panel.status_message =
-                                    "The guide selected the compiler root cause; the clicked error remains highlighted below."
-                                        .into();
-                                panel.schedule_refresh(cx);
-                            }
+                            // The guide carries its causal root in `selected_cluster_id`. Keep that
+                            // root in the impact tree without replacing the issue the user chose.
                         }
                         Err(error) => {
                             panel.last_workspace_guide_key = None;
