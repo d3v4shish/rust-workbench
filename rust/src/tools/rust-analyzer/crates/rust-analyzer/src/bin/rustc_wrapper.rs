@@ -6,9 +6,18 @@
 //!     https://github.com/intellij-rust/intellij-rust/blob/master/native-helper/src/main.rs
 use std::{
     ffi::OsString,
-    io,
+    fs, io,
+    path::PathBuf,
     process::{Command, ExitCode, Stdio},
+    time::SystemTime,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnershipArtifactStamp {
+    path: PathBuf,
+    length: u64,
+    modified: Option<SystemTime>,
+}
 
 pub(crate) fn main() -> io::Result<ExitCode> {
     let mut args = std::env::args_os();
@@ -40,9 +49,81 @@ fn run_rustc_with_ownership(
 ) -> io::Result<ExitCode> {
     let original = std::env::var_os("RA_ORIGINAL_RUSTC_WORKSPACE_WRAPPER");
     let model_directory = std::env::var_os("RA_OWNERSHIP_MODEL_DIR");
-    let (executable, args) =
-        ownership_invocation(rustc_executable, args, original, model_directory);
-    run_rustc(executable, args)
+    let checks_metadata = checks_metadata(&args);
+    let artifact_prefix = crate_name(&args).map(|name| format!("{name}-"));
+    let artifacts_before =
+        ownership_artifact_snapshot(model_directory.as_ref(), artifact_prefix.as_deref());
+    let (executable, instrumented_args) = ownership_invocation(
+        rustc_executable.clone(),
+        args.clone(),
+        original.clone(),
+        model_directory.clone(),
+    );
+    let instrumented_status = run_rustc(executable, instrumented_args)?;
+
+    // Some front-end errors stop the instrumented compiler before borrow checking. Run an
+    // unmodified diagnostic pass only when no model was produced, so rust-analyzer still receives
+    // rustc's complete error list without doubling the normal ownership-analysis workload.
+    let artifacts_after =
+        ownership_artifact_snapshot(model_directory.as_ref(), artifact_prefix.as_deref());
+    if needs_diagnostic_fallback(
+        checks_metadata,
+        model_directory.is_some(),
+        &artifacts_before,
+        &artifacts_after,
+    ) {
+        let (executable, args) = forwarded_rustc_invocation(rustc_executable, args, original);
+        return run_rustc(executable, args);
+    }
+
+    Ok(instrumented_status)
+}
+
+fn checks_metadata(args: &[OsString]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.starts_with("--emit=") && arg.contains("metadata") && !arg.contains("link")
+    })
+}
+
+fn crate_name(args: &[OsString]) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == "--crate-name")
+        .map(|pair| pair[1].to_string_lossy().into_owned())
+}
+
+fn ownership_artifact_snapshot(
+    model_directory: Option<&OsString>,
+    file_prefix: Option<&str>,
+) -> Vec<OwnershipArtifactStamp> {
+    let Some(model_directory) = model_directory else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(model_directory) else { return Vec::new() };
+    let mut snapshot = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|extension| extension == "json"))
+        .filter(|entry| {
+            file_prefix.is_none_or(|prefix| entry.file_name().to_string_lossy().starts_with(prefix))
+        })
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            Some(OwnershipArtifactStamp {
+                path: entry.path(),
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        })
+        .collect::<Vec<_>>();
+    snapshot.sort_by(|left, right| left.path.cmp(&right.path));
+    snapshot
+}
+
+fn needs_diagnostic_fallback(
+    checks_metadata: bool,
+    has_model_directory: bool,
+    artifacts_before: &[OwnershipArtifactStamp],
+    artifacts_after: &[OwnershipArtifactStamp],
+) -> bool {
+    checks_metadata && has_model_directory && artifacts_before == artifacts_after
 }
 
 fn ownership_invocation(
@@ -53,11 +134,7 @@ fn ownership_invocation(
 ) -> (OsString, Vec<OsString>) {
     let (executable, mut args) =
         forwarded_rustc_invocation(rustc_executable, args, original_wrapper);
-    let checks_metadata = args.iter().any(|arg| {
-        let arg = arg.to_string_lossy();
-        arg.starts_with("--emit=") && arg.contains("metadata") && !arg.contains("link")
-    });
-    if checks_metadata {
+    if checks_metadata(&args) {
         match model_directory {
             Some(directory) => {
                 let mut option = OsString::from("-Zborrowck-ownership-model=");
@@ -86,11 +163,7 @@ fn ownership_validation_invocation(
 ) -> (OsString, Vec<OsString>) {
     let (executable, mut args) =
         ownership_wrapper_invocation(rustc_executable, args, original_wrapper);
-    let checks_metadata = args.iter().any(|arg| {
-        let arg = arg.to_string_lossy();
-        arg.starts_with("--emit=") && arg.contains("metadata") && !arg.contains("link")
-    });
-    if checks_metadata
+    if checks_metadata(&args)
         && let Some(directory) = model_directory
         && !args.iter().any(|arg| arg.to_string_lossy().starts_with("-Zborrowck-ownership-model="))
     {
@@ -115,11 +188,7 @@ fn ownership_wrapper_invocation(
     mut args: Vec<OsString>,
     original_wrapper: Option<OsString>,
 ) -> (OsString, Vec<OsString>) {
-    let checks_metadata = args.iter().any(|arg| {
-        let arg = arg.to_string_lossy();
-        arg.starts_with("--emit=") && arg.contains("metadata") && !arg.contains("link")
-    });
-    if checks_metadata && !args.iter().any(|arg| arg == "-Zborrowck-wrapper-suggestions") {
+    if checks_metadata(&args) && !args.iter().any(|arg| arg == "-Zborrowck-wrapper-suggestions") {
         args.push("-Zborrowck-wrapper-suggestions".into());
     }
     forwarded_rustc_invocation(rustc_executable, args, original_wrapper)
@@ -261,5 +330,22 @@ mod tests {
         let (_, args) =
             ownership_wrapper_invocation("rustc".into(), vec!["--emit=dep-info,link".into()], None);
         assert_eq!(strings(args), ["--emit=dep-info,link"]);
+    }
+
+    #[test]
+    fn falls_back_to_complete_diagnostics_only_without_a_new_model() {
+        let before = vec![OwnershipArtifactStamp {
+            path: "/tmp/model.json".into(),
+            length: 10,
+            modified: None,
+        }];
+        let mut after = before.clone();
+
+        assert!(needs_diagnostic_fallback(true, true, &before, &after));
+        assert!(!needs_diagnostic_fallback(false, true, &before, &after));
+        assert!(!needs_diagnostic_fallback(true, false, &before, &after));
+
+        after[0].length += 1;
+        assert!(!needs_diagnostic_fallback(true, true, &before, &after));
     }
 }
