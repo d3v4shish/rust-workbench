@@ -2090,7 +2090,7 @@ impl Panel for RustWorkbenchPanel {
     }
 
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
-        false
+        true
     }
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
