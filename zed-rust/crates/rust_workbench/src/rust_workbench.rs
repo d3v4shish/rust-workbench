@@ -768,6 +768,50 @@ impl RustWorkbenchPanel {
         self.select_problem_index(index, true, cx);
     }
 
+    fn focus_problem_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(range) = self
+            .problems
+            .problems
+            .get(index)
+            .map(|problem| problem.primary_range)
+        else {
+            return;
+        };
+        self.select_problem_index(index, false, cx);
+        self.cue_range(range, cx);
+
+        let (Some(buffer), Some(editor)) = (
+            self.active_buffer.clone(),
+            self.active_editor.as_ref().and_then(WeakEntity::upgrade),
+        ) else {
+            return;
+        };
+        let text_range = {
+            let snapshot = buffer.read(cx).snapshot();
+            let start = snapshot.clip_point_utf16(point_from_lsp(range.start), Bias::Left);
+            let end = snapshot.clip_point_utf16(point_from_lsp(range.end), Bias::Right);
+            snapshot.anchor_after(snapshot.point_utf16_to_point(start))
+                ..snapshot.anchor_before(snapshot.point_utf16_to_point(end))
+        };
+        let multi_range = {
+            let multibuffer = editor.read(cx).buffer().clone();
+            let snapshot = multibuffer.read(cx).snapshot(cx);
+            snapshot.buffer_anchor_range_to_anchor_range(text_range)
+        };
+        let Some(multi_range) = multi_range else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::center()),
+                window,
+                cx,
+                |selections| selections.select_ranges([multi_range]),
+            );
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+    }
+
     fn select_visual_step(&mut self, index: usize, cx: &mut Context<Self>) {
         let range = self
             .model
@@ -2353,11 +2397,13 @@ impl Render for RustWorkbenchPanel {
                                         issue.binding_name
                                     ),
                                 )
-                                .on_click(cx.listener(
-                                    move |panel, _, _window, cx| {
-                                        panel.select_problem_index(index, true, cx);
-                                    },
+                                .aria_label(format!(
+                                    "Focus {code} on line {} in the Rust editor",
+                                    issue.primary_range.start.line + 1
                                 ))
+                                .on_click(cx.listener(move |panel, _, window, cx| {
+                                    panel.focus_problem_index(index, window, cx);
+                                }))
                             })),
                     )
                 })
