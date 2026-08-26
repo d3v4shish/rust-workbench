@@ -12,14 +12,18 @@ use ownership_topology::{
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::Range,
+    sync::Arc,
     time::Duration,
 };
 
 use db::kvp::KeyValueStore;
 use editor::{
-    Editor, EditorEvent, HighlightKey, RowHighlightOptions, RustInlineDiagnosticMode,
+    Anchor, Editor, EditorEvent, HighlightKey, RowHighlightOptions, RustInlineDiagnosticMode,
     RustMechanicsHintMode, RustOwnershipDisplayPreferences, RustOwnershipDisplayProfile,
-    RustOwnershipHintScope, SelectionEffects, actions::OpenRustWorkbenchForClue,
+    RustOwnershipHintScope, SelectionEffects,
+    actions::OpenRustWorkbenchForClue,
+    display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
     scroll::Autoscroll,
 };
 use gpui::{
@@ -38,7 +42,10 @@ use project::{
     },
 };
 use text::{Bias, Point, PointUtf16, ToPointUtf16};
-use ui::{Button, Color, IconName, Label, LabelSize, prelude::*, utils::WithRemSize, v_flex};
+use ui::{
+    Button, Color, IconButton, IconName, Label, LabelSize, Tooltip, prelude::*, utils::WithRemSize,
+    v_flex,
+};
 use workspace::{
     ItemHandle, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -77,56 +84,90 @@ const PANEL_FONT_SCALE_STEP_PERCENT: i16 = 10;
 struct OwnershipStudioCue;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum LearningView {
+enum GuideStage {
     #[default]
-    Story,
-    Memory,
-    Timeline,
-    Fixes,
+    Explain,
+    Visualize,
+    Fix,
 }
 
-impl LearningView {
-    const ALL: [Self; 4] = [Self::Story, Self::Memory, Self::Timeline, Self::Fixes];
+impl GuideStage {
+    const ALL: [Self; 3] = [Self::Explain, Self::Visualize, Self::Fix];
 
     fn label(self) -> &'static str {
         match self {
-            Self::Story => "Story",
-            Self::Memory => "Memory",
-            Self::Timeline => "Timeline",
-            Self::Fixes => "Fix choices",
+            Self::Explain => "Explain",
+            Self::Visualize => "Visualize",
+            Self::Fix => "Fix",
         }
     }
 
     fn id(self) -> &'static str {
         match self {
-            Self::Story => "story",
-            Self::Memory => "memory",
-            Self::Timeline => "timeline",
-            Self::Fixes => "fixes",
+            Self::Explain => "explain",
+            Self::Visualize => "visualize",
+            Self::Fix => "fix",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LearningSemantic {
+    Available,
+    Borrowed,
+    Transition,
+    Blocked,
+    Neutral,
+}
+
+impl LearningSemantic {
+    fn color(self) -> Color {
+        match self {
+            Self::Available => Color::Success,
+            Self::Borrowed => Color::Info,
+            Self::Transition => Color::Warning,
+            Self::Blocked => Color::Error,
+            Self::Neutral => Color::Muted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IssueSourceLine {
+    line: Option<u32>,
+    text: String,
+    semantic: LearningSemantic,
+    focus_range: Option<lsp::Range>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct IssueSourceExcerpt {
+    lines: Vec<IssueSourceLine>,
+}
+
+#[derive(Clone, Debug)]
+struct RustLearningAnnotation {
+    range: lsp::Range,
+    label: String,
+    semantic: LearningSemantic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DetailDrawer {
-    Why,
     Variables,
     Lifetimes,
     Calls,
     Layout,
-    C,
     Evidence,
 }
 
 impl DetailDrawer {
     fn label(self) -> &'static str {
         match self {
-            Self::Why => "Why",
             Self::Variables => "Variables",
             Self::Lifetimes => "Lifetimes",
             Self::Calls => "Calls",
             Self::Layout => "Layout",
-            Self::C => "Conceptual C",
             Self::Evidence => "Evidence",
         }
     }
@@ -200,27 +241,13 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenRustWorkbenchForClue, window, cx| {
             workspace.open_panel::<RustWorkbenchPanel>(window, cx);
             if let Some(panel) = workspace.panel::<RustWorkbenchPanel>(cx) {
-                panel.update(cx, |panel, cx| {
-                    // The editor has already placed the cursor at the semantic
-                    // clue's source anchor. Unlock the previous diagnostic so
-                    // the next bounded scan can select the exact field/place.
-                    panel.observe_active_editor(cx);
-                    panel.selected_problem_id = None;
-                    panel.operation_focus_requested = true;
-                    panel.selection_epoch = panel.selection_epoch.wrapping_add(1);
-                    panel.last_problem_key = None;
-                    panel.pending_problem_key = None;
-                    panel.last_model_key = None;
-                    panel.pending_model_key = None;
-                    panel.last_workspace_guide_key = None;
-                    panel.pending_workspace_guide_key = None;
-                    panel.workspace_guide = OwnershipWorkspaceGuide::default();
-                    panel.selected_symptom_problem_id = None;
-                    panel.selected_intent_choice_id = None;
-                    panel.selected_topology_element = None;
-                    panel.schedule_refresh(cx);
-                    panel.schedule_problem_scan(cx);
-                    cx.notify();
+                // Action callbacks hold a mutable Workspace lease. Defer the panel work because
+                // observing the active editor reads Workspace and GPUI rejects nested leases.
+                let panel = panel.downgrade();
+                cx.defer(move |cx| {
+                    if let Some(panel) = panel.upgrade() {
+                        panel.update(cx, |panel, cx| panel.open_for_clue(cx));
+                    }
                 });
             }
         });
@@ -279,6 +306,9 @@ pub struct RustWorkbenchPanel {
     last_workspace_guide_key: Option<WorkspaceGuideRequestKey>,
     pending_workspace_guide_key: Option<WorkspaceGuideRequestKey>,
     active_editor: Option<WeakEntity<Editor>>,
+    learning_annotation_editor: Option<WeakEntity<Editor>>,
+    learning_annotation_key: Option<LearningAnnotationKey>,
+    learning_annotation_block_ids: Vec<CustomBlockId>,
     editor_subscription: Option<Subscription>,
     refresh_task: Task<()>,
     problem_scan_task: Task<()>,
@@ -287,9 +317,10 @@ pub struct RustWorkbenchPanel {
     font_scale_percent: u16,
     display_preferences: RustOwnershipDisplayPreferences,
     show_display_controls: bool,
+    show_inline_guide: bool,
     show_issue_list: bool,
     show_workspace_roots: bool,
-    learning_view: LearningView,
+    guide_stage: GuideStage,
     active_detail_drawer: Option<DetailDrawer>,
     expanded_operations: BTreeSet<String>,
     repair_verification: Option<RepairVerification>,
@@ -328,6 +359,18 @@ struct WorkspaceGuideRequestKey {
     selection_epoch: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LearningAnnotationKey {
+    editor_id: EntityId,
+    buffer_id: EntityId,
+    source_hash: String,
+    problem_id: String,
+    category: String,
+    binding_range: lsp::Range,
+    operation_range: Option<lsp::Range>,
+    primary_range: lsp::Range,
+}
+
 fn model_response_is_current(
     pending: Option<&ModelRequestKey>,
     request: &ModelRequestKey,
@@ -337,6 +380,23 @@ fn model_response_is_current(
     pending == Some(request)
         && selection_epoch == request.selection_epoch
         && selected_problem_id == request.problem_id.as_deref()
+}
+
+fn text_anchor_range_for_lsp(
+    snapshot: &language::BufferSnapshot,
+    range: lsp::Range,
+) -> Option<Range<text::Anchor>> {
+    if range.start.line > range.end.line
+        || range.start.line == range.end.line && range.start.character > range.end.character
+    {
+        return None;
+    }
+    let start = snapshot.clip_point_utf16(point_from_lsp(range.start), Bias::Left);
+    let end = snapshot.clip_point_utf16(point_from_lsp(range.end), Bias::Right);
+    Some(
+        snapshot.anchor_after(snapshot.point_utf16_to_point(start))
+            ..snapshot.anchor_before(snapshot.point_utf16_to_point(end)),
+    )
 }
 
 fn default_problem_index(problem_count: usize, operation_focus_requested: bool) -> Option<usize> {
@@ -473,6 +533,29 @@ impl Render for OwnershipCoachBanner {
 }
 
 impl RustWorkbenchPanel {
+    fn open_for_clue(&mut self, cx: &mut Context<Self>) {
+        // The editor has already placed the cursor at the semantic clue's source anchor. Unlock
+        // the previous diagnostic so the next bounded scan can select the exact field/place.
+        self.observe_active_editor(cx);
+        self.selected_problem_id = None;
+        self.clear_learning_annotations(cx);
+        self.operation_focus_requested = true;
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        self.last_problem_key = None;
+        self.pending_problem_key = None;
+        self.last_model_key = None;
+        self.pending_model_key = None;
+        self.last_workspace_guide_key = None;
+        self.pending_workspace_guide_key = None;
+        self.workspace_guide = OwnershipWorkspaceGuide::default();
+        self.selected_symptom_problem_id = None;
+        self.selected_intent_choice_id = None;
+        self.selected_topology_element = None;
+        self.schedule_refresh(cx);
+        self.schedule_problem_scan(cx);
+        cx.notify();
+    }
+
     pub async fn load(
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
@@ -566,6 +649,9 @@ impl RustWorkbenchPanel {
                     last_workspace_guide_key: None,
                     pending_workspace_guide_key: None,
                     active_editor: None,
+                    learning_annotation_editor: None,
+                    learning_annotation_key: None,
+                    learning_annotation_block_ids: Vec::new(),
                     editor_subscription: None,
                     refresh_task: Task::ready(()),
                     problem_scan_task: Task::ready(()),
@@ -574,9 +660,10 @@ impl RustWorkbenchPanel {
                     font_scale_percent: DEFAULT_PANEL_FONT_SCALE_PERCENT,
                     display_preferences,
                     show_display_controls: false,
+                    show_inline_guide: true,
                     show_issue_list: false,
                     show_workspace_roots: false,
-                    learning_view: LearningView::default(),
+                    guide_stage: GuideStage::default(),
                     active_detail_drawer: None,
                     expanded_operations: BTreeSet::new(),
                     repair_verification: None,
@@ -602,8 +689,10 @@ impl RustWorkbenchPanel {
             .and_then(|workspace| workspace.read(cx).active_item_as::<Editor>(cx));
         if editor.as_ref().map(Entity::downgrade) == self.active_editor {
             self.apply_display_to_editor(cx);
+            self.sync_learning_annotations(cx);
             return;
         }
+        self.clear_learning_annotations(cx);
         self.clear_editor_cue(cx);
         self.last_model_key = None;
         self.pending_model_key = None;
@@ -646,6 +735,7 @@ impl RustWorkbenchPanel {
                         | EditorEvent::FileHandleChanged
                 );
                 if source_changed {
+                    panel.clear_learning_annotations(cx);
                     panel.last_model_key = None;
                     panel.pending_model_key = None;
                     panel.last_problem_key = None;
@@ -698,6 +788,241 @@ impl RustWorkbenchPanel {
             editor.clear_row_highlights::<OwnershipStudioCue>();
             cx.notify();
         });
+    }
+
+    fn clear_learning_annotations(&mut self, cx: &mut Context<Self>) {
+        self.learning_annotation_key = None;
+        let block_ids = std::mem::take(&mut self.learning_annotation_block_ids);
+        let editor = self
+            .learning_annotation_editor
+            .take()
+            .and_then(|editor| editor.upgrade());
+        if block_ids.is_empty() {
+            return;
+        }
+        if let Some(editor) = editor {
+            editor.update(cx, |editor, cx| {
+                editor.remove_blocks(block_ids.into_iter().collect(), None, cx);
+            });
+        }
+    }
+
+    fn editor_range_for_lsp(&self, range: lsp::Range, cx: &App) -> Option<Range<Anchor>> {
+        let buffer_id = self.active_buffer.as_ref()?.read(cx).remote_id();
+        let editor = self.active_editor.as_ref()?.upgrade()?;
+        let multibuffer = editor.read(cx).buffer().clone();
+        let snapshot = multibuffer.read(cx).snapshot(cx);
+        let buffer_snapshot = snapshot.as_singleton()?;
+        if buffer_snapshot.remote_id() != buffer_id {
+            return None;
+        }
+        let buffer_range = text_anchor_range_for_lsp(buffer_snapshot, range)?;
+        snapshot.buffer_anchor_range_to_anchor_range(buffer_range)
+    }
+
+    fn sync_learning_annotations(&mut self, cx: &mut Context<Self>) {
+        if !self.active || !self.show_inline_guide {
+            self.clear_learning_annotations(cx);
+            return;
+        }
+        let (Some(problem), Some(buffer), Some(editor)) = (
+            self.selected_problem().cloned(),
+            self.active_buffer.clone(),
+            self.active_editor.as_ref().and_then(WeakEntity::upgrade),
+        ) else {
+            self.clear_learning_annotations(cx);
+            return;
+        };
+        let operation_range = problem
+            .related_ranges
+            .first()
+            .copied()
+            .or_else(|| problem.related.first().map(|related| related.range));
+        let annotation_key = LearningAnnotationKey {
+            editor_id: editor.entity_id(),
+            buffer_id: buffer.entity_id(),
+            source_hash: self.problems.source_hash.clone(),
+            problem_id: problem.id.clone(),
+            category: problem.category.clone(),
+            binding_range: problem.binding_range,
+            operation_range,
+            primary_range: problem.primary_range,
+        };
+        if self.learning_annotation_key.as_ref() == Some(&annotation_key)
+            && self
+                .learning_annotation_editor
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .is_some_and(|current| current == editor)
+        {
+            return;
+        }
+        self.clear_learning_annotations(cx);
+
+        let buffer_id = buffer.read(cx).remote_id();
+        let multibuffer = editor.read(cx).buffer().clone();
+        let snapshot = multibuffer.read(cx).snapshot(cx);
+        let Some(buffer_snapshot) = snapshot.as_singleton() else {
+            return;
+        };
+        if buffer_snapshot.remote_id() != buffer_id {
+            return;
+        }
+        let source = buffer_snapshot.text();
+        if !ownership_problems_match_source(&self.problems, &source) {
+            return;
+        }
+        let anchor_for_range = |range| {
+            let buffer_range = text_anchor_range_for_lsp(buffer_snapshot, range)?;
+            snapshot
+                .buffer_anchor_range_to_anchor_range(buffer_range)
+                .map(|range| range.start)
+        };
+        let facts = guided_issue_facts(&problem, &self.model);
+        let narrative = learning_catalog::beginner_narrative(&problem.category, &facts.target);
+        let comparison =
+            learning_catalog::beginner_code_comparison(&problem.category, &facts.target);
+        let annotations = learning_annotations_for_problem(&problem);
+        let panel = cx.weak_entity();
+        let mut blocks = annotations
+            .into_iter()
+            .filter_map(|annotation| {
+                let anchor = anchor_for_range(annotation.range)?;
+                let label = annotation.label;
+                let semantic = annotation.semantic;
+                let panel = panel.clone();
+                Some(BlockProperties {
+                    placement: BlockPlacement::Near(anchor),
+                    height: Some(1),
+                    style: BlockStyle::Flex,
+                    priority: 2,
+                    render: Arc::new(move |bcx| {
+                        let panel = panel.clone();
+                        h_flex()
+                            .id(SharedString::from(format!("rust-learning-tag-{label}")))
+                            .px_1()
+                            .gap_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(match semantic {
+                                LearningSemantic::Available => {
+                                    bcx.theme().status().success_background.opacity(0.18)
+                                }
+                                LearningSemantic::Borrowed => {
+                                    bcx.theme().status().info_background.opacity(0.18)
+                                }
+                                LearningSemantic::Transition => {
+                                    bcx.theme().status().warning_background.opacity(0.18)
+                                }
+                                LearningSemantic::Blocked => {
+                                    bcx.theme().status().error_background.opacity(0.18)
+                                }
+                                LearningSemantic::Neutral => {
+                                    bcx.theme().colors().element_background
+                                }
+                            })
+                            .child(div().size(px(6.)).rounded_full().bg(match semantic {
+                                LearningSemantic::Available => bcx.theme().status().success,
+                                LearningSemantic::Borrowed => bcx.theme().status().info,
+                                LearningSemantic::Transition => bcx.theme().status().warning,
+                                LearningSemantic::Blocked => bcx.theme().status().error,
+                                LearningSemantic::Neutral => bcx.theme().colors().border_variant,
+                            }))
+                            .child(Label::new(label.clone()).size(LabelSize::XSmall))
+                            .on_click(move |_, _window, cx| {
+                                panel
+                                    .update(cx, |panel, cx| {
+                                        panel.guide_stage = GuideStage::Explain;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            })
+                            .into_any_element()
+                    }),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(anchor) = anchor_for_range(problem.primary_range) {
+            let reason = narrative.rust_model;
+            let suggestion = comparison.difference;
+            let example = comparison
+                .rust_pattern
+                .lines()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let explain_panel = panel.clone();
+            let fix_panel = panel;
+            blocks.push(BlockProperties {
+                placement: BlockPlacement::Below(anchor),
+                height: None,
+                style: BlockStyle::Flex,
+                priority: 2,
+                render: Arc::new(move |bcx| {
+                    let explain_panel = explain_panel.clone();
+                    let fix_panel = fix_panel.clone();
+                    v_flex()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .border_l_2()
+                        .border_color(bcx.theme().status().error)
+                        .bg(bcx.theme().colors().editor_background)
+                        .child(
+                            Label::new(format!("Why: {reason}"))
+                                .size(LabelSize::XSmall)
+                                .line_clamp(3),
+                        )
+                        .child(
+                            Label::new(format!("Try: {suggestion}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning)
+                                .line_clamp(3),
+                        )
+                        .child(
+                            Label::new(example.clone())
+                                .size(LabelSize::XSmall)
+                                .buffer_font(bcx)
+                                .line_clamp(3),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(Button::new("inline-learning-explain", "Explain").on_click(
+                                    move |_, _window, cx| {
+                                        explain_panel
+                                            .update(cx, |panel, cx| {
+                                                panel.guide_stage = GuideStage::Explain;
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    },
+                                ))
+                                .child(Button::new("inline-learning-fix", "Fix choices").on_click(
+                                    move |_, _window, cx| {
+                                        fix_panel
+                                            .update(cx, |panel, cx| {
+                                                panel.guide_stage = GuideStage::Fix;
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    },
+                                )),
+                        )
+                        .into_any_element()
+                }),
+            });
+        }
+
+        if blocks.is_empty() {
+            return;
+        }
+        self.learning_annotation_editor = Some(editor.downgrade());
+        self.learning_annotation_block_ids =
+            editor.update(cx, |editor, cx| editor.insert_blocks(blocks, None, cx));
+        self.learning_annotation_key = Some(annotation_key);
     }
 
     pub fn ownership_problems(&self) -> &[OwnershipProblem] {
@@ -786,6 +1111,7 @@ impl RustWorkbenchPanel {
             self.cue_range(range, cx);
         }
         self.apply_display_to_editor(cx);
+        self.sync_learning_annotations(cx);
         self.schedule_refresh(cx);
         self.schedule_workspace_guide(cx);
         cx.notify();
@@ -823,25 +1149,10 @@ impl RustWorkbenchPanel {
     ) {
         self.cue_range(range, cx);
 
-        let (Some(buffer), Some(editor)) = (
-            self.active_buffer.clone(),
-            self.active_editor.as_ref().and_then(WeakEntity::upgrade),
-        ) else {
+        let Some(editor) = self.active_editor.as_ref().and_then(WeakEntity::upgrade) else {
             return;
         };
-        let text_range = {
-            let snapshot = buffer.read(cx).snapshot();
-            let start = snapshot.clip_point_utf16(point_from_lsp(range.start), Bias::Left);
-            let end = snapshot.clip_point_utf16(point_from_lsp(range.end), Bias::Right);
-            snapshot.anchor_after(snapshot.point_utf16_to_point(start))
-                ..snapshot.anchor_before(snapshot.point_utf16_to_point(end))
-        };
-        let multi_range = {
-            let multibuffer = editor.read(cx).buffer().clone();
-            let snapshot = multibuffer.read(cx).snapshot(cx);
-            snapshot.buffer_anchor_range_to_anchor_range(text_range)
-        };
-        let Some(multi_range) = multi_range else {
+        let Some(multi_range) = self.editor_range_for_lsp(range, cx) else {
             return;
         };
         editor.update(cx, |editor, cx| {
@@ -856,8 +1167,7 @@ impl RustWorkbenchPanel {
     }
 
     fn visual_step_range(&self, index: usize) -> Option<lsp::Range> {
-        self
-            .model
+        self.model
             .memory_graph
             .snapshots
             .get(index)
@@ -1470,6 +1780,7 @@ impl RustWorkbenchPanel {
                                 }
                                 panel.selected_problem_id = selected_id;
                                 panel.apply_display_to_editor(cx);
+                                panel.sync_learning_annotations(cx);
                                 if panel.active {
                                     panel.schedule_refresh(cx);
                                     panel.schedule_workspace_guide(cx);
@@ -1541,7 +1852,7 @@ impl RustWorkbenchPanel {
             .then(|| self.workspace_guide.revision.clone());
         let request = rust_analyzer_ext::ownership_workspace_guide(
             self.project.clone(),
-            buffer.clone(),
+            buffer,
             position,
             requested_problem_id,
             expected_revision,
@@ -1586,25 +1897,10 @@ impl RustWorkbenchPanel {
     }
 
     fn cue_range(&mut self, range: lsp::Range, cx: &mut Context<Self>) {
-        let (Some(buffer), Some(editor)) = (
-            self.active_buffer.clone(),
-            self.active_editor.as_ref().and_then(WeakEntity::upgrade),
-        ) else {
+        let Some(editor) = self.active_editor.as_ref().and_then(WeakEntity::upgrade) else {
             return;
         };
-        let text_range = {
-            let snapshot = buffer.read(cx).snapshot();
-            let start = snapshot.clip_point_utf16(point_from_lsp(range.start), Bias::Left);
-            let end = snapshot.clip_point_utf16(point_from_lsp(range.end), Bias::Right);
-            snapshot.anchor_after(snapshot.point_utf16_to_point(start))
-                ..snapshot.anchor_before(snapshot.point_utf16_to_point(end))
-        };
-        let multi_range = {
-            let multibuffer = editor.read(cx).buffer().clone();
-            let snapshot = multibuffer.read(cx).snapshot(cx);
-            snapshot.buffer_anchor_range_to_anchor_range(text_range)
-        };
-        let Some(multi_range) = multi_range else {
+        let Some(multi_range) = self.editor_range_for_lsp(range, cx) else {
             return;
         };
         editor.update(cx, |editor, cx| {
@@ -1738,6 +2034,7 @@ impl RustWorkbenchPanel {
                                 panel.rebuild_topology_scene();
                                 panel.last_model_key = Some(request_key.clone());
                                 panel.apply_display_to_editor(cx);
+                                panel.sync_learning_annotations(cx);
                                 if let Some(range) = panel
                                     .selected_problem()
                                     .map(|problem| problem.primary_range)
@@ -2227,6 +2524,7 @@ impl Panel for RustWorkbenchPanel {
                 }
             } else {
                 panel.clear_editor_cue(cx);
+                panel.clear_learning_annotations(cx);
             }
         });
     }
@@ -2251,6 +2549,11 @@ impl Render for RustWorkbenchPanel {
         let workspace_guide = self.workspace_guide.clone();
         let selected_intent_choice_id = self.selected_intent_choice_id.clone();
         let problem = self.selected_problem().cloned();
+        let active_source_excerpt = problem.as_ref().and_then(|problem| {
+            self.active_buffer.as_ref().map(|buffer| {
+                issue_source_excerpt_from_snapshot(&buffer.read(cx).snapshot(), problem)
+            })
+        });
         let problem_count = self.problems.problems.len();
         let issue_list = self.problems.problems.clone();
         let selected_problem_index = self.selected_problem_index();
@@ -2266,9 +2569,10 @@ impl Render for RustWorkbenchPanel {
         let font_scale_percent = self.font_scale_percent;
         let display_preferences = self.display_preferences.clone();
         let show_display_controls = self.show_display_controls;
+        let show_inline_guide = self.show_inline_guide;
         let show_issue_list = self.show_issue_list;
         let show_workspace_roots = self.show_workspace_roots;
-        let learning_view = self.learning_view;
+        let guide_stage = self.guide_stage;
         let panel_rem_size = window.rem_size() * (f32::from(font_scale_percent) / 100.0);
         let problem_status = self.problem_status.clone();
         let status_message = self.status_message.clone();
@@ -2289,168 +2593,189 @@ impl Render for RustWorkbenchPanel {
                 .on_action(cx.listener(|panel, _: &NextVisualStep, _window, cx| {
                     panel.select_relative_visual_step(1, cx);
                 }))
-                .on_action(
-                    cx.listener(|panel, _: &FocusVisualStepSource, window, cx| {
-                        panel.select_visual_step_and_focus(panel.visual_step, window, cx);
-                    }),
-                )
+                .on_action(cx.listener(|panel, _: &FocusVisualStepSource, window, cx| {
+                    panel.select_visual_step_and_focus(panel.visual_step, window, cx);
+                }))
                 .size_full()
                 .bg(cx.theme().colors().panel_background)
-                .border_t_2()
-                .border_color(cx.theme().status().error)
                 .child(
-                    h_flex()
+                    v_flex()
                         .p_2()
                         .gap_1()
-                        .justify_between()
                         .border_b_1()
                         .border_color(cx.theme().colors().border)
-                        .child(Label::new("Rust guide").size(LabelSize::Small))
                         .child(
                             h_flex()
+                                .justify_between()
                                 .gap_1()
                                 .child(
-                                    Button::new(
-                                        "rust-learning-display",
-                                        format!(
-                                            "Clues: {}",
-                                            match display_preferences.mechanics_mode {
-                                                RustMechanicsHintMode::Off => "off",
-                                                RustMechanicsHintMode::SelectedPath => "path",
-                                                RustMechanicsHintMode::ConfiguredScope => "scope",
-                                            }
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_0p5()
+                                        .child(
+                                            Label::new("Rust learning guide")
+                                                .size(LabelSize::Small),
+                                        )
+                                        .child(
+                                            Label::new(selected_problem_label.unwrap_or_else(
+                                                || "Waiting for a Rust issue".to_owned(),
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate(),
                                         ),
-                                    )
-                                    .aria_expanded(show_display_controls)
-                                    .aria_label("Configure inline Rust ownership clues")
-                                    .on_click(cx.listener(
-                                        |panel, _, _window, cx| {
-                                            panel.show_display_controls =
-                                                !panel.show_display_controls;
-                                            cx.notify();
-                                        },
-                                    )),
                                 )
                                 .child(
-                                    Button::new("decrease-coach-font", "A−")
-                                        .on_click(cx.listener(|panel, _, _window, cx| {
-                                            panel.adjust_font_scale(
-                                                -PANEL_FONT_SCALE_STEP_PERCENT,
-                                                cx,
-                                            );
-                                        }))
-                                        .aria_label("Decrease Rust guide font size"),
-                                )
-                                .child(
-                                    Button::new("increase-coach-font", "A+")
-                                        .on_click(cx.listener(|panel, _, _window, cx| {
-                                            panel.adjust_font_scale(
-                                                PANEL_FONT_SCALE_STEP_PERCENT,
-                                                cx,
-                                            );
-                                        }))
-                                        .aria_label("Increase Rust guide font size"),
-                                )
-                                .child(
-                                    Button::new("refresh-ownership", "↻")
-                                        .aria_label("Refresh compiler ownership facts")
-                                        .on_click(cx.listener(|panel, _, _window, cx| {
-                                            panel.last_model_key = None;
-                                            panel.pending_model_key = None;
-                                            panel.last_problem_key = None;
-                                            panel.pending_problem_key = None;
-                                            panel.last_workspace_guide_key = None;
-                                            panel.pending_workspace_guide_key = None;
-                                            panel.workspace_guide =
-                                                OwnershipWorkspaceGuide::default();
-                                            panel.selected_intent_choice_id = None;
-                                            panel.schedule_problem_scan(cx);
-                                        })),
+                                    h_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            IconButton::new(
+                                                "rust-learning-display",
+                                                IconName::Settings,
+                                            )
+                                            .toggle_state(show_display_controls)
+                                            .aria_expanded(show_display_controls)
+                                            .aria_label("Configure Rust learning display")
+                                            .tooltip(Tooltip::text("Display settings"))
+                                            .on_click(
+                                                cx.listener(|panel, _, _window, cx| {
+                                                    panel.show_display_controls =
+                                                        !panel.show_display_controls;
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                "refresh-ownership",
+                                                IconName::RefreshTitle,
+                                            )
+                                            .aria_label("Refresh compiler ownership facts")
+                                            .tooltip(Tooltip::text("Refresh compiler facts"))
+                                            .on_click(
+                                                cx.listener(|panel, _, _window, cx| {
+                                                    panel.last_model_key = None;
+                                                    panel.pending_model_key = None;
+                                                    panel.last_problem_key = None;
+                                                    panel.pending_problem_key = None;
+                                                    panel.last_workspace_guide_key = None;
+                                                    panel.pending_workspace_guide_key = None;
+                                                    panel.workspace_guide =
+                                                        OwnershipWorkspaceGuide::default();
+                                                    panel.selected_intent_choice_id = None;
+                                                    panel.schedule_problem_scan(cx);
+                                                }),
+                                            ),
+                                        ),
                                 ),
+                        )
+                        .when(problem_count > 0, |this| {
+                            this.child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_1()
+                                    .child(
+                                        IconButton::new(
+                                            "previous-ownership-issue",
+                                            IconName::ArrowLeft,
+                                        )
+                                        .on_click(cx.listener(|panel, _, _window, cx| {
+                                            panel.select_relative_problem(-1, cx);
+                                        }))
+                                        .tooltip(Tooltip::text("Previous compiler issue"))
+                                        .aria_label("Previous compiler issue; Up Arrow"),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .justify_center()
+                                            .gap_1()
+                                            .child(
+                                                Label::new(selected_problem_index.map_or_else(
+                                                    || format!("{problem_count} issues"),
+                                                    |index| {
+                                                        format!("{} / {problem_count}", index + 1)
+                                                    },
+                                                ))
+                                                .size(LabelSize::Small),
+                                            )
+                                            .child(
+                                                Label::new("compiler issue")
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Error),
+                                            ),
+                                    )
+                                    .child(
+                                        IconButton::new(
+                                            "next-ownership-issue",
+                                            IconName::ArrowRight,
+                                        )
+                                        .on_click(cx.listener(|panel, _, _window, cx| {
+                                            panel.select_relative_problem(1, cx);
+                                        }))
+                                        .tooltip(Tooltip::text("Next compiler issue"))
+                                        .aria_label("Next compiler issue; Down Arrow"),
+                                    )
+                                    .when_some(selected_problem_range, |this, range| {
+                                        this.child(
+                                            IconButton::new(
+                                                "show-selected-ownership-issue",
+                                                IconName::Code,
+                                            )
+                                            .aria_label(
+                                                "Show the selected compiler issue in Rust source",
+                                            )
+                                            .tooltip(Tooltip::text("Show in source"))
+                                            .on_click(
+                                                cx.listener(move |panel, _, _window, cx| {
+                                                    panel.cue_range(range, cx)
+                                                }),
+                                            ),
+                                        )
+                                    })
+                                    .child(
+                                        IconButton::new(
+                                            "toggle-ownership-issue-list",
+                                            IconName::ListTree,
+                                        )
+                                        .toggle_state(show_issue_list)
+                                        .aria_expanded(show_issue_list)
+                                        .aria_label("Show or hide compiler issues in this file")
+                                        .tooltip(Tooltip::text("Issue picker"))
+                                        .on_click(
+                                            cx.listener(|panel, _, _window, cx| {
+                                                panel.show_issue_list = !panel.show_issue_list;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
+                            )
+                        })
+                        .child(
+                            Label::new(format!("{problem_status} · {status_message}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
                         ),
                 )
                 .when(show_display_controls, |this| {
-                    this.child(render_display_controls(&display_preferences, cx))
-                })
-                .when(problem_count > 0, |this| {
-                    this.child(
-                        h_flex()
-                            .mx_2()
-                            .mt_1()
-                            .p_1()
-                            .gap_1()
-                            .justify_between()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(cx.theme().colors().border_variant)
-                            .child(
-                                Button::new("previous-ownership-issue", "‹")
-                                    .on_click(cx.listener(|panel, _, _window, cx| {
-                                        panel.select_relative_problem(-1, cx);
-                                    }))
-                                    .aria_label("Previous compiler issue; Up Arrow"),
-                            )
-                            .child(
-                                v_flex()
-                                    .items_center()
-                                    .child(
-                                        Label::new(selected_problem_index.map_or_else(
-                                            || format!("{problem_count} issues in file · explaining current call"),
-                                            |index| format!("Issue {} of {problem_count}", index + 1),
-                                        ))
-                                        .size(LabelSize::Small),
-                                    )
-                                    .when_some(selected_problem_label, |this, label| {
-                                        this.child(
-                                            Label::new(label)
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                Button::new("next-ownership-issue", "›")
-                                    .on_click(cx.listener(|panel, _, _window, cx| {
-                                        panel.select_relative_problem(1, cx);
-                                    }))
-                                    .aria_label("Next compiler issue; Down Arrow"),
-                            )
-                            .when_some(selected_problem_range, |this, range| {
-                                this.child(
-                                    Button::new("show-selected-ownership-issue", "Code")
-                                        .aria_label(
-                                            "Show the selected compiler issue in Rust source",
-                                        )
-                                        .on_click(cx.listener(move |panel, _, _window, cx| {
-                                            panel.cue_range(range, cx)
-                                        })),
-                                )
-                            })
-                            .child(
-                                Button::new(
-                                    "toggle-ownership-issue-list",
-                                    if show_issue_list { "Hide" } else { "Issues" },
-                                )
-                                .aria_expanded(show_issue_list)
-                                .aria_label("Show or hide all compiler issues in this Rust file")
-                                .on_click(cx.listener(
-                                    |panel, _, _window, cx| {
-                                        panel.show_issue_list = !panel.show_issue_list;
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
-                    )
+                    this.child(render_display_controls(
+                        &display_preferences,
+                        show_inline_guide,
+                        cx,
+                    ))
                 })
                 .when(show_issue_list && problem_count > 0, |this| {
                     this.child(
                         v_flex()
-                            .mx_3()
-                            .mt_2()
+                            .id("rust-issue-picker")
+                            .mx_2()
                             .p_2()
                             .gap_1()
-                            .rounded_md()
-                            .border_1()
+                            .max_h(rems(16.))
+                            .overflow_y_scroll()
+                            .border_b_1()
                             .border_color(cx.theme().colors().border_variant)
                             .child(
                                 Label::new("Compiler issues in this file").size(LabelSize::Small),
@@ -2475,19 +2800,14 @@ impl Render for RustWorkbenchPanel {
                                     "Focus {code} on line {} in the Rust editor",
                                     issue.primary_range.start.line + 1
                                 ))
-                                .on_click(cx.listener(move |panel, _, window, cx| {
-                                    panel.focus_problem_index(index, window, cx);
-                                }))
+                                .on_click(cx.listener(
+                                    move |panel, _, window, cx| {
+                                        panel.focus_problem_index(index, window, cx);
+                                    },
+                                ))
                             })),
                     )
                 })
-                .child(
-                    v_flex().mx_2().my_1().child(
-                        Label::new(format!("{problem_status} · {status_message}"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-                )
                 .child(
                     v_flex()
                         .id("rust-ownership-scroll")
@@ -2502,6 +2822,7 @@ impl Render for RustWorkbenchPanel {
                                 .gap_2()
                                 .child(render_beginner_flow(
                                     problem.as_ref(),
+                                    active_source_excerpt.as_ref(),
                                     &self.problems,
                                     &self.model,
                                     topology_scene.as_ref(),
@@ -2512,7 +2833,7 @@ impl Render for RustWorkbenchPanel {
                                     show_repair_alternatives,
                                     selected_intent_choice_id.as_deref(),
                                     exact_mode,
-                                    learning_view,
+                                    guide_stage,
                                     &workspace_guide,
                                     show_workspace_roots,
                                     cx,
@@ -2969,9 +3290,7 @@ const CONTRACT_INTENT_CHOICES: &[BeginnerIntentChoice] = &[
 
 fn beginner_intent_choices(category: &str) -> &'static [BeginnerIntentChoice] {
     match category {
-        "use_after_move" | "partial_move" | "move_out_of_borrowed_content" => {
-            MOVE_INTENT_CHOICES
-        }
+        "use_after_move" | "partial_move" | "move_out_of_borrowed_content" => MOVE_INTENT_CHOICES,
         "multiple_mutable_borrows"
         | "mutable_while_shared"
         | "move_while_borrowed"
@@ -3074,6 +3393,7 @@ fn render_workspace_intent_question(
 #[allow(clippy::too_many_arguments)]
 fn render_beginner_flow(
     problem: Option<&OwnershipProblem>,
+    source_excerpt: Option<&IssueSourceExcerpt>,
     problems: &OwnershipProblems,
     model: &OwnershipModel,
     topology_scene: Option<&OwnershipTopologyScene>,
@@ -3084,7 +3404,7 @@ fn render_beginner_flow(
     show_repair_alternatives: bool,
     selected_intent_choice_id: Option<&str>,
     exact_mode: bool,
-    learning_view: LearningView,
+    guide_stage: GuideStage,
     workspace_guide: &OwnershipWorkspaceGuide,
     show_workspace_roots: bool,
     cx: &mut Context<RustWorkbenchPanel>,
@@ -3096,29 +3416,32 @@ fn render_beginner_flow(
     }
     let mut content = v_flex()
         .gap_2()
-        .child(render_learning_view_tabs(learning_view, cx));
-    content = match learning_view {
-        LearningView::Story => content.child(render_beginner_story(problem, model, cx)),
-        LearningView::Memory => content.child(render_guided_visual_step(
-            problem,
-            model,
-            topology_scene,
-            selected_topology_element,
-            selected_step,
-            cx,
-        )),
-        LearningView::Timeline => {
+        .child(render_guide_stage_tabs(guide_stage, cx));
+    content = match guide_stage {
+        GuideStage::Explain => {
+            content.child(render_beginner_story(problem, source_excerpt, model, cx))
+        }
+        GuideStage::Visualize => {
             let moments = visual_moments(problem, model);
             let selected_step = selected_step.min(moments.len().saturating_sub(1));
             let selected_moment = moments.get(selected_step).cloned();
-            content.child(render_visual_timeline(
-                &moments,
-                selected_step,
-                selected_moment,
-                cx,
-            ))
+            content
+                .child(render_visual_timeline(
+                    &moments,
+                    selected_step,
+                    selected_moment,
+                    cx,
+                ))
+                .child(render_guided_visual_step(
+                    problem,
+                    model,
+                    topology_scene,
+                    selected_topology_element,
+                    selected_step,
+                    cx,
+                ))
         }
-        LearningView::Fixes => content
+        GuideStage::Fix => content
             .child(render_workspace_intent_question(
                 problem,
                 workspace_guide,
@@ -3145,31 +3468,34 @@ fn render_beginner_flow(
     content.into_any_element()
 }
 
-fn render_learning_view_tabs(
-    selected_view: LearningView,
+fn render_guide_stage_tabs(
+    selected_stage: GuideStage,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     h_flex()
         .w_full()
         .gap_1()
-        .flex_wrap()
-        .children(LearningView::ALL.into_iter().map(|view| {
-            Button::new(
-                SharedString::from(format!("rust-learning-view-{}", view.id())),
-                view.label(),
+        .children(GuideStage::ALL.into_iter().map(|stage| {
+            div().flex_1().min_w_0().child(
+                Button::new(
+                    SharedString::from(format!("rust-guide-stage-{}", stage.id())),
+                    stage.label(),
+                )
+                .full_width()
+                .toggle_state(stage == selected_stage)
+                .aria_label(format!("Show the {} guide stage", stage.label()))
+                .on_click(cx.listener(move |panel, _, _window, cx| {
+                    panel.guide_stage = stage;
+                    cx.notify();
+                })),
             )
-            .toggle_state(view == selected_view)
-            .aria_label(format!("Show the {} learning view", view.label()))
-            .on_click(cx.listener(move |panel, _, _window, cx| {
-                panel.learning_view = view;
-                cx.notify();
-            }))
         }))
         .into_any_element()
 }
 
 fn render_beginner_story(
     problem: Option<&OwnershipProblem>,
+    source_excerpt: Option<&IssueSourceExcerpt>,
     model: &OwnershipModel,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
@@ -3180,6 +3506,13 @@ fn render_beginner_story(
     };
     let facts = guided_issue_facts(problem, model);
     let narrative = learning_catalog::beginner_narrative(&problem.category, &facts.target);
+    let comparison = learning_catalog::beginner_code_comparison(&problem.category, &facts.target);
+    let concept = learning_catalog::lesson_ids_for_problem(
+        &problem.category,
+        problem.diagnostic_code.as_deref(),
+    )
+    .first()
+    .and_then(|id| learning_catalog::lesson(id));
     let range = problem.primary_range;
     let source_quality = if problem.precision == "compiler_exact" {
         "compiler exact"
@@ -3188,20 +3521,41 @@ fn render_beginner_story(
     };
     let diagnostic_code = problem.diagnostic_code.as_deref().unwrap_or("rustc");
 
+    let operation_range = problem
+        .related_ranges
+        .first()
+        .copied()
+        .or_else(|| problem.related.first().map(|related| related.range));
+    let validated_repair = model
+        .repairs
+        .iter()
+        .find(|repair| repair_is_compiler_validated(repair));
+    let rust_example_title = if validated_repair.is_some() {
+        "Compiler-validated repair"
+    } else {
+        "Illustrative Rust pattern"
+    };
+    let rust_example = validated_repair
+        .map(|repair| repair.diff.clone())
+        .unwrap_or(comparison.rust_pattern);
+
     v_flex()
-        .p_3()
         .gap_3()
-        .rounded_md()
-        .border_1()
-        .border_color(cx.theme().colors().border_variant)
         .child(
             h_flex()
+                .px_1()
                 .gap_2()
                 .justify_between()
                 .child(
                     v_flex()
+                        .flex_1()
+                        .min_w_0()
                         .gap_1()
-                        .child(Label::new(narrative.title).size(LabelSize::Large))
+                        .child(
+                            Label::new(narrative.title)
+                                .size(LabelSize::Large)
+                                .line_clamp(2),
+                        )
                         .child(
                             Label::new(format!(
                                 "{diagnostic_code} · line {} · {source_quality}",
@@ -3212,8 +3566,9 @@ fn render_beginner_story(
                         ),
                 )
                 .child(
-                    Button::new("beginner-story-show-code", "Show in code")
+                    IconButton::new("beginner-story-show-code", IconName::Code)
                         .aria_label("Center this issue in the Rust editor")
+                        .tooltip(Tooltip::text("Show this issue in source"))
                         .on_click(cx.listener(move |panel, _, window, cx| {
                             panel.focus_range_in_editor(range, window, cx);
                         })),
@@ -3221,44 +3576,65 @@ fn render_beginner_story(
         )
         .child(render_story_step(
             "1",
-            "Before",
+            "Available",
             narrative.before,
-            Color::Success,
+            LearningSemantic::Available,
+            Some(problem.binding_range),
             cx,
         ))
-        .child(render_story_connector("then this operation happened", cx))
         .child(render_story_step(
             "2",
-            "Operation",
+            "What changed",
             narrative.operation,
-            Color::Warning,
+            LearningSemantic::Transition,
+            operation_range,
             cx,
         ))
-        .child(render_story_connector("so Rust sees this state now", cx))
         .child(render_story_step(
             "3",
-            "Now",
+            "Why Rust stopped here",
             narrative.now,
-            Color::Error,
+            LearningSemantic::Blocked,
+            Some(problem.primary_range),
             cx,
         ))
+        .when_some(source_excerpt, |this, excerpt| {
+            this.child(render_issue_source_excerpt(excerpt, cx))
+        })
+        .when_some(concept, |this, lesson| {
+            this.child(render_compact_concept_lesson(lesson, cx))
+        })
         .child(
             v_flex()
                 .gap_2()
                 .pt_2()
                 .border_t_1()
                 .border_color(cx.theme().colors().border)
-                .child(Label::new("A useful comparison").size(LabelSize::Small))
-                .child(render_story_explanation(
-                    "What may feel familiar",
+                .child(Label::new("Compare the models").size(LabelSize::Small))
+                .child(render_code_comparison(
+                    "Managed-reference intuition",
+                    comparison.familiar_pseudocode,
                     narrative.common_expectation,
+                    LearningSemantic::Neutral,
                     cx,
                 ))
-                .child(render_story_explanation(
-                    "Rust's model",
+                .child(render_code_comparison(
+                    rust_example_title,
+                    rust_example,
                     narrative.rust_model,
+                    if validated_repair.is_some() {
+                        LearningSemantic::Available
+                    } else {
+                        LearningSemantic::Borrowed
+                    },
                     cx,
-                )),
+                ))
+                .child(
+                    Label::new(comparison.difference)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .line_clamp(4),
+                ),
         )
         .child(
             v_flex()
@@ -3267,7 +3643,11 @@ fn render_beginner_story(
                 .rounded_sm()
                 .bg(cx.theme().status().info_background.opacity(0.14))
                 .child(Label::new("Intuition").size(LabelSize::Small))
-                .child(Label::new(narrative.intuition).size(LabelSize::Small)),
+                .child(
+                    Label::new(narrative.intuition)
+                        .size(LabelSize::Small)
+                        .line_clamp(4),
+                ),
         )
         .child(
             v_flex()
@@ -3275,6 +3655,7 @@ fn render_beginner_story(
                 .child(Label::new("Rust words in plain language").size(LabelSize::Small))
                 .children(narrative.vocabulary.into_iter().map(|entry| {
                     h_flex()
+                        .w_full()
                         .gap_2()
                         .items_start()
                         .child(
@@ -3283,16 +3664,20 @@ fn render_beginner_story(
                                 .buffer_font(cx),
                         )
                         .child(
-                            Label::new(entry.meaning)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
+                            div().flex_1().min_w_0().child(
+                                Label::new(entry.meaning)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .line_clamp(3),
+                            ),
                         )
                 })),
         )
         .child(
             Label::new(format!("Common trap: {}", narrative.misconception))
                 .size(LabelSize::XSmall)
-                .color(Color::Warning),
+                .color(Color::Warning)
+                .line_clamp(4),
         )
         .when(model.truncated, |this| {
             this.child(
@@ -3310,54 +3695,342 @@ fn render_story_step(
     number: &'static str,
     label: &'static str,
     explanation: String,
-    color: Color,
-    cx: &App,
+    semantic: LearningSemantic,
+    focus_range: Option<lsp::Range>,
+    cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
-    h_flex()
+    let color = semantic.color();
+    let row = h_flex()
         .w_full()
         .p_2()
         .gap_2()
         .items_start()
         .rounded_sm()
-        .bg(match color {
-            Color::Error => cx.theme().status().error_background.opacity(0.10),
-            Color::Warning => cx.theme().status().warning_background.opacity(0.10),
-            _ => cx.theme().status().success_background.opacity(0.10),
+        .border_l_2()
+        .border_color(match semantic {
+            LearningSemantic::Available => cx.theme().status().success,
+            LearningSemantic::Borrowed => cx.theme().status().info,
+            LearningSemantic::Transition => cx.theme().status().warning,
+            LearningSemantic::Blocked => cx.theme().status().error,
+            LearningSemantic::Neutral => cx.theme().colors().border_variant,
         })
-        .child(
-            Label::new(number)
-                .size(LabelSize::Large)
-                .color(color),
-        )
+        .bg(match semantic {
+            LearningSemantic::Available => cx.theme().status().success_background.opacity(0.08),
+            LearningSemantic::Borrowed => cx.theme().status().info_background.opacity(0.08),
+            LearningSemantic::Transition => cx.theme().status().warning_background.opacity(0.08),
+            LearningSemantic::Blocked => cx.theme().status().error_background.opacity(0.08),
+            LearningSemantic::Neutral => cx.theme().colors().element_background,
+        })
+        .child(Label::new(number).size(LabelSize::Large).color(color))
         .child(
             v_flex()
+                .flex_1()
+                .min_w_0()
                 .gap_1()
                 .child(Label::new(label).size(LabelSize::Small).color(color))
-                .child(Label::new(explanation).size(LabelSize::Small)),
+                .child(Label::new(explanation).size(LabelSize::Small).line_clamp(4)),
+        );
+    if let Some(range) = focus_range {
+        row.id(SharedString::from(format!("story-step-{label}")))
+            .cursor_pointer()
+            .on_click(cx.listener(move |panel, _, _window, cx| panel.cue_range(range, cx)))
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
+fn render_compact_concept_lesson(lesson: &learning_catalog::ConceptLesson, cx: &App) -> AnyElement {
+    v_flex()
+        .gap_2()
+        .pt_2()
+        .border_t_1()
+        .border_color(cx.theme().colors().border)
+        .child(
+            Label::new(format!("Concept · {}", lesson.title))
+                .size(LabelSize::Small)
+                .line_clamp(2),
+        )
+        .child(
+            Label::new(lesson.one_line)
+                .size(LabelSize::Small)
+                .line_clamp(4),
+        )
+        .child(
+            Label::new(format!("Rule: {}", lesson.rule))
+                .size(LabelSize::Small)
+                .color(Color::Info)
+                .line_clamp(4),
+        )
+        .child(
+            Label::new(format!("Why: {}", lesson.why))
+                .size(LabelSize::XSmall)
+                .line_clamp(5),
+        )
+        .child(
+            Label::new(format!("Memory model: {}", lesson.memory_model))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .line_clamp(5),
+        )
+        .child(
+            Label::new(format!("Watch for: {}", lesson.misconception))
+                .size(LabelSize::XSmall)
+                .color(Color::Warning)
+                .line_clamp(5),
         )
         .into_any_element()
 }
 
-fn render_story_connector(label: &'static str, _cx: &App) -> AnyElement {
-    Label::new(format!("↓ {label}"))
-        .size(LabelSize::XSmall)
-        .color(Color::Muted)
+fn render_code_comparison(
+    title: &'static str,
+    code: String,
+    explanation: String,
+    semantic: LearningSemantic,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .gap_1()
+        .pl_2()
+        .border_l_2()
+        .border_color(match semantic {
+            LearningSemantic::Available => cx.theme().status().success,
+            LearningSemantic::Borrowed => cx.theme().status().info,
+            LearningSemantic::Transition => cx.theme().status().warning,
+            LearningSemantic::Blocked => cx.theme().status().error,
+            LearningSemantic::Neutral => cx.theme().colors().border_variant,
+        })
+        .child(
+            Label::new(title)
+                .size(LabelSize::XSmall)
+                .color(semantic.color()),
+        )
+        .child(
+            Label::new(code)
+                .size(LabelSize::XSmall)
+                .buffer_font(cx)
+                .line_clamp(6),
+        )
+        .child(
+            Label::new(explanation)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .line_clamp(4),
+        )
         .into_any_element()
 }
 
-fn render_story_explanation(
-    label: &'static str,
-    explanation: String,
-    _cx: &App,
+#[cfg(test)]
+fn issue_source_excerpt(source: &str, problem: &OwnershipProblem) -> IssueSourceExcerpt {
+    let source_lines = source.lines().collect::<Vec<_>>();
+    issue_source_excerpt_with_lines(
+        source_lines.len(),
+        |row| source_lines[row as usize].to_owned(),
+        problem,
+    )
+}
+
+fn issue_source_excerpt_from_snapshot(
+    snapshot: &language::BufferSnapshot,
+    problem: &OwnershipProblem,
+) -> IssueSourceExcerpt {
+    let max_point = snapshot.max_point();
+    let line_count = max_point.row as usize + usize::from(max_point.column > 0);
+    issue_source_excerpt_with_lines(
+        line_count,
+        |row| {
+            snapshot
+                .text_for_range(Point::new(row, 0)..Point::new(row, snapshot.line_len(row)))
+                .collect()
+        },
+        problem,
+    )
+}
+
+fn issue_source_excerpt_with_lines(
+    line_count: usize,
+    mut source_line: impl FnMut(u32) -> String,
+    problem: &OwnershipProblem,
+) -> IssueSourceExcerpt {
+    let mut important = BTreeMap::<u32, (LearningSemantic, lsp::Range)>::new();
+    let mut insert = |range: lsp::Range, semantic: LearningSemantic| {
+        let current = important
+            .get(&range.start.line)
+            .map(|(semantic, _)| *semantic);
+        let priority = |semantic| match semantic {
+            LearningSemantic::Blocked => 4,
+            LearningSemantic::Transition => 3,
+            LearningSemantic::Borrowed => 2,
+            LearningSemantic::Available => 1,
+            LearningSemantic::Neutral => 0,
+        };
+        if current.is_none_or(|current| priority(semantic) >= priority(current)) {
+            important.insert(range.start.line, (semantic, range));
+        }
+    };
+    insert(problem.binding_range, LearningSemantic::Available);
+    if let Some(range) = problem
+        .related_ranges
+        .first()
+        .copied()
+        .or_else(|| problem.related.first().map(|related| related.range))
+    {
+        insert(range, LearningSemantic::Transition);
+    }
+    insert(problem.primary_range, LearningSemantic::Blocked);
+
+    let mut rows = BTreeSet::new();
+    for row in important.keys().copied() {
+        rows.insert(row.saturating_sub(1));
+        rows.insert(row);
+        if (row as usize) + 1 < line_count {
+            rows.insert(row + 1);
+        }
+    }
+    let mut result = Vec::new();
+    let mut previous = None;
+    for row in rows.into_iter().filter(|row| (*row as usize) < line_count) {
+        if previous.is_some_and(|previous| row > previous + 1) {
+            result.push(IssueSourceLine {
+                line: None,
+                text: "...".to_owned(),
+                semantic: LearningSemantic::Neutral,
+                focus_range: None,
+            });
+        }
+        let (semantic, focus_range) = important
+            .get(&row)
+            .copied()
+            .map(|(semantic, range)| (semantic, Some(range)))
+            .unwrap_or((LearningSemantic::Neutral, None));
+        result.push(IssueSourceLine {
+            line: Some(row + 1),
+            text: source_line(row),
+            semantic,
+            focus_range,
+        });
+        previous = Some(row);
+    }
+    IssueSourceExcerpt { lines: result }
+}
+
+fn learning_annotations_for_problem(problem: &OwnershipProblem) -> Vec<RustLearningAnnotation> {
+    let (cause, blocked) = match problem.category.as_str() {
+        "use_after_move" => ("ownership moves", "blocked: old owner"),
+        "partial_move" => ("field moves", "blocked: value incomplete"),
+        "multiple_mutable_borrows" => ("exclusive borrow starts", "blocked: borrow overlaps"),
+        "mutable_while_shared" | "assign_while_borrowed" => {
+            ("shared borrow starts", "blocked: reader still active")
+        }
+        "use_while_mutably_borrowed" => ("exclusive route starts", "blocked: use the &mut path"),
+        "move_while_borrowed" | "move_out_of_borrowed_content" => {
+            ("borrow points here", "blocked: owner must stay")
+        }
+        "immutable_mutation" => ("shared access only", "blocked: needs &mut"),
+        "missing_lifetime" | "borrowed_value_too_short" => {
+            ("reference escapes", "blocked: owner ends first")
+        }
+        "returning_local_reference" | "temporary_dropped_while_borrowed" => {
+            ("temporary owner", "blocked: value expires")
+        }
+        "trait_requirement" => ("capability required", "blocked: trait not proven"),
+        "type_mismatch" => ("type boundary", "blocked: contracts differ"),
+        "method_or_trait_unavailable" => ("method lookup", "blocked: route unavailable"),
+        "closure_may_outlive_borrow" | "borrowed_data_escapes" => {
+            ("borrow captured", "blocked: capture may outlive")
+        }
+        "await_outside_async" => ("await suspends", "blocked: no async context"),
+        "recursive_async_function" => ("future contains itself", "blocked: size is recursive"),
+        _ => ("contract changes", "blocked: proof failed"),
+    };
+    let operation_range = problem
+        .related_ranges
+        .first()
+        .copied()
+        .or_else(|| problem.related.first().map(|related| related.range));
+    let mut by_row = BTreeMap::new();
+    by_row.insert(
+        problem.binding_range.start.line,
+        RustLearningAnnotation {
+            range: problem.binding_range,
+            label: "available here".to_owned(),
+            semantic: LearningSemantic::Available,
+        },
+    );
+    if let Some(range) = operation_range {
+        by_row.insert(
+            range.start.line,
+            RustLearningAnnotation {
+                range,
+                label: cause.to_owned(),
+                semantic: if cause.contains("borrow") || cause.contains("shared") {
+                    LearningSemantic::Borrowed
+                } else {
+                    LearningSemantic::Transition
+                },
+            },
+        );
+    }
+    by_row.insert(
+        problem.primary_range.start.line,
+        RustLearningAnnotation {
+            range: problem.primary_range,
+            label: blocked.to_owned(),
+            semantic: LearningSemantic::Blocked,
+        },
+    );
+    by_row.into_values().take(3).collect()
+}
+
+fn render_issue_source_excerpt(
+    excerpt: &IssueSourceExcerpt,
+    cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     v_flex()
         .gap_0p5()
+        .py_2()
+        .border_y_1()
+        .border_color(cx.theme().colors().border_variant)
         .child(
-            Label::new(label)
+            Label::new("Your code")
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         )
-        .child(Label::new(explanation).size(LabelSize::Small))
+        .children(excerpt.lines.iter().enumerate().map(|(index, line)| {
+            let row = h_flex()
+                .id(SharedString::from(format!("issue-source-line-{index}")))
+                .w_full()
+                .gap_2()
+                .px_1()
+                .border_l_2()
+                .border_color(match line.semantic {
+                    LearningSemantic::Available => cx.theme().status().success,
+                    LearningSemantic::Borrowed => cx.theme().status().info,
+                    LearningSemantic::Transition => cx.theme().status().warning,
+                    LearningSemantic::Blocked => cx.theme().status().error,
+                    LearningSemantic::Neutral => cx.theme().colors().border_variant,
+                })
+                .child(
+                    Label::new(line.line.map_or_else(String::new, |line| line.to_string()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Label::new(line.text.clone())
+                            .size(LabelSize::XSmall)
+                            .buffer_font(cx)
+                            .truncate(),
+                    ),
+                );
+            if let Some(range) = line.focus_range {
+                row.cursor_pointer()
+                    .on_click(cx.listener(move |panel, _, _window, cx| panel.cue_range(range, cx)))
+                    .into_any_element()
+            } else {
+                row.into_any_element()
+            }
+        }))
         .into_any_element()
 }
 
@@ -4514,17 +5187,23 @@ fn render_beginner_memory_path(
     if path.stages.is_empty() {
         return empty_card("No storage layers are available for this issue yet.");
     }
+    let type_route = path
+        .stages
+        .iter()
+        .filter_map(|stage| stage.nodes.first())
+        .map(|node| node.label.clone())
+        .collect::<Vec<_>>()
+        .join(" -> ");
 
     v_flex()
         .py_2()
         .gap_2()
-        .child(Label::new("How this value is built").size(LabelSize::Large))
+        .child(Label::new("Variable to value").size(LabelSize::Large))
         .child(
-            Label::new(
-                "Follow the path from the variable name to each wrapper and the storage it controls.",
-            )
-            .size(LabelSize::Small)
-            .color(Color::Muted),
+            Label::new(type_route)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .buffer_font(cx),
         )
         .children(path.stages.into_iter().enumerate().map(|(stage_index, stage)| {
             let relation = stage.relation_from_previous.join(" · ");
@@ -4585,11 +5264,7 @@ fn render_beginner_memory_path(
                         } else {
                             cx.theme().colors().border_variant
                         })
-                        .bg(match node.storage.as_str() {
-                            "heap" => cx.theme().status().success_background.opacity(0.08),
-                            "inline" => cx.theme().status().info_background.opacity(0.08),
-                            _ => cx.theme().colors().panel_background,
-                        })
+                        .bg(cx.theme().colors().element_background.opacity(0.45))
                         .child(
                             Button::new(
                                 SharedString::from(format!(
@@ -4651,6 +5326,39 @@ fn render_beginner_memory_path(
             )
             .size(LabelSize::XSmall)
             .color(Color::Muted),
+        )
+        .child(render_learning_color_legend(cx))
+        .into_any_element()
+}
+
+fn render_learning_color_legend(cx: &App) -> AnyElement {
+    h_flex()
+        .gap_2()
+        .flex_wrap()
+        .children(
+            [
+                (LearningSemantic::Available, "available / verified"),
+                (LearningSemantic::Borrowed, "borrowed"),
+                (LearningSemantic::Transition, "changing / candidate"),
+                (LearningSemantic::Blocked, "blocked"),
+            ]
+            .into_iter()
+            .map(|(semantic, label)| {
+                h_flex()
+                    .gap_1()
+                    .child(div().size(px(7.)).rounded_full().bg(match semantic {
+                        LearningSemantic::Available => cx.theme().status().success,
+                        LearningSemantic::Borrowed => cx.theme().status().info,
+                        LearningSemantic::Transition => cx.theme().status().warning,
+                        LearningSemantic::Blocked => cx.theme().status().error,
+                        LearningSemantic::Neutral => cx.theme().colors().border_variant,
+                    }))
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+            }),
         )
         .into_any_element()
 }
@@ -5227,7 +5935,7 @@ fn render_concept_lesson(
 
 fn render_detail_drawers(
     active: Option<DetailDrawer>,
-    problem: Option<&OwnershipProblem>,
+    _problem: Option<&OwnershipProblem>,
     model: &OwnershipModel,
     full_topology_scene: Option<&OwnershipTopologyScene>,
     selected_topology_element: Option<&str>,
@@ -5236,7 +5944,6 @@ fn render_detail_drawers(
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     let content = active.map(|drawer| match drawer {
-        DetailDrawer::Why => render_why_details(problem, cx),
         DetailDrawer::Variables => v_flex()
             .gap_2()
             .when_some(full_topology_scene, |this, scene| {
@@ -5255,7 +5962,6 @@ fn render_detail_drawers(
             .into_any_element(),
         DetailDrawer::Calls => render_operation_insights(model, expanded_operations, cx),
         DetailDrawer::Layout => render_memory(model, exact_mode, cx),
-        DetailDrawer::C => render_conceptual_c_sketch(model, exact_mode, cx),
         DetailDrawer::Evidence => v_flex()
             .gap_2()
             .child(render_timeline(model, true, cx))
@@ -5276,98 +5982,63 @@ fn render_detail_drawers(
             .into_any_element(),
     });
     v_flex()
-        .rounded_md()
-        .border_1()
-        .border_color(cx.theme().colors().border_variant)
         .child(
-            h_flex()
-                .p_1()
-                .gap_1()
-                .flex_wrap()
-                .child(
-                    Label::new("Explore")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .children(
-                    [
-                        DetailDrawer::Why,
-                        DetailDrawer::Variables,
-                        DetailDrawer::Lifetimes,
-                        DetailDrawer::Calls,
-                        DetailDrawer::Layout,
-                        DetailDrawer::C,
-                        DetailDrawer::Evidence,
-                    ]
-                    .into_iter()
-                    .map(|drawer| {
-                        Button::new(
-                            SharedString::from(format!("detail-drawer-{drawer:?}")),
-                            if active == Some(drawer) {
-                                format!("{} ▲", drawer.label())
-                            } else {
-                                drawer.label().to_owned()
-                            },
-                        )
-                        .aria_expanded(active == Some(drawer))
-                        .aria_label(format!("Show or hide {} details", drawer.label()))
-                        .on_click(cx.listener(
-                            move |panel, _, _window, cx| {
-                                panel.toggle_detail_drawer(drawer, cx);
-                            },
-                        ))
-                    }),
+            Button::new(
+                "toggle-technical-details",
+                active.map_or_else(
+                    || "Technical details".to_owned(),
+                    |drawer| format!("Technical details · {}", drawer.label()),
                 ),
+            )
+            .full_width()
+            .aria_expanded(active.is_some())
+            .aria_label("Show or hide compiler-backed technical details")
+            .on_click(cx.listener(move |panel, _, _window, cx| {
+                if let Some(drawer) = active {
+                    panel.toggle_detail_drawer(drawer, cx);
+                } else {
+                    panel.toggle_detail_drawer(DetailDrawer::Variables, cx);
+                }
+            })),
         )
         .when_some(content, |this, content| {
             this.child(
                 v_flex()
                     .p_2()
+                    .gap_2()
                     .border_t_1()
                     .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        h_flex().gap_1().flex_wrap().children(
+                            [
+                                DetailDrawer::Variables,
+                                DetailDrawer::Lifetimes,
+                                DetailDrawer::Calls,
+                                DetailDrawer::Layout,
+                                DetailDrawer::Evidence,
+                            ]
+                            .into_iter()
+                            .map(|drawer| {
+                                Button::new(
+                                    SharedString::from(format!("detail-drawer-{drawer:?}")),
+                                    drawer.label(),
+                                )
+                                .toggle_state(active == Some(drawer))
+                                .aria_label(format!("Show {} details", drawer.label()))
+                                .on_click(cx.listener(
+                                    move |panel, _, _window, cx| {
+                                        if panel.active_detail_drawer != Some(drawer) {
+                                            panel.active_detail_drawer = Some(drawer);
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                            }),
+                        ),
+                    )
                     .child(content),
             )
         })
-        .into_any_element()
-}
-
-fn render_why_details(
-    problem: Option<&OwnershipProblem>,
-    _cx: &mut Context<RustWorkbenchPanel>,
-) -> AnyElement {
-    let Some(problem) = problem else {
-        return empty_card("Select a compiler issue to inspect its rule in more detail.");
-    };
-    let Some(lesson) = learning_catalog::lesson_ids_for_problem(
-        &problem.category,
-        problem.diagnostic_code.as_deref(),
-    )
-    .first()
-    .and_then(|id| learning_catalog::lesson(id)) else {
-        return empty_card("No extended explanation is bundled for this diagnostic yet.");
-    };
-    v_flex()
-        .gap_1()
-        .child(Label::new(lesson.title).size(LabelSize::Small))
-        .child(Label::new(lesson.rule).size(LabelSize::Small))
-        .child(Label::new(format!("Why the rule exists: {}", lesson.why)).size(LabelSize::Small))
-        .child(
-            Label::new(format!("Memory model: {}", lesson.memory_model))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-        )
-        .child(
-            Label::new(format!("Common misconception: {}", lesson.misconception))
-                .size(LabelSize::Small)
-                .color(Color::Warning),
-        )
-        .child(
-            Label::new(
-                "This teaching text explains the rule. Variable states and source locations remain compiler/analyzer facts.",
-            )
-            .size(LabelSize::XSmall)
-            .color(Color::Muted),
-        )
         .into_any_element()
 }
 
@@ -5583,6 +6254,7 @@ fn selected_button_label(selected: bool, label: &'static str) -> String {
 
 fn render_display_controls(
     preferences: &RustOwnershipDisplayPreferences,
+    show_inline_guide: bool,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
     let profile = preferences.profile;
@@ -5631,73 +6303,132 @@ fn render_display_controls(
         .gap_2()
         .border_b_1()
         .border_color(cx.theme().colors().border_variant)
-        .child(Label::new("Choose how much Rust explains in the editor").size(LabelSize::Small))
         .child(
-            Label::new("Focus is quiet; Learn follows the selected ownership story; Full shows every available compiler and analyzer cue.")
+            h_flex()
+                .justify_between()
+                .child(Label::new("Display").size(LabelSize::Small))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("decrease-coach-font", "A−")
+                                .tooltip(Tooltip::text("Decrease guide text size"))
+                                .on_click(cx.listener(|panel, _, _window, cx| {
+                                    panel.adjust_font_scale(-PANEL_FONT_SCALE_STEP_PERCENT, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("increase-coach-font", "A+")
+                                .tooltip(Tooltip::text("Increase guide text size"))
+                                .on_click(cx.listener(|panel, _, _window, cx| {
+                                    panel.adjust_font_scale(PANEL_FONT_SCALE_STEP_PERCENT, cx);
+                                })),
+                        ),
+                ),
+        )
+        .child(
+            h_flex().gap_1().flex_wrap().children(
+                [
+                    RustOwnershipDisplayProfile::Focus,
+                    RustOwnershipDisplayProfile::Learn,
+                    RustOwnershipDisplayProfile::Full,
+                ]
+                .into_iter()
+                .map(|candidate| {
+                    Button::new(
+                        SharedString::from(format!("display-profile-{candidate:?}")),
+                        selected_button_label(
+                            candidate == profile,
+                            display_profile_label(candidate),
+                        ),
+                    )
+                    .on_click(cx.listener(move |panel, _, _window, cx| {
+                        panel.set_display_profile(candidate, cx);
+                    }))
+                }),
+            ),
+        )
+        .child(
+            Button::new(
+                "toggle-inline-learning-guide",
+                selected_button_label(show_inline_guide, "Inline guide"),
+            )
+            .on_click(cx.listener(|panel, _, _window, cx| {
+                panel.show_inline_guide = !panel.show_inline_guide;
+                if panel.show_inline_guide {
+                    panel.sync_learning_annotations(cx);
+                } else {
+                    panel.clear_learning_annotations(cx);
+                }
+                cx.notify();
+            })),
+        )
+        .child(
+            Label::new("Compiler messages")
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         )
         .child(
-            h_flex().gap_1().flex_wrap().children([
-                RustOwnershipDisplayProfile::Focus,
-                RustOwnershipDisplayProfile::Learn,
-                RustOwnershipDisplayProfile::Full,
-            ].into_iter().map(|candidate| {
-                Button::new(
-                    SharedString::from(format!("display-profile-{candidate:?}")),
-                    selected_button_label(candidate == profile, display_profile_label(candidate)),
-                )
-                .on_click(cx.listener(move |panel, _, _window, cx| {
-                    panel.set_display_profile(candidate, cx);
-                }))
-            })),
+            h_flex().gap_1().flex_wrap().children(
+                [
+                    (RustInlineDiagnosticMode::Off, "Off"),
+                    (RustInlineDiagnosticMode::Selected, "Selected issue"),
+                    (RustInlineDiagnosticMode::All, "All"),
+                ]
+                .into_iter()
+                .map(|(candidate, label)| {
+                    Button::new(
+                        SharedString::from(format!("inline-mode-{candidate:?}")),
+                        selected_button_label(candidate == inline_mode, label),
+                    )
+                    .on_click(cx.listener(move |panel, _, _window, cx| {
+                        panel.display_preferences.inline_diagnostics = candidate;
+                        panel.display_preferences.profile = RustOwnershipDisplayProfile::Custom;
+                        panel.display_preferences_changed(cx);
+                    }))
+                }),
+            ),
         )
-        .child(Label::new("Inline compiler message").size(LabelSize::XSmall).color(Color::Muted))
         .child(
-            h_flex().gap_1().flex_wrap().children([
-                (RustInlineDiagnosticMode::Off, "Off"),
-                (RustInlineDiagnosticMode::Selected, "Selected issue"),
-                (RustInlineDiagnosticMode::All, "All"),
-            ].into_iter().map(|(candidate, label)| {
-                Button::new(
-                    SharedString::from(format!("inline-mode-{candidate:?}")),
-                    selected_button_label(candidate == inline_mode, label),
-                )
-                .on_click(cx.listener(move |panel, _, _window, cx| {
-                    panel.display_preferences.inline_diagnostics = candidate;
-                    panel.display_preferences.profile = RustOwnershipDisplayProfile::Custom;
-                    panel.display_preferences_changed(cx);
-                }))
-            })),
+            Label::new("Ownership scope")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
         )
-        .child(Label::new("Ownership scope").size(LabelSize::XSmall).color(Color::Muted))
         .child(
-            h_flex().gap_1().flex_wrap().children([
-                (RustOwnershipHintScope::SelectedBinding, "Selected binding"),
-                (RustOwnershipHintScope::CurrentFunction, "Current function"),
-                (RustOwnershipHintScope::File, "File"),
-            ].into_iter().map(|(candidate, label)| {
-                Button::new(
-                    SharedString::from(format!("ownership-scope-{candidate:?}")),
-                    selected_button_label(candidate == scope, label),
-                )
-                .on_click(cx.listener(move |panel, _, _window, cx| {
-                    panel.display_preferences.scope = candidate;
-                    panel.display_preferences.profile = RustOwnershipDisplayProfile::Custom;
-                    panel.display_preferences_changed(cx);
-                }))
-            })),
+            h_flex().gap_1().flex_wrap().children(
+                [
+                    (RustOwnershipHintScope::SelectedBinding, "Selected binding"),
+                    (RustOwnershipHintScope::CurrentFunction, "Current function"),
+                    (RustOwnershipHintScope::File, "File"),
+                ]
+                .into_iter()
+                .map(|(candidate, label)| {
+                    Button::new(
+                        SharedString::from(format!("ownership-scope-{candidate:?}")),
+                        selected_button_label(candidate == scope, label),
+                    )
+                    .on_click(cx.listener(move |panel, _, _window, cx| {
+                        panel.display_preferences.scope = candidate;
+                        panel.display_preferences.profile = RustOwnershipDisplayProfile::Custom;
+                        panel.display_preferences_changed(cx);
+                    }))
+                }),
+            ),
         )
-        .child(Label::new("Editor mechanics clues").size(LabelSize::XSmall).color(Color::Muted))
         .child(
-            h_flex()
-                .gap_1()
-                .flex_wrap()
-                .children([
+            Label::new("Mechanics clues")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(
+            h_flex().gap_1().flex_wrap().children(
+                [
                     (RustMechanicsHintMode::Off, "Off"),
                     (RustMechanicsHintMode::SelectedPath, "Selected path"),
                     (RustMechanicsHintMode::ConfiguredScope, "Configured scope"),
-                ].into_iter().map(|(candidate, label)| {
+                ]
+                .into_iter()
+                .map(|(candidate, label)| {
                     Button::new(
                         SharedString::from(format!("mechanics-mode-{candidate:?}")),
                         selected_button_label(candidate == mechanics_mode, label),
@@ -5707,20 +6438,32 @@ fn render_display_controls(
                         panel.display_preferences.profile = RustOwnershipDisplayProfile::Custom;
                         panel.display_preferences_changed(cx);
                     }))
-                })),
+                }),
+            ),
         )
-        .child(Label::new("Hint categories").size(LabelSize::XSmall).color(Color::Muted))
-        .child(h_flex().gap_1().flex_wrap().children(filters.into_iter().map(
-            |(filter, label, enabled)| {
-                Button::new(
-                    SharedString::from(format!("ownership-filter-{filter}")),
-                    selected_button_label(enabled, label),
-                )
-                .on_click(cx.listener(move |panel, _, _window, cx| {
-                    panel.toggle_display_filter(filter, cx);
-                }))
-            },
-        )))
+        .when(profile == RustOwnershipDisplayProfile::Custom, |this| {
+            this.child(
+                Label::new("Custom categories")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(filters.into_iter().map(|(filter, label, enabled)| {
+                        Button::new(
+                            SharedString::from(format!("ownership-filter-{filter}")),
+                            selected_button_label(enabled, label),
+                        )
+                        .on_click(cx.listener(
+                            move |panel, _, _window, cx| {
+                                panel.toggle_display_filter(filter, cx);
+                            },
+                        ))
+                    })),
+            )
+        })
         .into_any_element()
 }
 
@@ -6332,7 +7075,7 @@ fn problem_story(category: &str, name: &str) -> (String, String, String) {
 fn render_coach_flow(
     problem: Option<&OwnershipProblem>,
     model: &OwnershipModel,
-    show_c_comparison: bool,
+    _show_c_comparison: bool,
     show_all_events: bool,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
@@ -6346,7 +7089,7 @@ fn render_coach_flow(
         .or(model.selected_place.as_deref())
         .unwrap_or("value");
     let event_limit = if show_all_events { 96 } else { 8 };
-    let mut root = v_flex()
+    let root = v_flex()
         .gap_3()
         .child(Label::new(format!("The ownership story for `{name}`")).size(LabelSize::Large))
         .child(
@@ -6396,9 +7139,6 @@ fn render_coach_flow(
                 .color(Color::Muted),
             )
         });
-    if show_c_comparison {
-        root = root.child(render_conceptual_c_sketch(model, false, cx));
-    }
     root.into_any_element()
 }
 
@@ -7506,44 +8246,6 @@ fn render_repair_counterfactual(
         .into_any_element()
 }
 
-fn render_conceptual_c_sketch(
-    model: &OwnershipModel,
-    exact_mode: bool,
-    _cx: &mut Context<RustWorkbenchPanel>,
-) -> AnyElement {
-    let Some(sketch) = &model.c_sketch else {
-        return empty_card("Select a binding to generate its deterministic C-like intent sketch.");
-    };
-    v_flex()
-        .p_3()
-        .gap_2()
-        .rounded_md()
-        .border_1()
-        .child(Label::new(sketch.title.clone()).size(LabelSize::Large))
-        .child(provenance_badge(&sketch.provenance))
-        .child(
-            Label::new(sketch.code.clone())
-                .size(LabelSize::Small)
-                .buffer_font(_cx),
-        )
-        .child(
-            Label::new(sketch.warning.clone())
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        )
-        .when(exact_mode, |this| {
-            this.child(
-                Label::new(format!(
-                    "Linked to {} compiler ownership events",
-                    sketch.linked_event_ids.len()
-                ))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-            )
-        })
-        .into_any_element()
-}
-
 #[cfg(any())]
 fn render_lessons(
     active_lesson: Option<String>,
@@ -7878,6 +8580,128 @@ mod tests {
     fn ownership_source_hash_matches_rust_analyzer() {
         assert_eq!(ownership_source_hash(""), "cbf29ce484222325");
         assert_eq!(ownership_source_hash("hello"), "a430d84680aabd0b");
+    }
+
+    #[gpui::test]
+    fn lsp_ranges_are_validated_and_clipped_on_one_buffer_snapshot(cx: &mut App) {
+        let buffer = cx.new(|cx| Buffer::local("a😀b\nshort\n", cx));
+        let snapshot = buffer.read(cx).snapshot();
+
+        let unicode = text_anchor_range_for_lsp(
+            &snapshot,
+            lsp::Range::new(lsp::Position::new(0, 1), lsp::Position::new(0, 3)),
+        )
+        .expect("valid UTF-16 range");
+        assert_eq!(unicode.start, snapshot.anchor_after(Point::new(0, 1)));
+        assert_eq!(unicode.end, snapshot.anchor_before(Point::new(0, 5)));
+
+        let oversized = text_anchor_range_for_lsp(
+            &snapshot,
+            lsp::Range::new(lsp::Position::new(1, 99), lsp::Position::new(99, 99)),
+        )
+        .expect("oversized positions should be clipped");
+        assert_eq!(oversized.start, snapshot.anchor_after(Point::new(1, 5)));
+        assert_eq!(oversized.end, snapshot.anchor_before(snapshot.max_point()));
+
+        assert!(
+            text_anchor_range_for_lsp(
+                &snapshot,
+                lsp::Range::new(lsp::Position::new(2, 0), lsp::Position::new(1, 0)),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn issue_source_excerpt_keeps_causal_lines_and_collapses_distance() {
+        let source = (0..16)
+            .map(|line| format!("let line_{line} = {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut problem = test_problem("borrow", "line_1", 1, 13);
+        problem.related_ranges.push(lsp::Range::new(
+            lsp::Position::new(7, 4),
+            lsp::Position::new(7, 10),
+        ));
+
+        let excerpt = issue_source_excerpt(&source, &problem);
+        assert!(
+            excerpt
+                .lines
+                .iter()
+                .any(|line| line.line == Some(2) && line.semantic == LearningSemantic::Available)
+        );
+        assert!(
+            excerpt
+                .lines
+                .iter()
+                .any(|line| line.line == Some(8) && line.semantic == LearningSemantic::Transition)
+        );
+        assert!(
+            excerpt
+                .lines
+                .iter()
+                .any(|line| line.line == Some(14) && line.semantic == LearningSemantic::Blocked)
+        );
+        assert_eq!(
+            excerpt
+                .lines
+                .iter()
+                .filter(|line| line.line.is_none())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn issue_source_excerpt_reads_only_the_bounded_visible_rows() {
+        let mut problem = test_problem("large-file", "value", 10, 999_998);
+        problem.related_ranges.push(lsp::Range::new(
+            lsp::Position::new(500_000, 4),
+            lsp::Position::new(500_000, 9),
+        ));
+        let mut rows_read = 0;
+        let excerpt = issue_source_excerpt_with_lines(
+            1_000_000,
+            |row| {
+                rows_read += 1;
+                format!("let row_{row} = {row};")
+            },
+            &problem,
+        );
+
+        assert_eq!(rows_read, 9);
+        assert_eq!(excerpt.lines.len(), 11);
+        assert_eq!(
+            excerpt
+                .lines
+                .iter()
+                .filter(|line| line.line.is_none())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn selected_issue_annotations_are_bounded_and_causal() {
+        let mut problem = test_problem("move", "value", 2, 12);
+        problem.category = "use_after_move".to_owned();
+        problem.related_ranges.push(lsp::Range::new(
+            lsp::Position::new(7, 4),
+            lsp::Position::new(7, 9),
+        ));
+
+        let annotations = learning_annotations_for_problem(&problem);
+        assert_eq!(annotations.len(), 3);
+        assert_eq!(annotations[0].semantic, LearningSemantic::Available);
+        assert_eq!(annotations[1].label, "ownership moves");
+        assert_eq!(annotations[2].semantic, LearningSemantic::Blocked);
+
+        problem.binding_range = problem.primary_range;
+        problem.related_ranges.clear();
+        let annotations = learning_annotations_for_problem(&problem);
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].semantic, LearningSemantic::Blocked);
     }
 
     #[test]
@@ -8560,7 +9384,7 @@ mod tests {
         let validated = rust_analyzer_ext::OwnershipRepair {
             compiler_validated: true,
             validation_state: "candidate".to_owned(),
-            ..candidate.clone()
+            ..candidate
         };
         assert!(repair_is_compiler_validated(&validated));
 

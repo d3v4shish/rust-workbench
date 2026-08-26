@@ -42,6 +42,13 @@ pub(crate) struct BeginnerNarrative {
     pub vocabulary: Vec<BeginnerVocabulary>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BeginnerCodeComparison {
+    pub familiar_pseudocode: String,
+    pub rust_pattern: String,
+    pub difference: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn narrative(
     title: impl Into<String>,
@@ -70,18 +77,114 @@ fn narrative(
     }
 }
 
+pub(crate) fn beginner_code_comparison(category: &str, target: &str) -> BeginnerCodeComparison {
+    let (familiar_pseudocode, rust_pattern, difference) = match category {
+        "use_after_move" => (
+            format!("other = {target}\nuse({target})  // both names still refer to the object"),
+            format!("let other = &{target};\nuse_value(&{target});"),
+            "Borrow when the original owner must remain usable; clone only when an independent value is intended.",
+        ),
+        "partial_move" => (
+            format!("name = {target}.name\nuse({target})  // object remains whole"),
+            format!("let name = &{target}.name;\nuse_value(&{target});"),
+            "Taking a non-Copy field transfers that field. Borrowing reads it without leaving the parent incomplete.",
+        ),
+        "multiple_mutable_borrows" => (
+            format!("first = {target}\nsecond = {target}\nfirst.change(); second.change();"),
+            format!("let first = &mut {target};\nfirst.change();\nlet second = &mut {target};"),
+            "End one exclusive use before beginning the next so the mutable permissions do not overlap.",
+        ),
+        "mutable_while_shared" | "assign_while_borrowed" => (
+            format!("view = {target}\n{target}.change()\nuse(view)"),
+            format!("let view = &{target};\nuse_value(view);\n{target}.change();"),
+            "Finish using shared views before mutation so every reader observes the stable value it borrowed.",
+        ),
+        "use_while_mutably_borrowed" => (
+            format!("editor = {target}\nuse({target})\neditor.change()"),
+            format!("let editor = &mut {target};\neditor.change();\nuse_value(&{target});"),
+            "While an exclusive borrow is active, use that borrow as the only route to the value.",
+        ),
+        "move_while_borrowed" | "move_out_of_borrowed_content" => (
+            format!("view = {target}.part\nsend({target})\nuse(view)"),
+            format!("let view = &{target}.part;\nuse_value(view);\nsend({target});"),
+            "Use the borrowed path before moving its owner, or produce a separate owned value explicitly.",
+        ),
+        "immutable_mutation" => (
+            format!("{target}.change()  // reachable objects are normally mutable"),
+            format!("let mut {target} = make_value();\n{target}.change();"),
+            "Rust requires the entire access path to grant mutation; an outer `mut` cannot bypass a shared wrapper.",
+        ),
+        "missing_lifetime" | "borrowed_value_too_short" => (
+            "store(reference)  // runtime keeps the object alive".to_owned(),
+            format!("fn keep<'a>(value: &'a T) -> &'a T {{ value }}\nlet kept = keep(&{target});"),
+            "A lifetime describes which existing owner keeps a reference valid; it does not extend storage by itself.",
+        ),
+        "returning_local_reference" | "temporary_dropped_while_borrowed" => (
+            "return local.reference  // object survives through the reference".to_owned(),
+            "fn make_value() -> String {\n    String::from(\"owned\")\n}".to_owned(),
+            "Return ownership or bind the temporary in a sufficiently long scope instead of returning a reference to expiring storage.",
+        ),
+        "trait_requirement" => (
+            "call(value)  // capability checked when the call runs".to_owned(),
+            "fn call<T: RequiredTrait>(value: T) {\n    value.required_operation();\n}".to_owned(),
+            "The generic bound makes the required capability part of the compile-time API contract.",
+        ),
+        "type_mismatch" => (
+            "result = producer()\nconsumer(result)  // convert later if needed".to_owned(),
+            "let value: Expected = producer().try_into()?;\nconsumer(value);".to_owned(),
+            "Make conversions, optionality, failure, and ownership changes explicit at the type boundary.",
+        ),
+        "method_or_trait_unavailable" => (
+            format!("{target}.operation()  // resolve the name at runtime"),
+            format!("use crate::RequiredTrait;\nRequiredTrait::operation(&{target});"),
+            "Rust must prove both where the method comes from and that the receiver path grants its required access.",
+        ),
+        "closure_may_outlive_borrow" | "borrowed_data_escapes" => (
+            format!("task = () => use({target})  // capture keeps it alive"),
+            format!("let task = move || use_value({target});"),
+            "A `move` closure owns its captured environment instead of storing a reference into a shorter scope.",
+        ),
+        "await_outside_async" => (
+            "value = await operation()".to_owned(),
+            "async fn work() {\n    let value = operation().await;\n}".to_owned(),
+            "`.await` needs an async state-machine boundary that can preserve locals while execution is suspended.",
+        ),
+        "recursive_async_function" => (
+            "async work() { await work() }".to_owned(),
+            "async fn work() {\n    Box::pin(work()).await;\n}".to_owned(),
+            "Indirection gives the recursive future a finite, pointer-sized representation.",
+        ),
+        _ => (
+            format!("use({target})  // capability checked while running"),
+            format!("use_value(&{target});"),
+            "Rust requires the ownership, access, and type contract to be explicit before this operation runs.",
+        ),
+    };
+    BeginnerCodeComparison {
+        familiar_pseudocode,
+        rust_pattern,
+        difference: difference.to_owned(),
+    }
+}
+
 pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrative {
     match category {
         "use_after_move" => narrative(
             format!("`{target}` was handed to a new owner"),
             format!("`{target}` was the one place responsible for this value."),
             "An assignment or function call transferred that responsibility to another place.",
-            format!("The value still exists, but `{target}` is no longer a usable way to reach it."),
+            format!(
+                "The value still exists, but `{target}` is no longer a usable way to reach it."
+            ),
             "In many managed languages, assigning an object variable leaves both names usable.",
             "For a non-Copy Rust value, assignment normally transfers the owning handle unless sharing or cloning is explicit.",
             "Think of ownership as the responsibility to clean up, not as the physical location of the bytes.",
             "A move usually does not move the heap allocation; it changes which place controls it.",
-            &[("owner", "the place responsible for cleanup"), ("move", "transfer that responsibility"), ("Copy", "a type whose value may be duplicated implicitly")],
+            &[
+                ("owner", "the place responsible for cleanup"),
+                ("move", "transfer that responsibility"),
+                ("Copy", "a type whose value may be duplicated implicitly"),
+            ],
         ),
         "partial_move" => narrative(
             format!("Part of `{target}` was handed away"),
@@ -92,7 +195,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust distinguishes reading a field from moving an owned field out of its parent.",
             "Picture a form with one required page removed: the remaining pages exist, but the complete packet cannot be submitted.",
             "A partial move does not necessarily invalidate every sibling field.",
-            &[("place", "a variable, field, or other storage path"), ("partial move", "moving one part of a larger value"), ("reinitialize", "put a new value back into a moved place")],
+            &[
+                ("place", "a variable, field, or other storage path"),
+                ("partial move", "moving one part of a larger value"),
+                ("reinitialize", "put a new value back into a moved place"),
+            ],
         ),
         "multiple_mutable_borrows" => narrative(
             format!("`{target}` already has an exclusive visitor"),
@@ -103,7 +210,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust requires one exclusive mutable access path at a time so aliases cannot observe an in-progress mutation.",
             "An `&mut` is a temporary exclusive-access pass, not merely a pointer that permits writes.",
             "The first borrow may end before the surrounding block ends; its final use is what matters.",
-            &[("mutable borrow", "temporary exclusive access"), ("alias", "another path to the same value"), ("overlap", "two access permissions active at the same time")],
+            &[
+                ("mutable borrow", "temporary exclusive access"),
+                ("alias", "another path to the same value"),
+                ("overlap", "two access permissions active at the same time"),
+            ],
         ),
         "mutable_while_shared" | "assign_while_borrowed" => narrative(
             format!("`{target}` is still being observed"),
@@ -114,7 +225,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "A Rust shared borrow promises that the borrowed value will not be mutated through ordinary access for that loan's duration.",
             "Readers receive a stable-view promise; mutation waits until nobody can still rely on that view.",
             "Shared means read-only access, not shared ownership. `Rc<T>` and `&T` answer different questions.",
-            &[("shared borrow", "temporary read-only access"), ("loan", "the compiler-tracked borrow period"), ("final use", "the last point a reference is needed")],
+            &[
+                ("shared borrow", "temporary read-only access"),
+                ("loan", "the compiler-tracked borrow period"),
+                ("final use", "the last point a reference is needed"),
+            ],
         ),
         "use_while_mutably_borrowed" => narrative(
             format!("`{target}` is temporarily behind an exclusive reference"),
@@ -125,7 +240,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "An active `&mut T` temporarily becomes the only permitted route to that `T`.",
             "Opening an exclusive editing session temporarily disables other views of the same document.",
             "Borrowed does not mean moved or destroyed; it means access is temporarily constrained.",
-            &[("exclusive access", "one active read/write route"), ("borrow", "temporary access without taking ownership"), ("owner", "the path that resumes access after the loan")],
+            &[
+                ("exclusive access", "one active read/write route"),
+                ("borrow", "temporary access without taking ownership"),
+                ("owner", "the path that resumes access after the loan"),
+            ],
         ),
         "move_while_borrowed" => narrative(
             format!("`{target}` cannot leave while a reference points into it"),
@@ -136,7 +255,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "A Rust borrow is tied to a proven owner lifetime; ownership cannot transfer in a way that breaks that proof.",
             "Do not forward a package while someone is still using an item that must be returned to that package.",
             "Moving an owning handle is about control and cleanup, even if the underlying heap address would stay unchanged.",
-            &[("referent", "the value a reference points into"), ("lifetime", "the region where that reference may be used"), ("move", "transfer ownership")],
+            &[
+                ("referent", "the value a reference points into"),
+                ("lifetime", "the region where that reference may be used"),
+                ("move", "transfer ownership"),
+            ],
         ),
         "move_out_of_borrowed_content" => narrative(
             format!("A borrow of `{target}` does not own its contents"),
@@ -147,7 +270,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Moving a Rust field is different from reading it; only an owner may normally remove owned content.",
             "A visitor may inspect or modify permitted contents, but cannot take away a required component of the host object.",
             "Cloning a part and moving the original part have different identity and cost semantics.",
-            &[("borrowed content", "data reached through a reference"), ("move out", "remove ownership from its current place"), ("clone", "create a separate owned value explicitly")],
+            &[
+                ("borrowed content", "data reached through a reference"),
+                ("move out", "remove ownership from its current place"),
+                ("clone", "create a separate owned value explicitly"),
+            ],
         ),
         "immutable_mutation" => narrative(
             format!("The path to `{target}` does not grant write access"),
@@ -158,7 +285,20 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust makes write permission part of the binding, reference, method receiver, and wrapper path.",
             "Reaching a value and being allowed to change it are separate capabilities.",
             "Making the outer variable `mut` cannot create mutable access through a wrapper whose API only provides shared access.",
-            &[("mutable binding", "a variable that may be reassigned or mutably borrowed"), ("`&mut self`", "a method requires exclusive access to its receiver"), ("interior mutability", "a wrapper that checks mutation by another mechanism")],
+            &[
+                (
+                    "mutable binding",
+                    "a variable that may be reassigned or mutably borrowed",
+                ),
+                (
+                    "`&mut self`",
+                    "a method requires exclusive access to its receiver",
+                ),
+                (
+                    "interior mutability",
+                    "a wrapper that checks mutation by another mechanism",
+                ),
+            ],
         ),
         "missing_lifetime" | "borrowed_value_too_short" => narrative(
             format!("Rust cannot prove how long `{target}` remains valid"),
@@ -169,7 +309,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust references do not extend storage lifetime; the compiler must connect each reference to an owner that already lives long enough.",
             "A lifetime is an expiry relationship printed on a permission slip, not extra runtime storage.",
             "Writing a lifetime annotation describes a relationship; it cannot make a short-lived owner live longer.",
-            &[("lifetime", "how reference validity relates to owner scope"), ("outlive", "remain valid for at least as long"), ("annotation", "a name for a lifetime relationship")],
+            &[
+                ("lifetime", "how reference validity relates to owner scope"),
+                ("outlive", "remain valid for at least as long"),
+                ("annotation", "a name for a lifetime relationship"),
+            ],
         ),
         "returning_local_reference" => narrative(
             format!("`{target}` is local to the function that is ending"),
@@ -180,7 +324,14 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust normally ends local ownership at the function boundary unless the owned value itself is returned or stored elsewhere.",
             "Return the book, not a library card for a library that closes when the function exits.",
             "Heap allocation alone does not make data independent of its local owner.",
-            &[("local owner", "a value cleaned up when its scope ends"), ("dangling reference", "a reference whose referent no longer exists"), ("owned return", "transfer the value itself to the caller")],
+            &[
+                ("local owner", "a value cleaned up when its scope ends"),
+                (
+                    "dangling reference",
+                    "a reference whose referent no longer exists",
+                ),
+                ("owned return", "transfer the value itself to the caller"),
+            ],
         ),
         "temporary_dropped_while_borrowed" => narrative(
             format!("The temporary owner behind `{target}` ends too soon"),
@@ -191,7 +342,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust temporaries have defined drop points; borrowing one does not generally promote it to a longer owner scope.",
             "Give the owner a name in the scope where its borrowed data must remain usable.",
             "The reference is not the owner and therefore cannot keep the temporary alive by itself.",
-            &[("temporary", "an unnamed intermediate value"), ("drop point", "where cleanup runs"), ("referent", "the value being borrowed")],
+            &[
+                ("temporary", "an unnamed intermediate value"),
+                ("drop point", "where cleanup runs"),
+                ("referent", "the value being borrowed"),
+            ],
         ),
         "trait_requirement" => narrative(
             format!("`{target}` lacks a capability required here"),
@@ -202,7 +357,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust proves trait capabilities at compile time and propagates generic requirements through every call boundary.",
             "A trait bound is a capability checklist the compiler must complete before admitting the call.",
             "A missing trait does not always mean you should implement it; the chosen representation may be the real mismatch.",
-            &[("trait", "a named set of supported behavior"), ("bound", "a required trait on a generic type"), ("implementation", "proof that a type supplies a trait")],
+            &[
+                ("trait", "a named set of supported behavior"),
+                ("bound", "a required trait on a generic type"),
+                ("implementation", "proof that a type supplies a trait"),
+            ],
         ),
         "type_mismatch" => narrative(
             format!("The value produced for `{target}` has a different contract"),
@@ -213,7 +372,14 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust checks the producer and consumer contracts before running the program.",
             "Types are not just printed shapes; they also state ownership, optionality, failure, and allowed operations.",
             "Similar displayed values do not imply interchangeable types or a free conversion.",
-            &[("expected type", "the consumer's required contract"), ("found type", "the producer's actual contract"), ("conversion", "an explicit transformation between representations")],
+            &[
+                ("expected type", "the consumer's required contract"),
+                ("found type", "the producer's actual contract"),
+                (
+                    "conversion",
+                    "an explicit transformation between representations",
+                ),
+            ],
         ),
         "method_or_trait_unavailable" => narrative(
             format!("The requested operation is not available through `{target}`"),
@@ -224,7 +390,14 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust resolves one method at compile time and proves its trait scope, receiver layer, and access requirements.",
             "The inner value may know the operation while the wrapper you currently hold does not grant that route.",
             "A method existing on `T` does not imply it is available mutably through `Rc<T>` or `&T`.",
-            &[("receiver", "the value before the dot in a method call"), ("trait in scope", "a visible source of extension methods"), ("auto-deref", "compiler-assisted search through dereference layers")],
+            &[
+                ("receiver", "the value before the dot in a method call"),
+                ("trait in scope", "a visible source of extension methods"),
+                (
+                    "auto-deref",
+                    "compiler-assisted search through dereference layers",
+                ),
+            ],
         ),
         "closure_may_outlive_borrow" | "borrowed_data_escapes" => narrative(
             format!("The callable may keep access to `{target}` too long"),
@@ -235,7 +408,17 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "A Rust closure has a concrete hidden environment containing either references or owned captures, each with normal lifetime rules.",
             "Treat a closure as a small struct: ask whether each stored field is a borrowed reference or an owned value.",
             "The `move` keyword changes capture ownership; it does not necessarily allocate or copy every captured value.",
-            &[("capture", "a surrounding value stored in a closure environment"), ("`move` closure", "a closure that takes ownership of captures"), ("escape", "remain usable beyond the current scope")],
+            &[
+                (
+                    "capture",
+                    "a surrounding value stored in a closure environment",
+                ),
+                (
+                    "`move` closure",
+                    "a closure that takes ownership of captures",
+                ),
+                ("escape", "remain usable beyond the current scope"),
+            ],
         ),
         "await_outside_async" => narrative(
             format!("`{target}` tries to pause a non-async context"),
@@ -246,7 +429,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust separates blocking from awaiting; `.await` is only valid where a future state machine is being built.",
             "An async block is resumable work with saved locals, not just a function that happens to call networking code.",
             "Calling an async function creates a future; it does not run that future to completion immediately.",
-            &[("future", "a value representing work that can make progress"), ("`.await`", "suspend this future until another is ready"), ("async context", "a function or block compiled as a future")],
+            &[
+                ("future", "a value representing work that can make progress"),
+                ("`.await`", "suspend this future until another is ready"),
+                ("async context", "a function or block compiled as a future"),
+            ],
         ),
         "recursive_async_function" => narrative(
             format!("`{target}` would contain itself without a size boundary"),
@@ -257,7 +444,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust future types are concrete values; direct recursive containment needs a pointer-sized boundary such as boxing.",
             "A box turns 'contains another complete copy of me' into 'contains a fixed-size handle to another copy.'",
             "The recursion problem is the future's representation, not recursion in ordinary synchronous functions.",
-            &[("state machine", "the stored states of resumable async work"), ("indirection", "reach a value through a fixed-size handle"), ("boxed future", "a future stored behind heap indirection")],
+            &[
+                ("state machine", "the stored states of resumable async work"),
+                ("indirection", "reach a value through a fixed-size handle"),
+                ("boxed future", "a future stored behind heap indirection"),
+            ],
         ),
         _ => narrative(
             format!("Rust rejected an operation involving `{target}`"),
@@ -268,7 +459,11 @@ pub(crate) fn beginner_narrative(category: &str, target: &str) -> BeginnerNarrat
             "Rust tries to prove the relevant contract before the operation can run.",
             "Start by asking who owns the value, who may access it now, and how long that access must last.",
             "The compiler message describes the failed proof; it does not decide which program design you intended.",
-            &[("owner", "the place responsible for a value"), ("access", "permission to read, write, or consume"), ("contract", "what an API requires and guarantees")],
+            &[
+                ("owner", "the place responsible for a value"),
+                ("access", "permission to read, write, or consume"),
+                ("contract", "what an API requires and guarantees"),
+            ],
         ),
     }
 }
@@ -819,8 +1014,12 @@ mod tests {
 
         for category in categories {
             let narrative = beginner_narrative(category, "value");
+            let comparison = beginner_code_comparison(category, "value");
             assert!(!narrative.title.is_empty(), "missing title for {category}");
-            assert!(!narrative.before.is_empty(), "missing before for {category}");
+            assert!(
+                !narrative.before.is_empty(),
+                "missing before for {category}"
+            );
             assert!(
                 !narrative.operation.is_empty(),
                 "missing operation for {category}"
@@ -846,13 +1045,27 @@ mod tests {
                 narrative.vocabulary.len() >= 3,
                 "missing vocabulary for {category}"
             );
+            assert!(
+                !comparison.familiar_pseudocode.is_empty(),
+                "missing familiar code for {category}"
+            );
+            assert!(
+                !comparison.rust_pattern.is_empty(),
+                "missing Rust code for {category}"
+            );
+            assert!(
+                !comparison.difference.is_empty(),
+                "missing code comparison for {category}"
+            );
         }
     }
 
     #[test]
     fn fallback_narrative_remains_useful_for_new_problem_families() {
         let narrative = beginner_narrative("future_diagnostic", "item");
+        let comparison = beginner_code_comparison("future_diagnostic", "item");
         assert!(narrative.title.contains("item"));
         assert_eq!(narrative.vocabulary.len(), 3);
+        assert!(comparison.rust_pattern.contains("item"));
     }
 }

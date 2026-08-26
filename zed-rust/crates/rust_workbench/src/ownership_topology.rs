@@ -143,9 +143,7 @@ pub(super) fn beginner_memory_state(state: &str) -> String {
     }
 }
 
-pub(super) fn derive_beginner_memory_path(
-    scene: &OwnershipTopologyScene,
-) -> BeginnerMemoryPath {
+pub(super) fn derive_beginner_memory_path(scene: &OwnershipTopologyScene) -> BeginnerMemoryPath {
     if scene.nodes.is_empty() {
         return BeginnerMemoryPath {
             stages: Vec::new(),
@@ -423,7 +421,7 @@ fn semantic_node_order(
                 }
             })
             .collect::<Vec<_>>();
-        adjacent.sort_by(|left, right| left.cmp(right));
+        adjacent.sort();
         for (_, _, adjacent_id) in adjacent {
             if !visited.contains(&adjacent_id) {
                 queue.push_back(adjacent_id);
@@ -842,20 +840,8 @@ mod tests {
                     "RefCell borrow gate",
                     "RefCell<Vec<i32>>",
                 ),
-                node(
-                    "vec-header",
-                    "wrapper",
-                    "inline",
-                    "Vec header",
-                    "Vec<i32>",
-                ),
-                node(
-                    "vec-buffer",
-                    "buffer",
-                    "heap",
-                    "Vec element buffer",
-                    "i32",
-                ),
+                node("vec-header", "wrapper", "inline", "Vec header", "Vec<i32>"),
+                node("vec-buffer", "buffer", "heap", "Vec element buffer", "i32"),
             ],
             vec![
                 edge("e1", "binding", "rc-handle", "stores"),

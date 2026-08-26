@@ -3394,7 +3394,7 @@ fn rust_workbench_inlay_kind(data: Option<&lsp::LSPAny>) -> Option<InlayHintKind
         return (metadata.get("category")?.as_str()? == "method_coach")
             .then_some(InlayHintKind::MethodCoach);
     }
-    if !matches!(version, 1 | 2 | 3) {
+    if !matches!(version, 1..=3) {
         return None;
     }
     match metadata.get("category")?.as_str()? {

@@ -68,7 +68,7 @@ the broader Learning Debugger.
   Preview `Rc`, `RefCell`, `Rc<RefCell<_>>`, or thread-safe topologies to see the counterfactual
   memory model and runtime tradeoffs before touching source. Applied edits remain one-step undoable.
 - **Advanced compiler evidence** is the only collapsed secondary section. It contains exact MIR
-  facts, loan endpoints, representation layers, operation provenance, and the conceptual C sketch.
+  facts, loan endpoints, representation layers, and operation provenance.
 - Use **A−**, the percentage button, and **A+** in the panel header to reduce, reset, or increase
   panel text. Display profiles still control which editor inlays appear independently from the
   sidebar explanation.
