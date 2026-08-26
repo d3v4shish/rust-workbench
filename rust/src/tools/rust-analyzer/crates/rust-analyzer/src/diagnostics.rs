@@ -799,14 +799,13 @@ impl DiagnosticCollection {
         let ownership_events = Arc::make_mut(&mut self.ownership_events);
         for flycheck in ownership_events.iter_mut() {
             for package in flycheck.values_mut() {
-                if let Some(events) = package.get_mut(&file_id) {
-                    if events.iter().any(|event| event.exact) {
-                        let previous = std::mem::take(events);
-                        *events = Arc::new(
-                            previous.iter().filter(|event| !event.exact).cloned().collect(),
-                        );
-                        retired.event_sets.push(previous);
-                    }
+                if let Some(events) = package.get_mut(&file_id)
+                    && events.iter().any(|event| event.exact)
+                {
+                    let previous = std::mem::take(events);
+                    *events =
+                        Arc::new(previous.iter().filter(|event| !event.exact).cloned().collect());
+                    retired.event_sets.push(previous);
                 }
             }
         }

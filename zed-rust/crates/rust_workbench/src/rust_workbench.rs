@@ -80,6 +80,7 @@ const DEFAULT_PANEL_FONT_SCALE_PERCENT: u16 = 100;
 const MIN_PANEL_FONT_SCALE_PERCENT: u16 = 80;
 const MAX_PANEL_FONT_SCALE_PERCENT: u16 = 180;
 const PANEL_FONT_SCALE_STEP_PERCENT: i16 = 10;
+const MAX_RENDERED_ISSUES: usize = 48;
 struct OwnershipStudioCue;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -294,6 +295,7 @@ pub struct RustWorkbenchPanel {
     selected_intent_choice_id: Option<String>,
     operation_focus_requested: bool,
     selection_epoch: u64,
+    analysis_epoch: u64,
     problem_status: SharedString,
     status_message: SharedString,
     active_buffer: Option<Entity<Buffer>>,
@@ -343,12 +345,14 @@ struct ModelRequestKey {
     problem_id: Option<String>,
     position: PointUtf16,
     selection_epoch: u64,
+    analysis_epoch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProblemRequestKey {
     buffer_id: EntityId,
     source_hash: String,
+    analysis_epoch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -358,6 +362,7 @@ struct WorkspaceGuideRequestKey {
     problem_id: Option<String>,
     position: PointUtf16,
     selection_epoch: u64,
+    analysis_epoch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -377,9 +382,11 @@ fn model_response_is_current(
     request: &ModelRequestKey,
     selected_problem_id: Option<&str>,
     selection_epoch: u64,
+    analysis_epoch: u64,
 ) -> bool {
     pending == Some(request)
         && selection_epoch == request.selection_epoch
+        && analysis_epoch == request.analysis_epoch
         && selected_problem_id == request.problem_id.as_deref()
 }
 
@@ -643,6 +650,20 @@ impl RustWorkbenchPanel {
                             panel.pending_problem_key = None;
                             panel.schedule_problem_scan(cx);
                         }
+                        project::Event::LanguageServerAdded(_, name, _)
+                            if *name == rust_analyzer_ext::RUST_ANALYZER_NAME =>
+                        {
+                            panel.invalidate_analysis_session(
+                                "Rust analyzer started; refreshing compiler facts.",
+                                cx,
+                            );
+                        }
+                        project::Event::LanguageServerRemoved(_) => {
+                            panel.invalidate_analysis_session(
+                                "Rust analyzer stopped; existing facts are retained while it restarts.",
+                                cx,
+                            );
+                        }
                         _ => {}
                     }
                 });
@@ -659,6 +680,7 @@ impl RustWorkbenchPanel {
                     selected_intent_choice_id: None,
                     operation_focus_requested: false,
                     selection_epoch: 0,
+                    analysis_epoch: 0,
                     problem_status: "Checking this file for explainable Rust problems…".into(),
                     status_message: "Select a Rust variable, then refresh.".into(),
                     active_buffer: None,
@@ -791,6 +813,24 @@ impl RustWorkbenchPanel {
             })
         });
         self.apply_display_to_editor(cx);
+    }
+
+    fn invalidate_analysis_session(&mut self, status: &'static str, cx: &mut Context<Self>) {
+        self.analysis_epoch = self.analysis_epoch.wrapping_add(1);
+        self.last_problem_key = None;
+        self.pending_problem_key = None;
+        self.last_model_key = None;
+        self.pending_model_key = None;
+        self.last_workspace_guide_key = None;
+        self.pending_workspace_guide_key = None;
+        self.validating_repair_id = None;
+        self.status_message = status.into();
+        self.problem_status = status.into();
+        if self.active_buffer.is_some() {
+            self.schedule_problem_scan(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn clear_unavailable_source_state(&mut self, cx: &mut Context<Self>) {
@@ -1391,13 +1431,18 @@ impl RustWorkbenchPanel {
             cx,
         );
         self.validating_repair_id = Some(repair_id.clone());
+        let selection_epoch = self.selection_epoch;
+        let analysis_epoch = self.analysis_epoch;
         self.status_message =
             "Preview ready. rustc is checking whether the complete rewrite still compiles…".into();
         self.repair_validation_task = cx.spawn(async move |panel, cx| {
             let result = validation.await;
             panel
                 .update(cx, |panel, cx| {
-                    if panel.validating_repair_id.as_deref() != Some(repair_id.as_str()) {
+                    if panel.validating_repair_id.as_deref() != Some(repair_id.as_str())
+                        || panel.selection_epoch != selection_epoch
+                        || panel.analysis_epoch != analysis_epoch
+                    {
                         return;
                     }
                     match result {
@@ -1718,6 +1763,7 @@ impl RustWorkbenchPanel {
         let request_key = ProblemRequestKey {
             buffer_id: buffer.entity_id(),
             source_hash: ownership_source_hash(&source),
+            analysis_epoch: self.analysis_epoch,
         };
         if self.pending_problem_key.as_ref() == Some(&request_key)
             || self.last_problem_key.as_ref() == Some(&request_key)
@@ -1867,6 +1913,7 @@ impl RustWorkbenchPanel {
             problem_id: requested_problem_id.clone(),
             position,
             selection_epoch: self.selection_epoch,
+            analysis_epoch: self.analysis_epoch,
         };
         if self.pending_workspace_guide_key.as_ref() == Some(&request_key)
             || self.last_workspace_guide_key.as_ref() == Some(&request_key)
@@ -1900,7 +1947,10 @@ impl RustWorkbenchPanel {
                             ownership_source_hash(&active.read(cx).snapshot().text())
                                 == request_key.source_hash
                         });
-                    if !source_is_current || panel.selection_epoch != request_key.selection_epoch {
+                    if !source_is_current
+                        || panel.selection_epoch != request_key.selection_epoch
+                        || panel.analysis_epoch != request_key.analysis_epoch
+                    {
                         return;
                     }
                     match result {
@@ -2009,6 +2059,7 @@ impl RustWorkbenchPanel {
             problem_id: self.selected_problem_id.clone(),
             position,
             selection_epoch: self.selection_epoch,
+            analysis_epoch: self.analysis_epoch,
         };
         if self.pending_model_key.as_ref() == Some(&request_key)
             || self.last_model_key.as_ref() == Some(&request_key)
@@ -2034,12 +2085,24 @@ impl RustWorkbenchPanel {
                         &request_key,
                         panel.selected_problem_id.as_deref(),
                         panel.selection_epoch,
+                        panel.analysis_epoch,
                     ) {
                         return;
                     }
                     panel.pending_model_key = None;
                     match model {
                         Ok(model) => {
+                            if model.status == "rust_analyzer_unavailable"
+                                && panel.model.status != "rust_analyzer_unavailable"
+                                && panel.model.source_hash == request_key.source_hash
+                            {
+                                panel.last_model_key = None;
+                                panel.status_message =
+                                    "rust-analyzer is restarting; showing the last verified compiler facts."
+                                        .into();
+                                cx.notify();
+                                return;
+                            }
                             let source_is_current = panel
                                 .active_buffer
                                 .as_ref()
@@ -2081,12 +2144,21 @@ impl RustWorkbenchPanel {
                         }
                         Err(error) => {
                             panel.last_model_key = None;
-                            panel.status_message =
-                                format!("Ownership analysis failed: {error}").into();
-                            panel.model = OwnershipModel::default();
-                            panel.topology_scene = None;
-                            panel.full_topology_scene = None;
-                            panel.selected_topology_element = None;
+                            if panel.model.status != "rust_analyzer_unavailable"
+                                && panel.model.source_hash == request_key.source_hash
+                            {
+                                panel.status_message = format!(
+                                    "Ownership analysis failed: {error}. Showing the last verified compiler facts."
+                                )
+                                .into();
+                            } else {
+                                panel.status_message =
+                                    format!("Ownership analysis failed: {error}").into();
+                                panel.model = OwnershipModel::default();
+                                panel.topology_scene = None;
+                                panel.full_topology_scene = None;
+                                panel.selected_topology_element = None;
+                            }
                         }
                     }
                     cx.notify();
@@ -2157,6 +2229,7 @@ impl RustWorkbenchPanel {
         );
         let project = self.project.clone();
         let selection_epoch = self.selection_epoch;
+        let analysis_epoch = self.analysis_epoch;
         self.status_message = format!("Applying {title}…").into();
         self.repair_apply_task = cx.spawn(async move |panel, cx| {
             let result = async {
@@ -2174,7 +2247,9 @@ impl RustWorkbenchPanel {
 
             panel
                 .update(cx, |panel, cx| {
-                    if panel.selection_epoch != selection_epoch {
+                    if panel.selection_epoch != selection_epoch
+                        || panel.analysis_epoch != analysis_epoch
+                    {
                         return;
                     }
                     match result {
@@ -2269,6 +2344,19 @@ fn ownership_problem_signature(problem: &OwnershipProblem) -> String {
         problem.category,
         problem.binding_name
     )
+}
+
+fn issue_picker_range(problem_count: usize, selected_index: Option<usize>) -> Range<usize> {
+    if problem_count <= MAX_RENDERED_ISSUES {
+        return 0..problem_count;
+    }
+
+    let selected = selected_index.unwrap_or(0).min(problem_count - 1);
+    let half_window = MAX_RENDERED_ISSUES / 2;
+    let start = selected
+        .saturating_sub(half_window)
+        .min(problem_count - MAX_RENDERED_ISSUES);
+    start..start + MAX_RENDERED_ISSUES
 }
 
 fn ownership_model_matches_source(model: &OwnershipModel, source: &str) -> bool {
@@ -2589,8 +2677,19 @@ impl Render for RustWorkbenchPanel {
             })
         });
         let problem_count = self.problems.problems.len();
-        let issue_list = self.problems.problems.clone();
         let selected_problem_index = self.selected_problem_index();
+        let issue_range = issue_picker_range(problem_count, selected_problem_index);
+        let issue_list = self.problems.problems[issue_range.clone()].to_vec();
+        let previous_issue_page = issue_range
+            .start
+            .checked_sub(1)
+            .map(|index| index.saturating_sub(MAX_RENDERED_ISSUES - 1));
+        let next_issue_page = (issue_range.end < problem_count).then_some(issue_range.end);
+        let issue_range_label = format!(
+            "Showing {}-{} of {problem_count}",
+            issue_range.start.saturating_add(1),
+            issue_range.end
+        );
         let selected_problem_label = problem.as_ref().map(|problem| {
             let target = resolved_problem_target(problem, &self.model);
             if let Some(code) = problem.diagnostic_code.as_deref() {
@@ -2812,9 +2911,64 @@ impl Render for RustWorkbenchPanel {
                             .border_b_1()
                             .border_color(cx.theme().colors().border_variant)
                             .child(
-                                Label::new("Compiler issues in this file").size(LabelSize::Small),
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .gap_1()
+                                    .child(
+                                        v_flex()
+                                            .min_w_0()
+                                            .child(
+                                                Label::new("Compiler issues in this file")
+                                                    .size(LabelSize::Small),
+                                            )
+                                            .child(
+                                                Label::new(issue_range_label)
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_0p5()
+                                            .when_some(previous_issue_page, |this, index| {
+                                                this.child(
+                                                    IconButton::new(
+                                                        "previous-ownership-issue-page",
+                                                        IconName::ArrowLeft,
+                                                    )
+                                                    .aria_label("Show the previous page of issues")
+                                                    .tooltip(Tooltip::text("Previous issue page"))
+                                                    .on_click(cx.listener(
+                                                        move |panel, _, window, cx| {
+                                                            panel.focus_problem_index(
+                                                                index, window, cx,
+                                                            );
+                                                        },
+                                                    )),
+                                                )
+                                            })
+                                            .when_some(next_issue_page, |this, index| {
+                                                this.child(
+                                                    IconButton::new(
+                                                        "next-ownership-issue-page",
+                                                        IconName::ArrowRight,
+                                                    )
+                                                    .aria_label("Show the next page of issues")
+                                                    .tooltip(Tooltip::text("Next issue page"))
+                                                    .on_click(cx.listener(
+                                                        move |panel, _, window, cx| {
+                                                            panel.focus_problem_index(
+                                                                index, window, cx,
+                                                            );
+                                                        },
+                                                    )),
+                                                )
+                                            }),
+                                    ),
                             )
-                            .children(issue_list.into_iter().enumerate().map(|(index, issue)| {
+                            .children(issue_list.into_iter().enumerate().map(|(offset, issue)| {
+                                let index = issue_range.start + offset;
                                 let selected = Some(index) == selected_problem_index;
                                 let code = issue
                                     .diagnostic_code
@@ -9710,6 +9864,7 @@ mod tests {
             problem_id: Some("self-events".to_owned()),
             position: PointUtf16::new(13, 8),
             selection_epoch: 4,
+            analysis_epoch: 2,
         };
         let request_b = ModelRequestKey {
             problem_id: Some("current".to_owned()),
@@ -9723,18 +9878,28 @@ mod tests {
             &request_a,
             Some("current"),
             5,
+            2,
         ));
         assert!(!model_response_is_current(
             Some(&request_b),
             &request_b,
             Some("self-events"),
             5,
+            2,
+        ));
+        assert!(!model_response_is_current(
+            Some(&request_b),
+            &request_b,
+            Some("current"),
+            5,
+            3,
         ));
         assert!(model_response_is_current(
             Some(&request_b),
             &request_b,
             Some("current"),
             5,
+            2,
         ));
     }
 
@@ -9813,6 +9978,21 @@ mod tests {
         assert_eq!(relative_problem_index(Some(0), 5, 1), Some(1));
         assert_eq!(relative_problem_index(Some(4), 5, 1), Some(0));
         assert_eq!(relative_problem_index(Some(0), 5, -1), Some(4));
+    }
+
+    #[test]
+    fn issue_picker_keeps_large_diagnostic_sets_bounded_and_selected() {
+        assert_eq!(issue_picker_range(0, None), 0..0);
+        assert_eq!(issue_picker_range(36, Some(35)), 0..36);
+        assert_eq!(issue_picker_range(512, Some(0)), 0..48);
+        assert_eq!(issue_picker_range(512, Some(250)), 226..274);
+        assert_eq!(issue_picker_range(512, Some(511)), 464..512);
+
+        for selected in 0..512 {
+            let range = issue_picker_range(512, Some(selected));
+            assert_eq!(range.len(), MAX_RENDERED_ISSUES);
+            assert!(range.contains(&selected));
+        }
     }
 
     #[test]

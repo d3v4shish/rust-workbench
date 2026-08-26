@@ -14,6 +14,10 @@
     "light": "One Light",
     "dark": "One Dark",
   },
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false,
+  },
   "semantic_tokens": "combined",
   "inlay_hints": {
     "enabled": true,

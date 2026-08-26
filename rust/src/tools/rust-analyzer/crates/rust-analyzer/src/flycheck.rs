@@ -3,7 +3,7 @@
 
 use std::{
     cell::Cell,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt, io,
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
@@ -263,7 +263,8 @@ impl FlycheckHandle {
         validate_ownership_repairs: bool,
     ) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.sender
+        if self
+            .sender
             .send(StateChange::Restart {
                 generation,
                 scope: FlycheckScope::Workspace,
@@ -271,7 +272,10 @@ impl FlycheckHandle {
                 target: None,
                 validate_ownership_repairs,
             })
-            .unwrap();
+            .is_err()
+        {
+            tracing::debug!(flycheck_id = self.id, "ignored restart after flycheck worker stopped");
+        }
     }
 
     pub(crate) fn restart_for_package_with_validation(
@@ -283,7 +287,8 @@ impl FlycheckHandle {
         validate_ownership_repairs: bool,
     ) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.sender
+        if self
+            .sender
             .send(StateChange::Restart {
                 generation,
                 scope: FlycheckScope::Package { package, workspace_deps },
@@ -291,12 +296,15 @@ impl FlycheckHandle {
                 target,
                 validate_ownership_repairs,
             })
-            .unwrap();
+            .is_err()
+        {
+            tracing::debug!(flycheck_id = self.id, "ignored restart after flycheck worker stopped");
+        }
     }
 
     /// Stop this cargo check worker.
     pub(crate) fn cancel(&self) {
-        self.sender.send(StateChange::Cancel).unwrap();
+        let _ = self.sender.send(StateChange::Cancel);
     }
 
     pub(crate) fn id(&self) -> usize {
@@ -722,7 +730,13 @@ impl FlycheckActor {
                     tracing::debug!(flycheck_id = self.id, "flycheck finished");
 
                     // Watcher finished
-                    let command_handle = self.command_handle.take().unwrap();
+                    let Some(command_handle) = self.command_handle.take() else {
+                        tracing::debug!(
+                            flycheck_id = self.id,
+                            "ignored duplicate flycheck completion"
+                        );
+                        continue;
+                    };
                     self.command_receiver.take();
                     let formatted_handle = format!("{command_handle:?}");
 
@@ -1083,7 +1097,12 @@ impl FlycheckActor {
 
     #[track_caller]
     fn send(&self, check_task: FlycheckMessage) {
-        self.sender.send(check_task).unwrap();
+        if self.sender.send(check_task).is_err() {
+            tracing::debug!(
+                flycheck_id = self.id,
+                "ignored message after flycheck receiver stopped"
+            );
+        }
     }
 
     fn supports_ownership_wrapper(&self, cargo_options: &CargoOptions) -> bool {
@@ -1217,12 +1236,20 @@ impl FlycheckActor {
 }
 
 fn ownership_model_directory(root: &AbsPath) -> std::path::PathBuf {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in root.as_str().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    std::env::temp_dir().join(format!("rust-analyzer-ownership-v5-{hash:016x}"))
+    ownership_model_directory_for_instance(
+        root,
+        std::env::var_os("RUST_WORKBENCH_INSTANCE_ID").as_deref(),
+    )
+}
+
+fn ownership_model_directory_for_instance(
+    root: &AbsPath,
+    instance: Option<&OsStr>,
+) -> std::path::PathBuf {
+    let root_hash = stable_cache_hash(root.as_str().as_bytes());
+    let instance_hash =
+        stable_cache_hash(instance.unwrap_or_else(|| OsStr::new("standalone")).as_encoded_bytes());
+    std::env::temp_dir().join(format!("rust-analyzer-ownership-v6-{root_hash}-{instance_hash}"))
 }
 
 fn ownership_validation_target_directory(
@@ -1235,7 +1262,13 @@ fn ownership_validation_target_directory(
         .map(std::borrow::Cow::into_owned)
         .or_else(|| ws_target_dir.map(Utf8Path::to_owned))
         .unwrap_or_else(|| Utf8PathBuf::from("target"))
-        .join("rust-analyzer-ownership-validation-v1")
+        .join("rust-analyzer-ownership-validation-v2")
+        .join(stable_cache_hash(
+            std::env::var_os("RUST_WORKBENCH_INSTANCE_ID")
+                .as_deref()
+                .unwrap_or_else(|| OsStr::new("standalone"))
+                .as_encoded_bytes(),
+        ))
 }
 
 static NEXT_ALIAS_TEMP: AtomicUsize = AtomicUsize::new(0);
@@ -1543,12 +1576,18 @@ mod tests {
     #[test]
     fn ownership_model_cache_is_stable_and_workspace_scoped() {
         let root = AbsPathBuf::assert_utf8(std::env::current_dir().unwrap());
-        let first = ownership_model_directory(&root);
-        let second = ownership_model_directory(&root);
-        let other = ownership_model_directory(&root.join("another-workspace"));
+        let first = ownership_model_directory_for_instance(&root, Some(OsStr::new("first")));
+        let second = ownership_model_directory_for_instance(&root, Some(OsStr::new("first")));
+        let other_workspace = ownership_model_directory_for_instance(
+            &root.join("another-workspace"),
+            Some(OsStr::new("first")),
+        );
+        let other_instance =
+            ownership_model_directory_for_instance(&root, Some(OsStr::new("second")));
 
         assert_eq!(first, second);
-        assert_ne!(first, other);
+        assert_ne!(first, other_workspace);
+        assert_ne!(first, other_instance);
         assert!(
             first.file_name().unwrap().to_string_lossy().starts_with("rust-analyzer-ownership-")
         );

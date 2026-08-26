@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$root"
+
+if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+  echo "Release builds require a clean, committed source tree." >&2
+  git status --short >&2
+  exit 1
+fi
+
+./workbench bootstrap
+./workbench build all --portable
+./workbench package linux --skip-build
+
+archive="$(find dist -maxdepth 1 -type f -name 'rust-workbench-*-linux-*.tar.zst' -printf '%T@ %p\n' | sort -n | tail -n 1 | cut -d' ' -f2-)"
+printf '\nRelease outputs:\n%s\n%s\n%s\n' \
+  "$archive" \
+  "$archive.sha256" \
+  "$archive.manifest.json"

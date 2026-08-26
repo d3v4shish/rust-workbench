@@ -6,7 +6,8 @@
 //!     https://github.com/intellij-rust/intellij-rust/blob/master/native-helper/src/main.rs
 use std::{
     ffi::OsString,
-    fs, io,
+    fs,
+    io::{self, Read as _, Write as _},
     path::PathBuf,
     process::{Command, ExitCode, Stdio},
     time::SystemTime,
@@ -21,8 +22,12 @@ struct OwnershipArtifactStamp {
 
 pub(crate) fn main() -> io::Result<ExitCode> {
     let mut args = std::env::args_os();
-    let _me = args.next().unwrap();
-    let rustc = args.next().unwrap();
+    let _me = args
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing wrapper executable"))?;
+    let rustc = args.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "rustc wrapper requires a rustc executable")
+    })?;
     let args = args.collect();
     match std::env::var("RA_RUSTC_WRAPPER").as_deref() {
         Ok("borrowck-wrapper-suggestions") => run_rustc_with_wrapper_suggestions(rustc, args),
@@ -59,24 +64,90 @@ fn run_rustc_with_ownership(
         original.clone(),
         model_directory.clone(),
     );
-    let instrumented_status = run_rustc(executable, instrumented_args)?;
+    let instrumented = run_rustc_observing_errors(executable, instrumented_args)?;
 
     // Some front-end errors stop the instrumented compiler before borrow checking. Run an
     // unmodified diagnostic pass only when no model was produced, so rust-analyzer still receives
     // rustc's complete error list without doubling the normal ownership-analysis workload.
     let artifacts_after =
         ownership_artifact_snapshot(model_directory.as_ref(), artifact_prefix.as_deref());
-    if needs_diagnostic_fallback(
+    let needs_fallback = needs_diagnostic_fallback(
         checks_metadata,
         model_directory.is_some(),
         &artifacts_before,
         &artifacts_after,
-    ) {
+        instrumented.succeeded,
+        instrumented.emitted_error,
+    );
+    if std::env::var_os("RA_RUSTC_WRAPPER_TRACE").is_some() {
+        eprintln!(
+            "rustc-wrapper ownership: crate={} succeeded={} emitted_error={} artifact_changed={} fallback={needs_fallback}",
+            artifact_prefix.as_deref().unwrap_or("<unknown>"),
+            instrumented.succeeded,
+            instrumented.emitted_error,
+            artifacts_before != artifacts_after,
+        );
+    }
+    if needs_fallback {
         let (executable, args) = forwarded_rustc_invocation(rustc_executable, args, original);
         return run_rustc(executable, args);
     }
 
-    Ok(instrumented_status)
+    Ok(instrumented.exit_code)
+}
+
+struct ObservedRustcRun {
+    exit_code: ExitCode,
+    succeeded: bool,
+    emitted_error: bool,
+}
+
+fn run_rustc_observing_errors(
+    rustc_executable: OsString,
+    args: Vec<OsString>,
+) -> io::Result<ObservedRustcRun> {
+    #[allow(clippy::disallowed_methods)]
+    let mut child = Command::new(rustc_executable)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = child.stderr.take().ok_or_else(|| io::Error::other("missing rustc stderr"))?;
+    let mut reader = io::BufReader::new(stderr);
+    let mut parent_stderr = io::stderr().lock();
+    let mut chunk = [0_u8; 8192];
+    let mut observation_window = Vec::with_capacity(chunk.len() + 32);
+    let mut tail = Vec::with_capacity(32);
+    let mut emitted_error = false;
+    loop {
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        observation_window.clear();
+        observation_window.extend_from_slice(&tail);
+        observation_window.extend_from_slice(&chunk[..count]);
+        emitted_error |= byte_slice_contains(&observation_window, br#""level":"error""#)
+            || observation_window.starts_with(b"error")
+            || byte_slice_contains(&observation_window, b"\nerror")
+            || byte_slice_contains(&observation_window, b"error[");
+        let tail_start = observation_window.len().saturating_sub(32);
+        tail.clear();
+        tail.extend_from_slice(&observation_window[tail_start..]);
+        parent_stderr.write_all(&chunk[..count])?;
+    }
+    parent_stderr.flush()?;
+    let status = child.wait()?;
+    Ok(ObservedRustcRun {
+        exit_code: ExitCode::from(status.code().unwrap_or(102) as u8),
+        succeeded: status.success(),
+        emitted_error,
+    })
+}
+
+fn byte_slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
 }
 
 fn checks_metadata(args: &[OsString]) -> bool {
@@ -122,8 +193,14 @@ fn needs_diagnostic_fallback(
     has_model_directory: bool,
     artifacts_before: &[OwnershipArtifactStamp],
     artifacts_after: &[OwnershipArtifactStamp],
+    instrumented_succeeded: bool,
+    emitted_error: bool,
 ) -> bool {
-    checks_metadata && has_model_directory && artifacts_before == artifacts_after
+    checks_metadata
+        && has_model_directory
+        && artifacts_before == artifacts_after
+        && !instrumented_succeeded
+        && !emitted_error
 }
 
 fn ownership_invocation(
@@ -341,11 +418,23 @@ mod tests {
         }];
         let mut after = before.clone();
 
-        assert!(needs_diagnostic_fallback(true, true, &before, &after));
-        assert!(!needs_diagnostic_fallback(false, true, &before, &after));
-        assert!(!needs_diagnostic_fallback(true, false, &before, &after));
+        assert!(needs_diagnostic_fallback(true, true, &before, &after, false, false));
+        assert!(!needs_diagnostic_fallback(true, true, &before, &after, false, true));
+        assert!(!needs_diagnostic_fallback(true, true, &before, &after, true, false));
+        assert!(!needs_diagnostic_fallback(false, true, &before, &after, false, false));
+        assert!(!needs_diagnostic_fallback(true, false, &before, &after, false, false));
 
         after[0].length += 1;
-        assert!(!needs_diagnostic_fallback(true, true, &before, &after));
+        assert!(!needs_diagnostic_fallback(true, true, &before, &after, false, false));
+    }
+
+    #[test]
+    fn observed_error_detection_handles_json_and_plain_diagnostics() {
+        assert!(byte_slice_contains(
+            br#"{"message":"bad","level":"error"}"#,
+            br#""level":"error""#
+        ));
+        assert!(b"error[E0382]: moved value".starts_with(b"error"));
+        assert!(!byte_slice_contains(b"warning: unused", br#""level":"error""#));
     }
 }

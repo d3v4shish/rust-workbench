@@ -8,7 +8,7 @@ stress_project = "zed-rust/rust-ownership-stress-lab"
 os = "linux"
 arch = "x86_64"
 glibc_min = "2.43"
-archive = "rust-workbench-linux-x86_64-glibc2.43.tar.zst"
+archive = "rust-workbench-1.1.0-linux-x86_64-glibc2.43.tar.zst"
 
 [cleanup]
 debug_caches = [

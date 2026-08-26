@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+zed_source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+launcher="$zed_source_dir/script/rust-workbench"
+data_home="$(mktemp -d -t rust-workbench-instances.XXXXXX)"
+trap 'rm -rf "$data_home"' EXIT
+
+mkdir -p "$data_home/config"
+printf '%s\n' '{"telemetry":{"metrics":false,"diagnostics":false}}' >"$data_home/config/settings.json"
+
+named="$({ RUST_WORKBENCH_DATA_DIR="$data_home" "$launcher" --instance alpha --print-instance-dir; } | tail -n1)"
+test "$named" = "$data_home/instances/alpha"
+cmp "$data_home/config/settings.json" "$named/config/settings.json"
+
+if RUST_WORKBENCH_DATA_DIR="$data_home" "$launcher" --instance '../unsafe' --print-instance-dir >/dev/null 2>&1; then
+  echo "unsafe instance name was accepted" >&2
+  exit 1
+fi
+for unsafe_name in . ..; do
+  if RUST_WORKBENCH_DATA_DIR="$data_home" "$launcher" --instance "$unsafe_name" --print-instance-dir >/dev/null 2>&1; then
+    echo "unsafe instance name '$unsafe_name' was accepted" >&2
+    exit 1
+  fi
+done
+
+mkdir -p "$data_home"
+exec 9>"$data_home/.instance.lock"
+flock -n 9
+if RUST_WORKBENCH_DATA_DIR="$data_home" "$launcher" --instance default --print-instance-dir >/dev/null 2>&1; then
+  echo "a locked named instance was opened twice" >&2
+  exit 1
+fi
+automatic="$({ RUST_WORKBENCH_DATA_DIR="$data_home" "$launcher" --print-instance-dir; } | tail -n1)"
+test "$automatic" = "$data_home/instances/instance-2"
+exec 9>&-
+
+default="$({ RUST_WORKBENCH_DATA_DIR="$data_home" "$launcher" --instance default --print-instance-dir; } | tail -n1)"
+test "$default" = "$data_home"
+test "$default" != "$automatic"
+
+echo "Rust Workbench instance isolation passed."

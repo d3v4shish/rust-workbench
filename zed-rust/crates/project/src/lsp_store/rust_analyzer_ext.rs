@@ -1,5 +1,5 @@
 use ::serde::{Deserialize, Serialize};
-use anyhow::Context as _;
+use anyhow::{Context as _, ensure};
 use gpui::{App, AppContext as _, AsyncApp, Entity, Task, WeakEntity};
 use language::{Buffer, File as _, ServerHealth};
 use lsp::{DEFAULT_LSP_REQUEST_TIMEOUT, LanguageServer, LanguageServerId, LanguageServerName};
@@ -10,6 +10,20 @@ use crate::{CodeAction, LspAction, LspStore, LspStoreEvent, Project, ProjectPath
 
 pub const RUST_ANALYZER_NAME: LanguageServerName = LanguageServerName::new_static("rust-analyzer");
 pub const CARGO_DIAGNOSTICS_SOURCE_NAME: &str = "rustc";
+
+const MAX_OWNERSHIP_PROBLEMS: usize = 512;
+const MAX_OWNERSHIP_EVENTS: usize = 256;
+const MAX_OWNERSHIP_BODIES: usize = 512;
+const MAX_OWNERSHIP_BINDINGS: usize = 64;
+const MAX_OWNERSHIP_LOANS: usize = 64;
+const MAX_OWNERSHIP_OPERATIONS: usize = 64;
+const MAX_OWNERSHIP_REPAIRS: usize = 16;
+const MAX_OWNERSHIP_GRAPH_NODES: usize = 128;
+const MAX_OWNERSHIP_GRAPH_EDGES: usize = 256;
+const MAX_OWNERSHIP_SNAPSHOTS: usize = 256;
+const MAX_OWNERSHIP_ACCESS_PATHS: usize = 64;
+const MAX_OWNERSHIP_WORKSPACE_CLUSTERS: usize = 64;
+const MAX_OWNERSHIP_TEXT_BYTES: usize = 256 * 1024;
 
 /// Experimental: Informs the end user about the state of the server
 ///
@@ -642,6 +656,385 @@ fn candidate_validation_state() -> String {
     "candidate".to_owned()
 }
 
+fn validate_range(label: &str, range: &lsp::Range) -> anyhow::Result<()> {
+    ensure!(
+        (range.start.line, range.start.character) <= (range.end.line, range.end.character),
+        "{label} contains an inverted LSP range"
+    );
+    Ok(())
+}
+
+fn validate_text(label: &str, text: &str) -> anyhow::Result<()> {
+    ensure!(
+        text.len() <= MAX_OWNERSHIP_TEXT_BYTES,
+        "{label} exceeds the Rust Workbench text limit"
+    );
+    Ok(())
+}
+
+fn validate_schema(
+    label: &str,
+    schema_version: u32,
+    maximum: u32,
+    unavailable: bool,
+) -> anyhow::Result<()> {
+    if unavailable && schema_version == 0 {
+        return Ok(());
+    }
+    ensure!(schema_version > 0, "{label} omitted its schema version");
+    ensure!(
+        schema_version <= maximum,
+        "{label} schema {schema_version} is newer than supported schema {maximum}"
+    );
+    Ok(())
+}
+
+fn validate_unique_ids<'a>(
+    label: &str,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        ensure!(!id.is_empty(), "{label} contains an empty id");
+        ensure!(seen.insert(id), "{label} contains duplicate id `{id}`");
+    }
+    Ok(())
+}
+
+fn validate_memory_graph(label: &str, graph: &OwnershipMemoryGraph) -> anyhow::Result<()> {
+    ensure!(
+        graph.nodes.len() <= MAX_OWNERSHIP_GRAPH_NODES,
+        "{label} contains too many memory nodes"
+    );
+    ensure!(
+        graph.edges.len() <= MAX_OWNERSHIP_GRAPH_EDGES,
+        "{label} contains too many memory edges"
+    );
+    ensure!(
+        graph.snapshots.len() <= MAX_OWNERSHIP_SNAPSHOTS,
+        "{label} contains too many memory snapshots"
+    );
+    ensure!(
+        graph.access_paths.len() <= MAX_OWNERSHIP_ACCESS_PATHS,
+        "{label} contains too many access paths"
+    );
+    validate_unique_ids(
+        &format!("{label} nodes"),
+        graph.nodes.iter().map(|node| node.id.as_str()),
+    )?;
+    validate_unique_ids(
+        &format!("{label} edges"),
+        graph.edges.iter().map(|edge| edge.id.as_str()),
+    )?;
+    validate_unique_ids(
+        &format!("{label} snapshots"),
+        graph.snapshots.iter().map(|snapshot| snapshot.id.as_str()),
+    )?;
+    validate_unique_ids(
+        &format!("{label} access paths"),
+        graph.access_paths.iter().map(|path| path.id.as_str()),
+    )?;
+    for node in &graph.nodes {
+        if let Some(range) = &node.range {
+            validate_range("ownership memory node", range)?;
+        }
+    }
+    for edge in &graph.edges {
+        if let Some(range) = &edge.range {
+            validate_range("ownership memory edge", range)?;
+        }
+    }
+    for snapshot in &graph.snapshots {
+        validate_range("ownership memory snapshot", &snapshot.range)?;
+        ensure!(
+            snapshot.deltas.len() <= MAX_OWNERSHIP_GRAPH_NODES,
+            "{label} snapshot contains too many state changes"
+        );
+    }
+    for path in &graph.access_paths {
+        ensure!(
+            path.steps.len() <= 32,
+            "{label} access path contains too many steps"
+        );
+    }
+    Ok(())
+}
+
+fn validate_ownership_problems(result: &OwnershipProblems) -> anyhow::Result<()> {
+    let unavailable = result.status == "rust_analyzer_unavailable";
+    ensure!(
+        matches!(
+            result.status.as_str(),
+            "ready" | "waiting_for_compiler" | "rust_analyzer_unavailable"
+        ),
+        "ownership problems returned unknown status `{}`",
+        result.status
+    );
+    validate_schema("ownership problems", result.schema_version, 7, unavailable)?;
+    ensure!(
+        result.problems.len() <= MAX_OWNERSHIP_PROBLEMS,
+        "ownership problems response exceeds {MAX_OWNERSHIP_PROBLEMS} items"
+    );
+    validate_unique_ids(
+        "ownership problems",
+        result.problems.iter().map(|problem| problem.id.as_str()),
+    )?;
+    for problem in &result.problems {
+        validate_range("ownership problem", &problem.primary_range)?;
+        validate_range("ownership problem binding", &problem.binding_range)?;
+        ensure!(
+            problem.related_ranges.len() <= 64,
+            "ownership problem has too many related ranges"
+        );
+        ensure!(
+            problem.related.len() <= 64,
+            "ownership problem has too many related messages"
+        );
+        for range in &problem.related_ranges {
+            validate_range("ownership problem related site", range)?;
+        }
+        for related in &problem.related {
+            validate_range("ownership problem related message", &related.range)?;
+            validate_text("ownership problem related message", &related.message)?;
+        }
+        validate_text("ownership problem message", &problem.message)?;
+    }
+    Ok(())
+}
+
+fn validate_workspace_guide(result: &OwnershipWorkspaceGuide) -> anyhow::Result<()> {
+    let unavailable = result.status == "rust_analyzer_unavailable";
+    ensure!(
+        matches!(
+            result.status.as_str(),
+            "ready" | "ready_empty" | "refreshed" | "rust_analyzer_unavailable"
+        ),
+        "workspace guide returned unknown status `{}`",
+        result.status
+    );
+    validate_schema("workspace guide", result.schema_version, 1, unavailable)?;
+    ensure!(
+        result.clusters.len() <= MAX_OWNERSHIP_WORKSPACE_CLUSTERS,
+        "workspace guide contains too many clusters"
+    );
+    ensure!(
+        result.journey.len() <= 64,
+        "workspace guide contains too many journey frames"
+    );
+    validate_unique_ids(
+        "workspace guide clusters",
+        result.clusters.iter().map(|cluster| cluster.id.as_str()),
+    )?;
+    validate_unique_ids(
+        "workspace guide journey",
+        result.journey.iter().map(|frame| frame.id.as_str()),
+    )?;
+    for cluster in &result.clusters {
+        ensure!(
+            cluster.impacts.len() <= 64,
+            "workspace cluster contains too many impacts"
+        );
+        ensure!(
+            cluster.related_constraints.len() <= 64,
+            "workspace cluster contains too many related constraints"
+        );
+        validate_range("workspace cluster root", &cluster.root.location.range)?;
+        for site in cluster.impacts.iter().chain(&cluster.related_constraints) {
+            validate_range("workspace guide site", &site.location.range)?;
+        }
+    }
+    for frame in &result.journey {
+        validate_range("workspace guide journey frame", &frame.location.range)?;
+    }
+    if let Some(question) = &result.intent_question {
+        ensure!(
+            question.choices.len() <= 16,
+            "workspace guide contains too many intent choices"
+        );
+    }
+    Ok(())
+}
+
+fn validate_ownership_model(result: &OwnershipModel) -> anyhow::Result<()> {
+    let unavailable = result.status == "rust_analyzer_unavailable";
+    ensure!(
+        matches!(
+            result.status.as_str(),
+            "ready" | "waiting_for_compiler" | "rust_analyzer_unavailable"
+        ),
+        "ownership model returned unknown status `{}`",
+        result.status
+    );
+    validate_schema("ownership model", result.schema_version, 14, unavailable)?;
+    ensure!(
+        result.compiler_schema_version <= 7,
+        "compiler ownership schema {} is newer than supported schema 7",
+        result.compiler_schema_version
+    );
+    ensure!(
+        result.events.len() <= MAX_OWNERSHIP_EVENTS,
+        "ownership model contains too many events"
+    );
+    ensure!(
+        result.value_trace.len() <= 64,
+        "ownership model contains too many value trace steps"
+    );
+    ensure!(
+        result.bodies.len() <= MAX_OWNERSHIP_BODIES,
+        "ownership model contains too many bodies"
+    );
+    ensure!(
+        result.bindings.len() <= MAX_OWNERSHIP_BINDINGS,
+        "ownership model contains too many bindings"
+    );
+    ensure!(
+        result.loans.len() <= MAX_OWNERSHIP_LOANS,
+        "ownership model contains too many loans"
+    );
+    ensure!(
+        result.operations.len() <= MAX_OWNERSHIP_OPERATIONS,
+        "ownership model contains too many operations"
+    );
+    ensure!(
+        result.repairs.len() <= MAX_OWNERSHIP_REPAIRS,
+        "ownership model contains too many repairs"
+    );
+    validate_unique_ids(
+        "ownership events",
+        result.events.iter().map(|event| event.event_id.as_str()),
+    )?;
+    validate_unique_ids(
+        "ownership repairs",
+        result.repairs.iter().map(|repair| repair.id.as_str()),
+    )?;
+    for event in &result.events {
+        validate_range("ownership event", &event.range)?;
+        validate_range("ownership event binding", &event.binding_range)?;
+    }
+    for step in &result.value_trace {
+        validate_range("ownership value trace", &step.range)?;
+    }
+    for body in &result.bodies {
+        validate_range("ownership body", &body.range)?;
+        ensure!(
+            body.blocks.len() <= 512,
+            "ownership body contains too many blocks"
+        );
+        for block in &body.blocks {
+            validate_range("ownership block", &block.range)?;
+            ensure!(
+                block.successors.len() <= 32,
+                "ownership block contains too many successors"
+            );
+        }
+    }
+    for binding in &result.bindings {
+        validate_range("ownership binding", &binding.range)?;
+        ensure!(
+            binding.memory_layers.len() <= 32,
+            "ownership binding contains too many storage layers"
+        );
+    }
+    for loan in &result.loans {
+        validate_range("ownership loan reservation", &loan.reserve.range)?;
+        if let Some(activation) = &loan.activation {
+            validate_range("ownership loan activation", &activation.range)?;
+        }
+        ensure!(
+            loan.live_points.len() <= 512,
+            "ownership loan contains too many live points"
+        );
+        ensure!(
+            loan.end_points.len() <= 512,
+            "ownership loan contains too many end points"
+        );
+    }
+    for operation in &result.operations {
+        validate_range("ownership operation", &operation.range)?;
+        ensure!(
+            operation.argument_flows.len() <= 32,
+            "ownership operation contains too many arguments"
+        );
+        ensure!(
+            operation.effects.len() <= 64,
+            "ownership operation contains too many effects"
+        );
+        ensure!(
+            operation.effect_facts.len() <= 64,
+            "ownership operation contains too many effect facts"
+        );
+        ensure!(
+            operation.alternatives.len() <= 32,
+            "ownership operation contains too many alternatives"
+        );
+    }
+    for repair in &result.repairs {
+        validate_text("ownership repair preview", &repair.diff)?;
+        ensure!(
+            repair.affected_files.len() <= 64,
+            "ownership repair touches too many files"
+        );
+        if let Some(graph) = &repair.preview_graph {
+            validate_memory_graph("ownership repair preview graph", graph)?;
+        }
+    }
+    validate_memory_graph("ownership memory graph", &result.memory_graph)?;
+    if let Some(graph) = &result.conflict_graph {
+        ensure!(
+            graph.nodes.len() <= 64,
+            "ownership conflict graph contains too many nodes"
+        );
+        ensure!(
+            graph.edges.len() <= 96,
+            "ownership conflict graph contains too many edges"
+        );
+        ensure!(
+            graph.snapshots.len() <= 64,
+            "ownership conflict graph contains too many snapshots"
+        );
+        validate_unique_ids(
+            "ownership conflict graph nodes",
+            graph.nodes.iter().map(|node| node.id.as_str()),
+        )?;
+        for node in &graph.nodes {
+            if let Some(range) = &node.range {
+                validate_range("ownership conflict node", range)?;
+            }
+        }
+        for snapshot in &graph.snapshots {
+            validate_range("ownership conflict snapshot", &snapshot.range)?;
+            ensure!(
+                snapshot.states.len() <= 64,
+                "ownership conflict snapshot contains too many states"
+            );
+        }
+    }
+    if let Some(context) = &result.source_context {
+        ensure!(
+            context.breadcrumbs.len() <= 64,
+            "ownership source context has too many breadcrumbs"
+        );
+        ensure!(
+            context.call_paths.len() <= 64,
+            "ownership source context has too many call paths"
+        );
+        ensure!(
+            context.related_types.len() <= 64,
+            "ownership source context has too many related types"
+        );
+        for path in &context.call_paths {
+            ensure!(
+                path.len() <= 32,
+                "ownership source context call path is too deep"
+            );
+        }
+    }
+    if let Some(sketch) = &result.c_sketch {
+        validate_text("ownership conceptual code sketch", &sketch.code)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnershipRepairEffects {
@@ -774,10 +1167,12 @@ pub fn ownership_model(
         }));
     };
     cx.background_spawn(async move {
-        request
+        let result = request
             .await
             .into_response()
-            .context("requesting compiler ownership model from rust-analyzer")
+            .context("requesting compiler ownership model from rust-analyzer")?;
+        validate_ownership_model(&result)?;
+        Ok(result)
     })
 }
 
@@ -807,10 +1202,12 @@ pub fn ownership_problems(
         }));
     };
     cx.background_spawn(async move {
-        request
+        let result = request
             .await
             .into_response()
-            .context("requesting ownership problems from rust-analyzer")
+            .context("requesting ownership problems from rust-analyzer")?;
+        validate_ownership_problems(&result)?;
+        Ok(result)
     })
 }
 
@@ -848,10 +1245,12 @@ pub fn ownership_workspace_guide(
         }));
     };
     cx.background_spawn(async move {
-        request
+        let result = request
             .await
             .into_response()
-            .context("requesting the workspace ownership guide from rust-analyzer")
+            .context("requesting the workspace ownership guide from rust-analyzer")?;
+        validate_workspace_guide(&result)?;
+        Ok(result)
     })
 }
 
@@ -935,10 +1334,17 @@ pub fn ownership_validate_repair(
         }));
     };
     cx.background_spawn(async move {
-        request
+        let result = request
             .await
             .into_response()
-            .context("starting compiler validation for an ownership repair")
+            .context("starting compiler validation for an ownership repair")?;
+        ensure!(
+            matches!(result.status.as_str(), "checking" | "stale" | "unavailable"),
+            "ownership repair validation returned unknown status `{}`",
+            result.status
+        );
+        validate_text("ownership repair validation message", &result.message)?;
+        Ok(result)
     })
 }
 
@@ -1130,4 +1536,113 @@ fn find_rust_analyzer_server(
                 }
             })
     })
+}
+
+#[cfg(test)]
+mod ownership_protocol_tests {
+    use super::*;
+
+    fn problem(id: String, range: lsp::Range) -> OwnershipProblem {
+        OwnershipProblem {
+            id,
+            category: "use_after_move".to_owned(),
+            diagnostic_code: Some("E0382".to_owned()),
+            message: "value used after move".to_owned(),
+            binding_name: "value".to_owned(),
+            primary_range: range,
+            binding_range: range,
+            related_ranges: Vec::new(),
+            related: Vec::new(),
+            model_position: range.start,
+            precision: "compiler_exact".to_owned(),
+        }
+    }
+
+    #[test]
+    fn unavailable_payloads_may_use_schema_zero() {
+        let problems = OwnershipProblems {
+            status: "rust_analyzer_unavailable".to_owned(),
+            ..Default::default()
+        };
+        let model = OwnershipModel {
+            status: "rust_analyzer_unavailable".to_owned(),
+            ..Default::default()
+        };
+        assert!(validate_ownership_problems(&problems).is_ok());
+        assert!(validate_ownership_model(&model).is_ok());
+    }
+
+    #[test]
+    fn protocol_rejects_newer_schemas_and_inverted_ranges() {
+        let model = OwnershipModel {
+            schema_version: 15,
+            status: "ready".to_owned(),
+            ..Default::default()
+        };
+        assert!(validate_ownership_model(&model).is_err());
+
+        let range = lsp::Range::new(lsp::Position::new(4, 8), lsp::Position::new(3, 1));
+        let problems = OwnershipProblems {
+            schema_version: 1,
+            status: "ready".to_owned(),
+            source_hash: "hash".to_owned(),
+            problems: vec![problem("problem".to_owned(), range)],
+        };
+        assert!(validate_ownership_problems(&problems).is_err());
+    }
+
+    #[test]
+    fn protocol_rejects_duplicate_ids_and_excessive_problem_counts() {
+        let range = lsp::Range::new(lsp::Position::new(1, 0), lsp::Position::new(1, 4));
+        let duplicate = OwnershipProblems {
+            schema_version: 1,
+            status: "ready".to_owned(),
+            source_hash: "hash".to_owned(),
+            problems: vec![
+                problem("same".to_owned(), range),
+                problem("same".to_owned(), range),
+            ],
+        };
+        assert!(validate_ownership_problems(&duplicate).is_err());
+
+        let excessive = OwnershipProblems {
+            schema_version: 1,
+            status: "ready".to_owned(),
+            source_hash: "hash".to_owned(),
+            problems: (0..=MAX_OWNERSHIP_PROBLEMS)
+                .map(|index| problem(format!("problem-{index}"), range))
+                .collect(),
+        };
+        assert!(validate_ownership_problems(&excessive).is_err());
+    }
+
+    #[test]
+    fn protocol_rejects_unknown_statuses_and_oversized_repair_text() {
+        let problems = OwnershipProblems {
+            schema_version: 1,
+            status: "mystery".to_owned(),
+            ..Default::default()
+        };
+        assert!(validate_ownership_problems(&problems).is_err());
+
+        let model = OwnershipModel {
+            schema_version: 14,
+            status: "ready".to_owned(),
+            repairs: vec![OwnershipRepair {
+                id: "repair".to_owned(),
+                title: "Repair".to_owned(),
+                strategy: "borrow".to_owned(),
+                semantics: "borrows the value".to_owned(),
+                diff: "x".repeat(MAX_OWNERSHIP_TEXT_BYTES + 1),
+                affected_files: Vec::new(),
+                preview_complete: true,
+                compiler_validated: false,
+                validation_state: "candidate".to_owned(),
+                effects: OwnershipRepairEffects::default(),
+                preview_graph: None,
+            }],
+            ..Default::default()
+        };
+        assert!(validate_ownership_model(&model).is_err());
+    }
 }

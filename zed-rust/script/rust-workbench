@@ -10,12 +10,39 @@ rustc_binary="$rust_source_dir/build/x86_64-unknown-linux-gnu/stage1/bin/rustc"
 rustdoc_binary="$rust_source_dir/build/x86_64-unknown-linux-gnu/stage1/bin/rustdoc"
 cargo_binary="$rust_source_dir/build/x86_64-unknown-linux-gnu/stage0/bin/cargo"
 profile="${RUST_WORKBENCH_PROFILE:-release}"
-if [[ "${1:-}" == "--debug" ]]; then
-  profile="debug"
-  shift
-fi
+instance_name=""
+new_instance=0
+print_instance_dir=0
+editor_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --debug)
+      profile="debug"
+      shift
+      ;;
+    --instance)
+      if [[ $# -lt 2 ]]; then
+        echo "usage: rust-workbench --instance NAME [PATH ...]" >&2
+        exit 2
+      fi
+      instance_name="$2"
+      shift 2
+      ;;
+    --new-instance)
+      new_instance=1
+      shift
+      ;;
+    --print-instance-dir)
+      print_instance_dir=1
+      shift
+      ;;
+    *)
+      editor_args+=("$1")
+      shift
+      ;;
+  esac
+done
 editor_binary="$zed_source_dir/target/$profile/rust-workbench"
-user_data_dir="$zed_source_dir/rust-workbench-data"
 local_sysroot="$zed_source_dir/.build-deps/sysroot"
 
 if [[ ! -x "$editor_binary" ]]; then
@@ -42,13 +69,78 @@ if [[ -z "$cargo_binary" || ! -x "$cargo_binary" ]]; then
   exit 1
 fi
 
+if ! command -v flock >/dev/null 2>&1; then
+  echo "Rust Workbench needs flock from util-linux for isolated editor instances." >&2
+  exit 1
+fi
+if [[ -n "$instance_name" \
+  && ( ! "$instance_name" =~ ^[A-Za-z0-9._-]+$ || "$instance_name" == "." || "$instance_name" == ".." ) ]]; then
+  echo "Rust Workbench instance names may contain letters, digits, dot, underscore, and dash, but cannot be '.' or '..'." >&2
+  exit 2
+fi
+
+data_home="${RUST_WORKBENCH_DATA_DIR:-$zed_source_dir/rust-workbench-data}"
+mkdir -p "$data_home/instances"
+if [[ $new_instance -eq 1 ]]; then
+  if [[ -n "$instance_name" ]]; then
+    echo "--instance and --new-instance cannot be used together." >&2
+    exit 2
+  fi
+  instance_name="session-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+fi
+
+acquire_instance() {
+  local candidate="$1"
+  local candidate_dir
+  if [[ "$candidate" == "default" ]]; then
+    candidate_dir="$data_home"
+  else
+    candidate_dir="$data_home/instances/$candidate"
+  fi
+  mkdir -p "$candidate_dir"
+  exec {instance_lock_fd}>"$candidate_dir/.instance.lock"
+  if ! flock -n "$instance_lock_fd"; then
+    exec {instance_lock_fd}>&-
+    return 1
+  fi
+  instance_name="$candidate"
+  user_data_dir="$candidate_dir"
+}
+
+if [[ -n "$instance_name" ]]; then
+  if ! acquire_instance "$instance_name"; then
+    echo "Rust Workbench instance '$instance_name' is already running." >&2
+    exit 1
+  fi
+else
+  for candidate in default instance-{2..16}; do
+    if acquire_instance "$candidate"; then
+      break
+    fi
+  done
+  if [[ -z "${user_data_dir:-}" ]]; then
+    echo "Rust Workbench already has 16 active instances; close one or use --new-instance." >&2
+    exit 1
+  fi
+fi
+
+if [[ "$instance_name" != "default" && ! -e "$user_data_dir/config/settings.json" ]]; then
+  mkdir -p "$user_data_dir/config"
+  for config_file in settings.json keymap.json; do
+    if [[ -f "$data_home/config/$config_file" ]]; then
+      cp "$data_home/config/$config_file" "$user_data_dir/config/$config_file"
+    fi
+  done
+fi
+
 export LD_LIBRARY_PATH="$local_sysroot/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export RUST_WORKBENCH_RUST_ANALYZER="$analyzer_binary"
 export RUST_WORKBENCH_RUSTC="$rustc_binary"
 export RUST_WORKBENCH_RUSTDOC="$rustdoc_binary"
 export RUST_WORKBENCH_CARGO="$cargo_binary"
 export RUST_WORKBENCH_RUST_SRC="$rust_source_dir/library"
-export RUST_WORKBENCH_ANALYSIS_TARGET="$zed_source_dir/rust-workbench-analysis-target"
+export RUST_WORKBENCH_INSTANCE_ID="$instance_name"
+export RUST_WORKBENCH_ANALYSIS_TARGET="$user_data_dir/analysis-target"
 export RUSTC="$rustc_binary"
 export RUSTDOC="$rustdoc_binary"
 export CARGO="$cargo_binary"
@@ -57,8 +149,15 @@ unset RUST_WORKBENCH_BUNDLE_ROOT RUSTUP_TOOLCHAIN || true
 export PATH="$(dirname "$cargo_binary"):$(dirname "$rustc_binary"):$(dirname "$analyzer_binary"):$PATH"
 export ZED_UPDATE_EXPLANATION="Rust Workbench is updated by rebuilding this source tree."
 export ZED_RELEASE_CHANNEL="dev"
+export ZED_GENERATE_MINIDUMPS=1
+unset ZED_MINIDUMP_ENDPOINT || true
 export XDG_CACHE_HOME="$user_data_dir/cache"
 
 mkdir -p "$XDG_CACHE_HOME"
 
-exec "$editor_binary" --user-data-dir "$user_data_dir" "$@"
+echo "Rust Workbench instance: $instance_name ($user_data_dir)"
+if [[ $print_instance_dir -eq 1 ]]; then
+  printf '%s\n' "$user_data_dir"
+  exit 0
+fi
+exec "$editor_binary" --user-data-dir "$user_data_dir" "${editor_args[@]}"

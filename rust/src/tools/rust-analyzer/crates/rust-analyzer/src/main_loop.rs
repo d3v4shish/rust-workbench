@@ -1334,12 +1334,11 @@ impl GlobalState {
                 file.file_id,
                 file.events,
             );
-            if let Some(model) = file.model {
-                if let Some(model) =
+            if let Some(model) = file.model
+                && let Some(model) =
                     self.diagnostics.set_ownership_tutorial_model(file.file_id, model)
-                {
-                    retired.tutorial_models.push(model);
-                }
+            {
+                retired.tutorial_models.push(model);
             }
             self.ownership_file_sequences.insert(file.file_id, batch.sequence);
             let document_is_open =
@@ -1397,7 +1396,7 @@ impl GlobalState {
                 if ownership_model_transport {
                     let pointer =
                         match serde_json::from_str::<OwnershipModelPointer>(&diagnostic.message) {
-                            Ok(pointer) if matches!(pointer.version, 2 | 3 | 4) => pointer,
+                            Ok(pointer) if matches!(pointer.version, 2..=4) => pointer,
                             Ok(pointer) => {
                                 tracing::warn!(
                                     version = pointer.version,
@@ -1829,7 +1828,7 @@ fn prepare_ownership_model_artifacts(
     let mut prepared = FxHashMap::<FileId, PreparedOwnershipFile>::default();
     for path in paths {
         let artifact = match read_ownership_model_artifact(&path) {
-            Ok(artifact) if matches!(artifact.schema_version, 2 | 3 | 4 | 5 | 6 | 7) => artifact,
+            Ok(artifact) if matches!(artifact.schema_version, 2..=7) => artifact,
             Ok(artifact) => {
                 tracing::warn!(
                     version = artifact.schema_version,

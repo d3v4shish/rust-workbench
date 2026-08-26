@@ -1555,7 +1555,7 @@ pub(crate) fn handle_ownership_model(
             .filter_map(ast::IdentPat::cast)
             .filter_map(|pattern| {
                 let name = pattern.name()?;
-                (name.text().to_string() == candidate_name).then(|| name.syntax().text_range())
+                (name.text() == candidate_name).then(|| name.syntax().text_range())
             })
             .min_by_key(|range| {
                 let start: u32 = range.start().into();

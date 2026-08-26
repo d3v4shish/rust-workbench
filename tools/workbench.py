@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import time
@@ -362,6 +363,7 @@ def build_analyzer() -> None:
 
 def portable_build_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    environment.pop("ZED_MINIDUMP_ENDPOINT", None)
     environment["RUST_WORKBENCH_PORTABLE"] = "1"
     environment["ZED_BUNDLE"] = "true"
     return environment
@@ -397,20 +399,54 @@ def test_quick_or_full(mode: str) -> None:
     )
 
 
+def linux_cpu_totals() -> tuple[int, int] | None:
+    try:
+        fields = Path("/proc/stat").read_text(encoding="ascii").splitlines()[0].split()
+        if fields[0] != "cpu" or len(fields) < 6:
+            return None
+        values = [int(value) for value in fields[1:]]
+    except (OSError, ValueError, IndexError):
+        return None
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return sum(values), idle
+
+
+def ensure_performance_host_idle() -> None:
+    before = linux_cpu_totals()
+    if before is None:
+        return
+    time.sleep(2)
+    after = linux_cpu_totals()
+    if after is None:
+        return
+    total_delta = after[0] - before[0]
+    idle_delta = after[1] - before[1]
+    idle_percent = idle_delta / max(total_delta, 1) * 100.0
+    print(f"Performance preflight: {idle_percent:.1f}% CPU idle", flush=True)
+    if idle_percent < 50.0:
+        raise SystemExit(
+            "performance qualification requires at least 50% idle CPU before it starts; "
+            "stop unrelated workloads and rerun without changing the baseline"
+        )
+
+
 def test_performance() -> None:
+    ensure_performance_host_idle()
     cargo = CARGO if CARGO.is_file() else Path(shutil.which("cargo") or "cargo")
-    run(
-        [
-            ZED / "script" / "benchmark-rust-ownership-check",
-            "--cargo",
-            cargo,
-            "--rustc",
-            RUSTC,
-            "--analyzer",
-            ANALYZER_BINARY,
-        ],
-        cwd=ZED,
-    )
+    for suite in range(1, 4):
+        print(f"Compiler transport performance suite {suite}/3", flush=True)
+        run(
+            [
+                ZED / "script" / "benchmark-rust-ownership-check",
+                "--cargo",
+                cargo,
+                "--rustc",
+                RUSTC,
+                "--analyzer",
+                ANALYZER_BINARY,
+            ],
+            cwd=ZED,
+        )
     run(
         [
             ZED / "script" / "benchmark-rust-learning-context",
@@ -427,10 +463,85 @@ def test_performance() -> None:
     )
 
 
-def run_editor(paths: list[str], *, debug: bool = False) -> None:
+def host_cargo() -> Path:
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise SystemExit("cargo is required to run Rust Workbench tests")
+    return Path(cargo)
+
+
+def test_resilience() -> None:
+    cargo = host_cargo()
+    run(
+        [
+            cargo,
+            "test",
+            "--manifest-path",
+            ZED / "Cargo.toml",
+            "-p",
+            "project",
+            "ownership_protocol_tests",
+            "--lib",
+        ],
+        cwd=ZED,
+    )
+    run(
+        [cargo, "test", "--manifest-path", ZED / "Cargo.toml", "-p", "rust_workbench", "--lib"],
+        cwd=ZED,
+    )
+
+
+def test_ui() -> None:
+    cargo = host_cargo()
+    run(
+        [
+            cargo,
+            "test",
+            "--manifest-path",
+            ZED / "Cargo.toml",
+            "-p",
+            "rust_workbench",
+            "compact_scene_and_issue_navigation_meet_ui_latency_budget",
+            "--lib",
+            "--",
+            "--nocapture",
+        ],
+        cwd=ZED,
+    )
+
+
+def test_multi_instance() -> None:
+    run([ZED / "script" / "test-rust-workbench-instances"], cwd=ZED)
+    cargo = host_cargo()
+    run(
+        [
+            cargo,
+            "test",
+            "--manifest-path",
+            ANALYZER / "Cargo.toml",
+            "-p",
+            "rust-analyzer",
+            "--lib",
+            "flycheck::tests::ownership_model_cache_is_stable_and_workspace_scoped",
+        ],
+        cwd=ANALYZER,
+    )
+
+
+def run_editor(
+    paths: list[str],
+    *,
+    debug: bool = False,
+    instance: str | None = None,
+    new_instance: bool = False,
+) -> None:
     arguments: list[object] = [ZED / "script" / "rust-workbench"]
     if debug:
         arguments.append("--debug")
+    if instance is not None:
+        arguments.extend(("--instance", instance))
+    if new_instance:
+        arguments.append("--new-instance")
     arguments.extend(paths or [str(STRESS_PROJECT)])
     run(arguments, cwd=ZED)
 
@@ -471,6 +582,115 @@ def disk_report() -> None:
     for pid, rss_kib, command, arguments in rows:
         print(f"{pid:>8} {human_size(rss_kib * 1024):>12} {command} {arguments[:100]}")
     print(f"combined RSS: {human_size(total * 1024)}")
+
+
+def diagnostic_data_root(override: Path | None) -> Path:
+    if override is not None:
+        return override.expanduser().resolve()
+    configured = os.environ.get("RUST_WORKBENCH_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (ZED / "rust-workbench-data").resolve()
+
+
+def diagnostic_files(data_root: Path, *, include_minidumps: bool) -> list[Path]:
+    if not data_root.is_dir():
+        raise SystemExit(f"Rust Workbench data directory does not exist: {data_root}")
+    result: list[Path] = []
+    for path in data_root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative_parts = {part.lower() for part in path.relative_to(data_root).parts}
+        is_log = path.suffix.lower() == ".log" or path.name.endswith(".log.old")
+        is_crash = bool(relative_parts & {"crashes", "logs"})
+        is_minidump = path.suffix.lower() in {".dmp", ".mdmp"}
+        if is_minidump and not include_minidumps:
+            continue
+        if is_log or is_crash:
+            result.append(path)
+    return sorted(result, key=lambda path: path.as_posix())[:200]
+
+
+def redact_diagnostic_text(value: str) -> str:
+    replacements = ((str(ROOT), "<workspace>"), (str(Path.home()), "<home>"))
+    for original, replacement in replacements:
+        if original and original != "/":
+            value = value.replace(original, replacement)
+    value = re.sub(
+        r"(?i)(authorization|api[_-]?key|token|secret)(\s*[:=]\s*)([^\s,;]+)",
+        r"\1\2<redacted>",
+        value,
+    )
+    return value
+
+
+def collect_diagnostics(
+    *, data_root: Path | None, include_minidumps: bool, output_path: Path | None
+) -> Path:
+    source = diagnostic_data_root(data_root)
+    files = diagnostic_files(source, include_minidumps=include_minidumps)
+    DIST.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    destination = (output_path or DIST / f"rust-workbench-diagnostics-{timestamp}.tar.gz").resolve()
+    maximum_file_bytes = 10 * 1024 * 1024
+    maximum_total_bytes = 100 * 1024 * 1024
+    copied_bytes = 0
+    with tempfile.TemporaryDirectory(prefix="rust-workbench-diagnostics-") as temp:
+        staging = Path(temp) / "rust-workbench-diagnostics"
+        staging.mkdir()
+        included: list[dict[str, object]] = []
+        for source_file in files:
+            size = source_file.stat().st_size
+            if size > maximum_file_bytes or copied_bytes + size > maximum_total_bytes:
+                continue
+            relative = source_file.relative_to(source)
+            target = staging / "profiles" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if source_file.suffix.lower() in {".log", ".txt", ".json"} or source_file.name.endswith(
+                ".log.old"
+            ):
+                content = source_file.read_text(encoding="utf-8", errors="replace")
+                target.write_text(redact_diagnostic_text(content), encoding="utf-8")
+            else:
+                shutil.copy2(source_file, target)
+            copied_bytes += size
+            included.append({"path": relative.as_posix(), "bytes": size})
+        manifest = {
+            "format_version": 1,
+            "created_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "source_commit": source_commit(),
+            "minidumps_included": include_minidumps,
+            "files": included,
+        }
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(destination, "w:gz") as archive:
+            archive.add(staging, arcname=staging.name, recursive=True)
+    print(f"diagnostics: {destination}")
+    print(f"included files: {len(included)} ({human_size(copied_bytes)})")
+    if not include_minidumps:
+        print("minidumps: excluded (pass --include-minidumps to opt in)")
+    return destination
+
+
+def prune_diagnostics(*, data_root: Path | None, max_age_days: int, dry_run: bool) -> None:
+    source = diagnostic_data_root(data_root)
+    cutoff = time.time() - max_age_days * 24 * 60 * 60
+    candidates = [
+        path
+        for path in diagnostic_files(source, include_minidumps=True)
+        if path.stat().st_mtime < cutoff
+    ]
+    for path in candidates:
+        relative = path.relative_to(source)
+        if dry_run:
+            print(f"would remove {relative}")
+        else:
+            path.unlink()
+            print(f"removed {relative}")
+    print(f"diagnostic files matched: {len(candidates)}")
 
 
 def safe_generated_path(relative: str) -> Path:
@@ -1107,6 +1327,8 @@ def package_linux(*, skip_build: bool, keep_staging: bool, verify: bool) -> Path
         native_versions = populate_bundle(app)
         validation = validate_bundle(app)
         create_manifest(app, native_versions, validation)
+        manifest = archive.with_suffix(archive.suffix + ".manifest.json")
+        shutil.copy2(app / "manifest.json", manifest)
         smoke_bundle(app, label="staging")
         archive_bundle(staging, archive, app_name)
         if verify:
@@ -1114,6 +1336,7 @@ def package_linux(*, skip_build: bool, keep_staging: bool, verify: bool) -> Path
         print(f"bundle: {archive}")
         print(f"archive size: {human_size(archive.stat().st_size)}")
         print(f"sha256: {sha256(archive)}")
+        print(f"manifest: {manifest}")
         if keep_staging:
             kept = DIST / "rust-workbench.app"
             if kept.exists():
@@ -1129,7 +1352,9 @@ def latest_archive() -> Path:
     configured = DIST / CONFIG["compatibility"]["archive"]
     if configured.is_file():
         return configured
-    candidates = sorted(DIST.glob("rust-workbench-linux-*.tar.zst"), key=lambda path: path.stat().st_mtime)
+    candidates = sorted(
+        DIST.glob("rust-workbench-*-linux-*.tar.zst"), key=lambda path: path.stat().st_mtime
+    )
     if not candidates:
         raise SystemExit("no packaged bundle found; run ./workbench package linux")
     return candidates[-1]
@@ -1145,14 +1370,24 @@ def parser() -> argparse.ArgumentParser:
     build_parser.add_argument("component", choices=("compiler", "analyzer", "editor", "all"))
     build_parser.add_argument("--portable", action="store_true", help="link the editor for bundle layout")
 
-    test_parser = subcommands.add_parser("test", help="run correctness, full, performance, or bundle gates")
-    test_parser.add_argument("suite", choices=("quick", "full", "performance", "bundle"))
+    test_parser = subcommands.add_parser(
+        "test", help="run correctness, resilience, UI, performance, or bundle gates"
+    )
+    test_parser.add_argument(
+        "suite",
+        choices=("quick", "full", "resilience", "ui", "multi-instance", "performance", "bundle"),
+    )
     test_parser.add_argument("--archive", type=Path)
     test_parser.add_argument("--container", action="store_true")
 
     run_parser = subcommands.add_parser("run", help="launch Rust Workbench")
     run_parser.add_argument("paths", nargs="*")
     run_parser.add_argument("--debug", action="store_true")
+    run_instance = run_parser.add_mutually_exclusive_group()
+    run_instance.add_argument("--instance", help="use a named isolated editor profile")
+    run_instance.add_argument(
+        "--new-instance", action="store_true", help="create a new isolated editor profile"
+    )
 
     package_parser = subcommands.add_parser("package", help="create a relocatable application archive")
     package_parser.add_argument("target", choices=("linux",))
@@ -1161,6 +1396,19 @@ def parser() -> argparse.ArgumentParser:
     package_parser.add_argument("--no-verify", action="store_true")
 
     subcommands.add_parser("disk", help="report build storage and live editor/analyzer RSS")
+
+    diagnostics_parser = subcommands.add_parser(
+        "diagnostics", help="collect or prune local logs and crash evidence"
+    )
+    diagnostics_commands = diagnostics_parser.add_subparsers(dest="diagnostics_command", required=True)
+    collect_parser = diagnostics_commands.add_parser("collect")
+    collect_parser.add_argument("--data-root", type=Path)
+    collect_parser.add_argument("--output", type=Path)
+    collect_parser.add_argument("--include-minidumps", action="store_true")
+    prune_parser = diagnostics_commands.add_parser("prune")
+    prune_parser.add_argument("--data-root", type=Path)
+    prune_parser.add_argument("--max-age-days", type=int, default=30)
+    prune_parser.add_argument("--dry-run", action="store_true")
 
     clean_parser = subcommands.add_parser("clean", help="remove only configured generated artifacts")
     selection = clean_parser.add_mutually_exclusive_group(required=True)
@@ -1181,12 +1429,23 @@ def main() -> int:
     elif arguments.command == "test":
         if arguments.suite in ("quick", "full"):
             test_quick_or_full(arguments.suite)
+        elif arguments.suite == "resilience":
+            test_resilience()
+        elif arguments.suite == "ui":
+            test_ui()
+        elif arguments.suite == "multi-instance":
+            test_multi_instance()
         elif arguments.suite == "performance":
             test_performance()
         else:
             verify_archive((arguments.archive or latest_archive()).resolve(), container=arguments.container)
     elif arguments.command == "run":
-        run_editor(arguments.paths, debug=arguments.debug)
+        run_editor(
+            arguments.paths,
+            debug=arguments.debug,
+            instance=arguments.instance,
+            new_instance=arguments.new_instance,
+        )
     elif arguments.command == "package":
         package_linux(
             skip_build=arguments.skip_build,
@@ -1195,6 +1454,21 @@ def main() -> int:
         )
     elif arguments.command == "disk":
         disk_report()
+    elif arguments.command == "diagnostics":
+        if arguments.diagnostics_command == "collect":
+            collect_diagnostics(
+                data_root=arguments.data_root,
+                include_minidumps=arguments.include_minidumps,
+                output_path=arguments.output,
+            )
+        else:
+            if arguments.max_age_days < 1:
+                raise SystemExit("--max-age-days must be at least 1")
+            prune_diagnostics(
+                data_root=arguments.data_root,
+                max_age_days=arguments.max_age_days,
+                dry_run=arguments.dry_run,
+            )
     elif arguments.command == "clean":
         mode = "all" if arguments.all else "debug-caches"
         clean(mode, dry_run=arguments.dry_run)
