@@ -7,7 +7,6 @@ use ownership_topology::{
     OwnershipTopologyScene, TopologyColumn, beginner_memory_role, beginner_memory_state,
     derive_beginner_memory_path, derive_ownership_topology_scene,
     derive_ownership_topology_scene_with_limits, topology_column, topology_column_title,
-    topology_edge_active_at_step, topology_state_at_step,
 };
 
 use std::{
@@ -314,7 +313,9 @@ pub struct RustWorkbenchPanel {
     problem_scan_task: Task<()>,
     problem_selection_task: Task<()>,
     workspace_guide_task: Task<()>,
+    repair_apply_task: Task<()>,
     font_scale_percent: u16,
+    display_preferences_key: Option<String>,
     display_preferences: RustOwnershipDisplayPreferences,
     show_display_controls: bool,
     show_inline_guide: bool,
@@ -415,6 +416,7 @@ pub struct OwnershipCoachBanner {
     workspace: WeakEntity<Workspace>,
     panel: Option<WeakEntity<RustWorkbenchPanel>>,
     panel_subscription: Option<Subscription>,
+    panel_connection_pending: bool,
     problem_count: usize,
 }
 
@@ -424,8 +426,25 @@ impl OwnershipCoachBanner {
             workspace,
             panel: None,
             panel_subscription: None,
+            panel_connection_pending: false,
             problem_count: 0,
         }
+    }
+
+    fn defer_panel_connection(&mut self, cx: &mut Context<Self>) {
+        if self.panel_connection_pending {
+            return;
+        }
+        self.panel_connection_pending = true;
+        let banner = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            banner
+                .update(cx, |banner, cx| {
+                    banner.panel_connection_pending = false;
+                    banner.connect_panel(cx);
+                })
+                .ok();
+        });
     }
 
     fn connect_panel(&mut self, cx: &mut Context<Self>) {
@@ -495,7 +514,9 @@ impl ToolbarItemView for OwnershipCoachBanner {
             self.problem_count = 0;
             return ToolbarItemLocation::Hidden;
         }
-        self.connect_panel(cx);
+        // Toolbar updates run inside Workspace/Pane update transactions. Reading Workspace here
+        // would lease the same entity twice and panic when, for example, diagnostics is opened.
+        self.defer_panel_connection(cx);
         if self.problem_count == 0 {
             ToolbarItemLocation::Hidden
         } else {
@@ -563,11 +584,11 @@ impl RustWorkbenchPanel {
         workspace.update_in(&mut cx, |workspace, window, cx| {
             let project = workspace.project().clone();
             let workspace_id = workspace.database_id();
-            let display_preferences = workspace_id
-                .and_then(|workspace_id| {
-                    let key = format!("{DISPLAY_PREFERENCES_KEY_PREFIX}:{workspace_id:?}");
-                    KeyValueStore::global(cx).read_kvp(&key).ok().flatten()
-                })
+            let display_preferences_key = workspace_id
+                .map(|workspace_id| format!("{DISPLAY_PREFERENCES_KEY_PREFIX}:{workspace_id:?}"));
+            let display_preferences = display_preferences_key
+                .as_deref()
+                .and_then(|key| KeyValueStore::global(cx).read_kvp(key).ok().flatten())
                 .and_then(|serialized| serde_json::from_str(&serialized).ok())
                 .unwrap_or_else(RustOwnershipDisplayPreferences::focus);
             let workspace_entity = cx.entity();
@@ -657,7 +678,9 @@ impl RustWorkbenchPanel {
                     problem_scan_task: Task::ready(()),
                     problem_selection_task: Task::ready(()),
                     workspace_guide_task: Task::ready(()),
+                    repair_apply_task: Task::ready(()),
                     font_scale_percent: DEFAULT_PANEL_FONT_SCALE_PERCENT,
+                    display_preferences_key,
                     display_preferences,
                     show_display_controls: false,
                     show_inline_guide: true,
@@ -700,6 +723,8 @@ impl RustWorkbenchPanel {
         self.pending_problem_key = None;
         self.last_workspace_guide_key = None;
         self.pending_workspace_guide_key = None;
+        self.active_buffer = None;
+        self.active_position = None;
         self.problems = OwnershipProblems::default();
         self.workspace_guide = OwnershipWorkspaceGuide::default();
         self.selected_problem_id = None;
@@ -714,6 +739,8 @@ impl RustWorkbenchPanel {
         self.selected_topology_element = None;
         self.preview_repair_id = None;
         self.show_repair_alternatives = false;
+        self.repair_apply_task = Task::ready(());
+        self.repair_verification = None;
         self.repair_validation_task = Task::ready(());
         self.validating_repair_id = None;
         if let Some(previous_editor) = self.active_editor.as_ref().and_then(WeakEntity::upgrade) {
@@ -764,6 +791,33 @@ impl RustWorkbenchPanel {
             })
         });
         self.apply_display_to_editor(cx);
+    }
+
+    fn clear_unavailable_source_state(&mut self, cx: &mut Context<Self>) {
+        self.clear_learning_annotations(cx);
+        self.clear_editor_cue(cx);
+        self.active_buffer = None;
+        self.active_position = None;
+        self.last_problem_key = None;
+        self.pending_problem_key = None;
+        self.last_model_key = None;
+        self.pending_model_key = None;
+        self.last_workspace_guide_key = None;
+        self.pending_workspace_guide_key = None;
+        self.problems = OwnershipProblems::default();
+        self.model = OwnershipModel::default();
+        self.workspace_guide = OwnershipWorkspaceGuide::default();
+        self.selected_problem_id = None;
+        self.selected_symptom_problem_id = None;
+        self.selected_intent_choice_id = None;
+        self.topology_scene = None;
+        self.full_topology_scene = None;
+        self.selected_topology_element = None;
+        self.preview_repair_id = None;
+        self.repair_apply_task = Task::ready(());
+        self.repair_verification = None;
+        self.repair_validation_task = Task::ready(());
+        self.validating_repair_id = None;
     }
 
     fn owns_active_uri(&self, uri: &lsp::Uri, cx: &App) -> bool {
@@ -1167,11 +1221,17 @@ impl RustWorkbenchPanel {
     }
 
     fn visual_step_range(&self, index: usize) -> Option<lsp::Range> {
-        self.model
-            .memory_graph
-            .snapshots
-            .get(index)
-            .map(|snapshot| snapshot.range)
+        self.topology_scene
+            .as_ref()
+            .and_then(|scene| scene.moments.get(index))
+            .map(|moment| moment.range)
+            .or_else(|| {
+                self.model
+                    .memory_graph
+                    .snapshots
+                    .get(index)
+                    .map(|snapshot| snapshot.range)
+            })
             .or_else(|| {
                 self.model
                     .conflict_graph
@@ -1211,7 +1271,10 @@ impl RustWorkbenchPanel {
     }
 
     fn select_relative_visual_step(&mut self, direction: isize, cx: &mut Context<Self>) {
-        let count = ownership_visual_step_count(self.selected_problem(), &self.model);
+        let count = self.topology_scene.as_ref().map_or_else(
+            || ownership_visual_step_count(self.selected_problem(), &self.model),
+            |scene| scene.moments.len(),
+        );
         if count == 0 {
             return;
         }
@@ -1243,56 +1306,17 @@ impl RustWorkbenchPanel {
     }
 
     fn update_topology_scene_step(&mut self, index: usize) {
-        let node_states = topology_state_at_step(&self.model, index);
-        let edge_states = self
-            .model
-            .memory_graph
-            .edges
-            .iter()
-            .map(|edge| {
-                (
-                    edge.id.as_str(),
-                    topology_edge_active_at_step(edge, &self.model, index),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let conflict_states = self
-            .model
-            .conflict_graph
-            .as_ref()
-            .and_then(|graph| {
-                graph
-                    .snapshots
-                    .get(index)
-                    .or_else(|| graph.snapshots.last())
-            })
-            .map(|snapshot| {
-                snapshot
-                    .states
-                    .iter()
-                    .map(|state| (format!("conflict:{}", state.node_id), state.state.clone()))
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
-        for scene in self
-            .topology_scene
-            .iter_mut()
-            .chain(self.full_topology_scene.iter_mut())
-        {
-            scene.selected_step = index.min(scene.moments.len().saturating_sub(1));
-            for node in &mut scene.nodes {
-                if let Some(state) = node_states
-                    .get(&node.id)
-                    .or_else(|| conflict_states.get(&node.id))
-                {
-                    node.state.clone_from(state);
-                }
-            }
-            for edge in &mut scene.edges {
-                if let Some(active) = edge_states.get(edge.id.as_str()) {
-                    edge.active = *active;
-                }
-            }
+        let problem = self.selected_problem().cloned();
+        self.topology_scene = derive_ownership_topology_scene(problem.as_ref(), &self.model, index);
+        if self.full_topology_scene.is_some() {
+            self.full_topology_scene = derive_ownership_topology_scene_with_limits(
+                problem.as_ref(),
+                &self.model,
+                index,
+                64,
+                96,
+                true,
+            );
         }
     }
 
@@ -1489,17 +1513,12 @@ impl RustWorkbenchPanel {
     }
 
     fn persist_display_preferences(&self, cx: &mut Context<Self>) {
-        let Some(workspace_id) = self
-            .workspace
-            .upgrade()
-            .and_then(|workspace| workspace.read(cx).database_id())
-        else {
+        let Some(key) = self.display_preferences_key.clone() else {
             return;
         };
         let Ok(serialized) = serde_json::to_string(&self.display_preferences) else {
             return;
         };
-        let key = format!("{DISPLAY_PREFERENCES_KEY_PREFIX}:{workspace_id:?}");
         let database = KeyValueStore::global(cx);
         db::write_and_log(cx, move || async move {
             database.write_kvp(key, serialized).await
@@ -1675,8 +1694,10 @@ impl RustWorkbenchPanel {
 
     fn scan_problems(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = self.active_editor.as_ref().and_then(WeakEntity::upgrade) else {
+            self.active_editor = None;
+            self.editor_subscription = None;
+            self.clear_unavailable_source_state(cx);
             self.problem_status = "Open a Rust source file to use the ownership coach.".into();
-            self.problems = OwnershipProblems::default();
             cx.notify();
             return;
         };
@@ -1687,8 +1708,8 @@ impl RustWorkbenchPanel {
                 snapshot.anchor_to_buffer_anchor(editor.selections.newest_anchor().head())?;
             multibuffer.buffer(anchor.buffer_id)
         }) else {
+            self.clear_unavailable_source_state(cx);
             self.problem_status = "Open a Rust source file to use the ownership coach.".into();
-            self.problems = OwnershipProblems::default();
             cx.notify();
             return;
         };
@@ -1762,8 +1783,13 @@ impl RustWorkbenchPanel {
                                             panel.operation_focus_requested,
                                         )
                                     });
-                                let selected_id =
-                                    selected.map(|index| panel.problems.problems[index].id.clone());
+                                let selected_id = selected.and_then(|index| {
+                                    panel
+                                        .problems
+                                        .problems
+                                        .get(index)
+                                        .map(|problem| problem.id.clone())
+                                });
                                 if selected_id != previous_id {
                                     panel.selection_epoch = panel.selection_epoch.wrapping_add(1);
                                     panel.model = OwnershipModel::default();
@@ -2130,8 +2156,9 @@ impl RustWorkbenchPanel {
             cx,
         );
         let project = self.project.clone();
+        let selection_epoch = self.selection_epoch;
         self.status_message = format!("Applying {title}…").into();
-        self.refresh_task = cx.spawn(async move |panel, cx| {
+        self.repair_apply_task = cx.spawn(async move |panel, cx| {
             let result = async {
                 let action = action
                     .await?
@@ -2147,6 +2174,9 @@ impl RustWorkbenchPanel {
 
             panel
                 .update(cx, |panel, cx| {
+                    if panel.selection_epoch != selection_epoch {
+                        return;
+                    }
                     match result {
                         Ok(()) => {
                             panel.status_message = "Repair applied. Use Undo to revert it.".into();
@@ -2218,7 +2248,7 @@ fn repair_verification_outcome(
                     "{} on `{}` at line {}",
                     problem.diagnostic_code.as_deref().unwrap_or("rustc"),
                     problem.binding_name,
-                    problem.primary_range.start.line + 1
+                    display_line_number(problem.primary_range.start.line)
                 )
             })
             .collect::<Vec<_>>();
@@ -2421,6 +2451,10 @@ fn ownership_source_hash(source: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn display_line_number(zero_based_line: u32) -> u32 {
+    zero_based_line.saturating_add(1)
 }
 
 fn repair_is_compiler_validated(repair: &rust_analyzer_ext::OwnershipRepair) -> bool {
@@ -2792,13 +2826,13 @@ impl Render for RustWorkbenchPanel {
                                     format!(
                                         "{} {code} · line {} · `{}`",
                                         if selected { "●" } else { "○" },
-                                        issue.primary_range.start.line + 1,
+                                        display_line_number(issue.primary_range.start.line),
                                         issue.binding_name
                                     ),
                                 )
                                 .aria_label(format!(
                                     "Focus {code} on line {} in the Rust editor",
-                                    issue.primary_range.start.line + 1
+                                    display_line_number(issue.primary_range.start.line)
                                 ))
                                 .on_click(cx.listener(
                                     move |panel, _, window, cx| {
@@ -2855,6 +2889,7 @@ impl Render for RustWorkbenchPanel {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct VisualMoment {
     phase: String,
@@ -2995,7 +3030,7 @@ fn workspace_site_caption(site: &OwnershipWorkspaceSite) -> String {
     format!(
         "{} · {path}:{}",
         site.label,
-        site.location.range.start.line + 1
+        display_line_number(site.location.range.start.line)
     )
 }
 
@@ -3409,61 +3444,56 @@ fn render_beginner_flow(
     show_workspace_roots: bool,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
-    if problem.is_none()
-        && let Some(operation) = model.operations.first()
-    {
-        return render_method_coach_flow(operation, cx);
-    }
+    let valid_code_operation = problem
+        .is_none()
+        .then(|| model.operations.first())
+        .flatten();
     let mut content = v_flex()
         .gap_2()
         .child(render_guide_stage_tabs(guide_stage, cx));
     content = match guide_stage {
-        GuideStage::Explain => {
-            content.child(render_beginner_story(problem, source_excerpt, model, cx))
+        GuideStage::Explain => content.child(if let Some(operation) = valid_code_operation {
+            render_method_coach_flow(operation, cx)
+        } else {
+            render_beginner_story(problem, source_excerpt, model, cx)
+        }),
+        GuideStage::Visualize => content.child(render_guided_visual_step(
+            problem,
+            model,
+            topology_scene,
+            selected_topology_element,
+            selected_step,
+            cx,
+        )),
+        GuideStage::Fix => {
+            if let Some(operation) = valid_code_operation {
+                content.child(render_method_coach_flow(operation, cx))
+            } else {
+                content
+                    .child(render_workspace_intent_question(
+                        problem,
+                        workspace_guide,
+                        selected_intent_choice_id,
+                        cx,
+                    ))
+                    .child(render_guided_fix_step(
+                        problem,
+                        problems,
+                        model,
+                        verification,
+                        preview_repair_id,
+                        show_repair_alternatives,
+                        selected_intent_choice_id,
+                        exact_mode,
+                        cx,
+                    ))
+                    .child(render_workspace_impact_tree(
+                        workspace_guide,
+                        show_workspace_roots,
+                        cx,
+                    ))
+            }
         }
-        GuideStage::Visualize => {
-            let moments = visual_moments(problem, model);
-            let selected_step = selected_step.min(moments.len().saturating_sub(1));
-            let selected_moment = moments.get(selected_step).cloned();
-            content
-                .child(render_visual_timeline(
-                    &moments,
-                    selected_step,
-                    selected_moment,
-                    cx,
-                ))
-                .child(render_guided_visual_step(
-                    problem,
-                    model,
-                    topology_scene,
-                    selected_topology_element,
-                    selected_step,
-                    cx,
-                ))
-        }
-        GuideStage::Fix => content
-            .child(render_workspace_intent_question(
-                problem,
-                workspace_guide,
-                selected_intent_choice_id,
-                cx,
-            ))
-            .child(render_guided_fix_step(
-                problem,
-                problems,
-                model,
-                verification,
-                preview_repair_id,
-                show_repair_alternatives,
-                selected_intent_choice_id,
-                exact_mode,
-                cx,
-            ))
-            .child(render_workspace_impact_tree(
-                workspace_guide,
-                show_workspace_roots,
-                cx,
-            )),
     };
     content.into_any_element()
 }
@@ -3486,6 +3516,9 @@ fn render_guide_stage_tabs(
                 .aria_label(format!("Show the {} guide stage", stage.label()))
                 .on_click(cx.listener(move |panel, _, _window, cx| {
                     panel.guide_stage = stage;
+                    if stage == GuideStage::Visualize {
+                        panel.rebuild_topology_scene();
+                    }
                     cx.notify();
                 })),
             )
@@ -3559,7 +3592,7 @@ fn render_beginner_story(
                         .child(
                             Label::new(format!(
                                 "{diagnostic_code} · line {} · {source_quality}",
-                                range.start.line + 1
+                                display_line_number(range.start.line)
                             ))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
@@ -3835,7 +3868,7 @@ fn issue_source_excerpt_from_snapshot(
     problem: &OwnershipProblem,
 ) -> IssueSourceExcerpt {
     let max_point = snapshot.max_point();
-    let line_count = max_point.row as usize + usize::from(max_point.column > 0);
+    let line_count = (max_point.row as usize).saturating_add(usize::from(max_point.column > 0));
     issue_source_excerpt_with_lines(
         line_count,
         |row| {
@@ -3883,14 +3916,14 @@ fn issue_source_excerpt_with_lines(
     for row in important.keys().copied() {
         rows.insert(row.saturating_sub(1));
         rows.insert(row);
-        if (row as usize) + 1 < line_count {
-            rows.insert(row + 1);
+        if (row as usize).saturating_add(1) < line_count {
+            rows.insert(row.saturating_add(1));
         }
     }
     let mut result = Vec::new();
-    let mut previous = None;
+    let mut previous: Option<u32> = None;
     for row in rows.into_iter().filter(|row| (*row as usize) < line_count) {
-        if previous.is_some_and(|previous| row > previous + 1) {
+        if previous.is_some_and(|previous| row > previous.saturating_add(1)) {
             result.push(IssueSourceLine {
                 line: None,
                 text: "...".to_owned(),
@@ -3904,7 +3937,7 @@ fn issue_source_excerpt_with_lines(
             .map(|(semantic, range)| (semantic, Some(range)))
             .unwrap_or((LearningSemantic::Neutral, None));
         result.push(IssueSourceLine {
-            line: Some(row + 1),
+            line: Some(display_line_number(row)),
             text: source_line(row),
             semantic,
             focus_range,
@@ -4061,7 +4094,7 @@ fn render_method_coach_flow(
                         .child(
                             Button::new(
                                 "show-method-coach-source",
-                                format!("line {}", range.start.line + 1),
+                                format!("line {}", display_line_number(range.start.line)),
                             )
                             .on_click(
                                 cx.listener(move |panel, _, _window, cx| {
@@ -4092,7 +4125,7 @@ fn render_method_coach_flow(
                     render_call_flow_row(
                         &format!(
                             "ARGUMENT {} → {}",
-                            argument.index + 1,
+                            argument.index.saturating_add(1),
                             argument.parameter_type
                         ),
                         &argument.expression,
@@ -4231,16 +4264,23 @@ fn render_guided_visual_step(
     selected_step: usize,
     cx: &mut Context<RustWorkbenchPanel>,
 ) -> AnyElement {
-    if topology_scene.is_some() {
-        return render_visual_memory_map(
-            topology_scene,
-            selected_topology_element,
-            model,
-            selected_step,
-            cx,
-        );
+    if let Some(scene) =
+        topology_scene_for_visualization(problem, model, topology_scene, selected_step)
+    {
+        return render_topology_scene(scene, selected_topology_element, cx);
     }
-    render_value_journey(problem, model, selected_step, cx)
+    empty_card("Select a Rust value, operation, or compiler issue to build its ownership diagram.")
+}
+
+fn topology_scene_for_visualization(
+    problem: Option<&OwnershipProblem>,
+    model: &OwnershipModel,
+    cached_scene: Option<&OwnershipTopologyScene>,
+    selected_step: usize,
+) -> Option<OwnershipTopologyScene> {
+    cached_scene
+        .cloned()
+        .or_else(|| derive_ownership_topology_scene(problem, model, selected_step))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4281,6 +4321,7 @@ fn render_guided_fix_step(
         .into_any_element()
 }
 
+#[allow(dead_code)]
 fn render_value_journey(
     problem: Option<&OwnershipProblem>,
     model: &OwnershipModel,
@@ -4390,6 +4431,7 @@ fn render_value_journey(
         .into_any_element()
 }
 
+#[allow(dead_code)]
 fn render_guided_mutation_requirement(
     problem: Option<&OwnershipProblem>,
     model: &OwnershipModel,
@@ -4571,6 +4613,7 @@ fn selected_mutation_operation(
         })
 }
 
+#[allow(dead_code)]
 fn render_guided_conflict_graph(
     graph: &rust_analyzer_ext::OwnershipConflictGraph,
     selected_step: usize,
@@ -4687,6 +4730,7 @@ fn render_guided_conflict_graph(
         .into_any_element()
 }
 
+#[allow(dead_code)]
 fn trace_arrow_label(kind: &str) -> &'static str {
     match kind {
         "move" | "partial_move" => "ownership moves",
@@ -4889,6 +4933,7 @@ fn guided_issue_facts(problem: &OwnershipProblem, model: &OwnershipModel) -> Gui
     }
 }
 
+#[allow(dead_code)]
 fn render_visual_timeline(
     moments: &[VisualMoment],
     selected_step: usize,
@@ -4955,7 +5000,7 @@ fn render_visual_timeline(
                     .child(
                         Label::new(format!(
                             "Line {} · {}",
-                            moment.range.start.line + 1,
+                            display_line_number(moment.range.start.line),
                             visual_state_plain_label(&moment.state)
                         ))
                         .size(LabelSize::XSmall)
@@ -4966,6 +5011,7 @@ fn render_visual_timeline(
         .into_any_element()
 }
 
+#[allow(dead_code)]
 fn visual_state_plain_label(state: &str) -> &'static str {
     if state.contains("reject") || state.contains("invalid") || state.contains("blocked") {
         "Operation blocked"
@@ -4984,6 +5030,7 @@ fn visual_state_plain_label(state: &str) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn visual_phase_label(phase: &str, index: usize) -> String {
     let label = match phase {
         "borrow_created" | "contract" => "Before",
@@ -5043,6 +5090,7 @@ fn visual_state_color(state: &str, cx: &App) -> gpui::Hsla {
     }
 }
 
+#[allow(dead_code)]
 fn render_visual_memory_map(
     topology_scene: Option<&OwnershipTopologyScene>,
     selected_topology_element: Option<&str>,
@@ -5178,6 +5226,7 @@ fn render_visual_memory_map(
         .into_any_element()
 }
 
+#[allow(dead_code)]
 fn render_beginner_memory_path(
     scene: &OwnershipTopologyScene,
     selected_topology_element: Option<&str>,
@@ -5331,6 +5380,7 @@ fn render_beginner_memory_path(
         .into_any_element()
 }
 
+#[allow(dead_code)]
 fn render_learning_color_legend(cx: &App) -> AnyElement {
     h_flex()
         .gap_2()
@@ -5409,6 +5459,7 @@ fn memory_layer_relation(source_kind: &str, target_kind: &str) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn render_structured_memory_chain(binding: &OwnershipBinding, cx: &App) -> AnyElement {
     let mut previous_kind = "stack_binding";
     let mut rows = vec![
@@ -5456,6 +5507,7 @@ fn render_structured_memory_chain(binding: &OwnershipBinding, cx: &App) -> AnyEl
         .into_any_element()
 }
 
+#[allow(dead_code)]
 fn render_visual_memory_node(
     node: rust_analyzer_ext::OwnershipConflictNode,
     state: Option<&rust_analyzer_ext::OwnershipConflictNodeState>,
@@ -5615,7 +5667,7 @@ fn render_visual_operation_summary(
                         .child(
                             Button::new(
                                 SharedString::from(format!("visual-operation-{}", operation.id)),
-                                format!("line {}", range.start.line + 1),
+                                format!("line {}", display_line_number(range.start.line)),
                             )
                             .on_click(cx.listener(
                                 move |panel, _, _window, cx| {
@@ -6099,7 +6151,10 @@ fn render_operation_insights(
                         .child(
                             Button::new(
                                 SharedString::from(format!("show-operation-{}", operation.id)),
-                                format!("line {}", operation.range.start.line + 1),
+                                format!(
+                                    "line {}",
+                                    display_line_number(operation.range.start.line)
+                                ),
                             )
                             .on_click(cx.listener(move |panel, _, _window, cx| {
                                 panel.cue_range(range, cx);
@@ -7103,7 +7158,7 @@ fn render_coach_flow(
         )
         .children(model.events.clone().into_iter().take(event_limit).map(|event| {
             let range = event.range;
-            let line = event.range.start.line + 1;
+            let line = display_line_number(event.range.start.line);
             v_flex()
                 .p_3()
                 .gap_1()
@@ -7584,7 +7639,7 @@ fn render_coach_result(
                     "The selected issue is still present",
                     format!(
                         "Cargo still reports {target} near line {} after `{}`. Undo or compare another validated rewrite.",
-                        current_line + 1,
+                        display_line_number(*current_line),
                         verification.repair_title
                     ),
                     Color::Error,
@@ -8582,6 +8637,12 @@ mod tests {
         assert_eq!(ownership_source_hash("hello"), "a430d84680aabd0b");
     }
 
+    #[test]
+    fn external_line_numbers_saturate_for_display() {
+        assert_eq!(display_line_number(0), 1);
+        assert_eq!(display_line_number(u32::MAX), u32::MAX);
+    }
+
     #[gpui::test]
     fn lsp_ranges_are_validated_and_clipped_on_one_buffer_snapshot(cx: &mut App) {
         let buffer = cx.new(|cx| Buffer::local("a😀b\nshort\n", cx));
@@ -9294,7 +9355,7 @@ mod tests {
 
         for index in 0..10_000 {
             let started = std::time::Instant::now();
-            let states = topology_state_at_step(&model, index % 4);
+            let states = ownership_topology::topology_state_at_step(&model, index % 4);
             std::hint::black_box(states);
             scrubber_ns.push(started.elapsed().as_nanos());
         }
@@ -9885,6 +9946,20 @@ mod tests {
         assert_eq!(moments[1].phase, "operation_rejected");
         assert_eq!(moments[2].phase, "repair");
         assert_eq!(moments[1].range, problem.primary_range);
+    }
+
+    #[test]
+    fn visualize_derives_a_diagram_when_the_cached_scene_was_cleared() {
+        let mut problem = test_problem("self-featured-push", "self", 53, 54);
+        problem.category = "mutable_while_shared".to_owned();
+        problem.diagnostic_code = Some("E0502".to_owned());
+
+        let scene =
+            topology_scene_for_visualization(Some(&problem), &OwnershipModel::default(), None, 0)
+                .expect("a selected compiler issue must always produce a visual scene");
+
+        assert!(!scene.nodes.is_empty());
+        assert!(scene.nodes.iter().any(|node| node.label == "self"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Correct controls. The coach must not report these as ownership errors.
 
 pub mod arc_mutex;
+pub mod diagram_shapes;
 pub mod nll;
 pub mod partial_reinitialize;
 pub mod rc;

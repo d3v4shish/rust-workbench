@@ -24,18 +24,18 @@ borrow conflicts in one stateful component. Then use the following audit map:
 | `messaging.rs` | 5 | E0596 ×2, E0502 ×2, E0382: receiver mutation, queue invalidation, and a repeated move |
 | `reports.rs` | 5 | E0382 ×3, E0502, E0506: partial/repeated moves and mutations while viewed |
 
-`unsupported_cases` now supplies five non-ownership learning diagnostics: type mismatch, two
-invalid returned references, a thread-safety trait requirement, and method resolution. The name is
-retained so existing test scripts keep working, but these cases are now intentionally supported by
-the broader Learning Debugger.
+`unsupported_cases` now supplies eight broader learning diagnostics: type mismatch, two invalid
+returned references, a thread-safety trait requirement, method resolution, await outside async,
+recursive async, and a closure that may outlive its borrow. The name is retained so existing test
+scripts keep working, but these cases are intentionally supported by the broader Learning Debugger.
 
 ## How to test
 
 1. If prompted, click **Trust this worktree**, then wait for Cargo check to finish.
 2. Open `crates/commerce_app/src/catalog.rs` and put the cursor on a red-underlined expression.
 3. The red **Explainable Rust issue detected** banner should appear for the supported errors above.
-4. Press `Ctrl+Alt+O` or click **Explain visually**. The one vertical **Rust Ownership Coach** flow
-   opens; there are no mode tabs to switch.
+4. Press `Ctrl+Alt+O` or click **Explain visually**. Select **Visualize** to open the focused,
+   stepped ownership diagram.
 5. Confirm the panel says **Issue 1 of 5** and names both the Rust error code and binding.
 6. Click **Next** and **Previous**; the selected issue and source highlight should move in source order.
 7. Click `current` in `analytics.rs`; the panel should automatically select its E0506 issue. Click
@@ -45,13 +45,19 @@ the broader Learning Debugger.
    `*current`, and `self` remain alive; only replacement/write access is temporarily blocked.
 9. Verify the three large states say **Actual** for Before and Conflict. A selected-but-unapplied
    repair must say **Hypothetical**; only a fresh compiler check may produce **Verified result**.
-10. Click value-journey cards and verify Zed highlights their exact lines.
+10. Change diagram phases and click nodes; verify the diagram state changes without shifting its
+    layout and Zed highlights the corresponding source lines.
 11. Switch among the application modules and verify the panel follows the selected diagnostic.
 12. Use the isolated repair packages in the second matrix when testing validated, applicable diffs.
 13. In Fixes, inspect semantics and the diff before applying. Apply only in this disposable lab.
 14. Press Undo after each application, or restore a file by reopening this generated workspace.
 
 ## Ownership Coach controls
+
+- **Visualize** shows one focused box-and-arrow canvas. Solid facts come from the compiler or
+  resolved source types; dashed yellow effects are explicitly possible or conceptual. Diagnostic
+  phases move through Before, Conflict, and After while valid async and closure examples use their
+  natural execution phases.
 
 - **Where the value went** follows the selected compiler diagnostic through binding, transfer,
   borrow, rejected use, reinitialization, and drop. Each card separates source state, destination
@@ -93,7 +99,7 @@ the broader Learning Debugger.
 | `crates/repair_rc_refcell/src/main.rs` | E0596 | immutable mutation | Rc+RefCell and thread-safe candidates |
 | `crates/mutation_cases/src/shared_reference.rs` | E0596 | immutable mutation | shows immutable reference boundary |
 | `crates/mutation_cases/src/rc_without_cell.rs` | E0596 | immutable mutation | demonstrates why Rc alone is not mutable |
-| `crates/unsupported_cases/src/lib.rs` | E0277/E0308/E0515/E0599 | trait/type/lifetime/method lessons | prewritten intent choices; standard editor actions remain available |
+| `crates/unsupported_cases/src/lib.rs` | E0277/E0308/E0373/E0515/E0599/E0728/E0733 | trait/type/lifetime/method/closure/async lessons | prewritten intent choices; standard editor actions remain available |
 
 ## Correct-code controls
 
@@ -108,6 +114,8 @@ does not invent errors. Put the cursor on a value, open the panel with `Ctrl+Alt
 - `rc_refcell.rs`: single-thread shared mutable ownership.
 - `arc_mutex.rs`: cross-thread shared synchronized mutation.
 - `rwlock.rs`: multiple readers or one writer across threads.
+- `diagram_shapes.rs`: nested wrappers, `Cow`, closures, `&dyn Trait`, `Box<dyn Trait>`, pinned
+  futures, and a compiler-valid Vec reallocation repair.
 
 The hard test is not whether every file gets a suggestion. Correct behavior includes showing a
 precise explanation with no repair, and showing no coach banner for unsupported diagnostic codes.

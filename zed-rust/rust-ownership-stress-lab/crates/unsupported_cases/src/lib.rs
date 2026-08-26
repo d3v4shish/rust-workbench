@@ -25,3 +25,18 @@ pub fn method_not_available() {
     let count = 3_u32;
     count.push(4);
 }
+
+pub fn await_outside_async_context() {
+    std::future::ready(String::from("done")).await;
+}
+
+pub async fn recursive_async_state(depth: usize) {
+    if depth > 0 {
+        recursive_async_state(depth - 1).await;
+    }
+}
+
+pub fn closure_may_outlive_borrow() {
+    let message = String::from("captured by reference");
+    std::thread::spawn(|| println!("{message}"));
+}

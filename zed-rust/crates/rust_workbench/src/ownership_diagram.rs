@@ -7,6 +7,11 @@ use super::*;
 fn topology_node_color(state: &str) -> Color {
     if state.contains("blocked") || state.contains("reject") || state.contains("invalid") {
         Color::Error
+    } else if state.contains("possible")
+        || state.contains("hypothetical")
+        || state.contains("requested")
+    {
+        Color::Warning
     } else if state.contains("borrow") || state.contains("read-only") {
         Color::Info
     } else if state.contains("move") || state.contains("drop") {
@@ -23,10 +28,37 @@ fn node_role(node: &TopologyNode) -> &'static str {
         "HANDLE"
     } else if node.kind == "wrapper" {
         "WRAPPER"
+    } else if node.kind == "operation" {
+        "OPERATION"
+    } else if node.kind == "reference_binding" {
+        "REFERENCE"
+    } else if node.kind == "future_state" {
+        "FUTURE STATE"
+    } else if node.kind == "suspension_point" {
+        "AWAIT POINT"
+    } else if node.kind == "closure_environment" {
+        "CLOSURE"
+    } else if node.kind == "metadata" {
+        "METADATA"
+    } else if node.kind == "element" {
+        "ELEMENT"
     } else if node.storage == "heap" {
         "HEAP"
     } else {
         topology_column_title(node.column)
+    }
+}
+
+fn provenance_symbol(provenance: &str) -> &'static str {
+    if provenance.contains("conceptual") {
+        "?"
+    } else if matches!(
+        provenance,
+        "compiler_exact" | "compiler_diagnostic" | "resolved_self_parameter"
+    ) {
+        "✓"
+    } else {
+        "≈"
     }
 }
 
@@ -71,16 +103,21 @@ fn render_topology_node(
             Color::Info => cx.theme().status().info,
             _ => cx.theme().status().success,
         })
-        .bg(match node.storage.as_str() {
-            "heap" => cx.theme().status().success_background.opacity(0.08),
-            "inline" => cx.theme().status().info_background.opacity(0.06),
-            _ => cx.theme().colors().panel_background,
+        .bg(if node.provenance.contains("conceptual") {
+            cx.theme().status().warning_background.opacity(0.12)
+        } else {
+            match node.storage.as_str() {
+                "heap" => cx.theme().status().success_background.opacity(0.08),
+                "inline" => cx.theme().status().info_background.opacity(0.06),
+                _ => cx.theme().colors().panel_background,
+            }
         })
         .child(
             Button::new(
                 SharedString::from(format!("topology-node-{}", node.id)),
                 format!(
-                    "{} · {} `{}`",
+                    "{} {} · {} `{}`",
+                    provenance_symbol(&node.provenance),
                     node_role(&node),
                     visual_state_symbol(&node.state),
                     node.label
@@ -122,6 +159,7 @@ fn render_topology_edge_canvas(edges: Vec<TopologyEdge>) -> AnyElement {
                     continue;
                 }
                 let mut builder = if !edge.active
+                    || edge.provenance.contains("conceptual")
                     || edge.label.contains("weak")
                     || edge.label.contains("conditional")
                 {
@@ -140,8 +178,12 @@ fn render_topology_edge_canvas(edges: Vec<TopologyEdge>) -> AnyElement {
                         builder.line_to(point);
                     }
                 }
-                let (end_x, end_y) = edge.route[edge.route.len() - 1];
-                let (before_x, before_y) = edge.route[edge.route.len() - 2];
+                let mut route_from_end = edge.route.iter().rev().copied();
+                let (Some((end_x, end_y)), Some((before_x, before_y))) =
+                    (route_from_end.next(), route_from_end.next())
+                else {
+                    continue;
+                };
                 let end = point(
                     bounds.origin.x + px(f32::from(end_x)),
                     bounds.origin.y + px(f32::from(end_y)),
@@ -170,6 +212,11 @@ fn render_topology_edge_canvas(edges: Vec<TopologyEdge>) -> AnyElement {
                             cx.theme().status().warning
                         } else if edge.label.contains("borrow") {
                             cx.theme().status().info
+                        } else if edge.label.contains("realloc")
+                            || edge.label.contains("invalidate")
+                            || edge.label.contains("suspend")
+                        {
+                            cx.theme().status().warning
                         } else if edge.label.contains("owns")
                             || edge.label.contains("shares")
                             || edge.label == "stores"
@@ -193,6 +240,19 @@ fn render_topology_edge_canvas(edges: Vec<TopologyEdge>) -> AnyElement {
     .absolute()
     .inset_0()
     .into_any_element()
+}
+
+fn diagram_phase_label(moment: &super::ownership_topology::TopologyMoment) -> String {
+    match moment.path_marker.as_deref() {
+        Some("borrow_created" | "borrow_reserved" | "before") => "Before".to_owned(),
+        Some("operation_rejected" | "conflict") => "Conflict".to_owned(),
+        Some("borrow_ended" | "after" | "result") => "After".to_owned(),
+        Some("operation") => "Operation".to_owned(),
+        Some("shape") => "Current shape".to_owned(),
+        _ if moment.title.to_ascii_lowercase().contains("suspend") => "Suspended".to_owned(),
+        _ if moment.title.to_ascii_lowercase().contains("resume") => "Resumed".to_owned(),
+        _ => moment.title.clone(),
+    }
 }
 
 fn render_edge_label(edge: TopologyEdge, cx: &App) -> AnyElement {
@@ -234,24 +294,84 @@ pub(super) fn render_topology_scene(
         .border_1()
         .border_color(cx.theme().colors().border_variant)
         .child(
-            h_flex()
-                .justify_between()
+            v_flex()
+                .gap_0p5()
                 .child(
-                    Label::new(if scene.expanded {
-                        "Full value map"
-                    } else {
-                        "Where the value lives"
-                    })
+                    Label::new(scene.title.clone())
                     .size(LabelSize::Small),
                 )
                 .child(
-                    Label::new("● usable  ◇ borrowed  → moved  ! blocked")
+                    Label::new("✓ compiler  ≈ derived  ? possible")
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 ),
         )
         .child(
-            Label::new("VARIABLE  ↓  INLINE HANDLE / WRAPPER  ↓  HEAP OR BORROWED TARGET")
+            Label::new(scene.summary.clone())
+                .size(LabelSize::Small),
+        )
+        .when(!scene.moments.is_empty(), |this| {
+            this.child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(scene.moments.iter().enumerate().map(|(index, moment)| {
+                        let label = diagram_phase_label(moment);
+                        Button::new(
+                            SharedString::from(format!("topology-step-{index}")),
+                            if index == scene.selected_step {
+                                format!("● {label}")
+                            } else {
+                                label
+                            },
+                        )
+                        .toggle_state(index == scene.selected_step)
+                        .aria_label(format!(
+                            "Show diagram phase {} of {}: {}",
+                            index + 1,
+                            scene.moments.len(),
+                            moment.title
+                        ))
+                        .tooltip(ui::Tooltip::text(moment.explanation.clone()))
+                        .on_click(cx.listener(move |panel, _, _window, cx| {
+                            panel.select_visual_step(index, cx)
+                        }))
+                    })),
+            )
+        })
+        .when_some(selected_moment, |this, moment| {
+            this.child(
+                v_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .border_l_2()
+                    .border_color(if moment
+                        .path_marker
+                        .as_deref()
+                        .is_some_and(|phase| phase.contains("reject") || phase == "conflict")
+                    {
+                        cx.theme().status().error
+                    } else {
+                        cx.theme().status().info
+                    })
+                    .child(
+                        Label::new(format!(
+                            "{} · line {}",
+                            diagram_phase_label(&moment),
+                            display_line_number(moment.range.start.line)
+                        ))
+                        .size(LabelSize::XSmall),
+                    )
+                    .child(
+                        Label::new(moment.explanation)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+        })
+        .child(
+            Label::new("LOCAL / REFERENCE  ↓  INLINE OWNER OR WRAPPER  ↓  HEAP / RUNTIME TARGET")
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         )
@@ -278,14 +398,14 @@ pub(super) fn render_topology_scene(
                         .map(|node| render_topology_node(node, selected_element, cx)),
                 ),
         )
-        .when(!linear_flow.is_empty(), |this| {
+        .when(scene.expanded && !linear_flow.is_empty(), |this| {
             this.child(
                 Label::new(format!("Value flow: {linear_flow}"))
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
         })
-        .when(!scene.edges.is_empty(), |this| {
+        .when(scene.expanded && !scene.edges.is_empty(), |this| {
             this.child(Label::new("Relations").size(LabelSize::Small)).child(
                 h_flex().gap_1().flex_wrap().children(scene.edges.iter().map(|edge| {
                     let source = scene
@@ -329,80 +449,6 @@ pub(super) fn render_topology_scene(
                         )
                     }))
                 })),
-            )
-        })
-        .when(!scene.moments.is_empty(), |this| {
-            let last = scene.moments.len().saturating_sub(1);
-            this.child(Label::new("Ownership event").size(LabelSize::Small))
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new("topology-previous-step", "←")
-                                .aria_label("Previous ownership event; Left Arrow")
-                                .disabled(scene.selected_step == 0)
-                                .on_click(cx.listener(move |panel, _, _window, cx| {
-                                    panel.select_visual_step(
-                                        scene.selected_step.saturating_sub(1),
-                                        cx,
-                                    )
-                                })),
-                        )
-                        .children(scene.moments.iter().enumerate().map(|(index, moment)| {
-                            let tooltip = moment.title.clone();
-                            Button::new(
-                                SharedString::from(format!("topology-step-{index}")),
-                                if index == scene.selected_step {
-                                    format!("● {}", index + 1)
-                                } else {
-                                    format!("○ {}", index + 1)
-                                },
-                            )
-                            .aria_label(format!(
-                                "Ownership event {} of {}: {}",
-                                index + 1,
-                                scene.moments.len(),
-                                moment.title
-                            ))
-                            .tooltip(ui::Tooltip::text(tooltip))
-                            .on_click(cx.listener(move |panel, _, _window, cx| {
-                                panel.select_visual_step(index, cx)
-                            }))
-                        }))
-                        .child(
-                            Button::new("topology-next-step", "→")
-                                .aria_label("Next ownership event; Right Arrow")
-                                .disabled(scene.selected_step >= last)
-                                .on_click(cx.listener(move |panel, _, _window, cx| {
-                                    panel.select_visual_step(
-                                        (scene.selected_step + 1).min(last),
-                                        cx,
-                                    )
-                                })),
-                        ),
-                )
-        })
-        .when_some(selected_moment, |this, moment| {
-            this.child(
-                v_flex()
-                    .p_2()
-                    .gap_0p5()
-                    .bg(cx.theme().status().info_background.opacity(0.1))
-                    .child(
-                        Label::new(format!(
-                            "Step {} · {} · line {}{}",
-                            scene.selected_step + 1,
-                            moment.title,
-                            moment.range.start.line + 1,
-                            moment
-                                .path_marker
-                                .as_deref()
-                                .map(|path| format!(" · path {path}"))
-                                .unwrap_or_default()
-                        ))
-                        .size(LabelSize::Small),
-                    )
-                    .child(Label::new(moment.explanation).size(LabelSize::Small)),
             )
         })
         .when(!scene.access_lines.is_empty(), |this| {
