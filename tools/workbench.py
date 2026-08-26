@@ -528,6 +528,12 @@ def test_multi_instance() -> None:
     )
 
 
+def editor_location(value: str) -> str:
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value) or Path(value).is_absolute():
+        return value
+    return str((ROOT / value).resolve())
+
+
 def run_editor(
     paths: list[str],
     *,
@@ -542,7 +548,8 @@ def run_editor(
         arguments.extend(("--instance", instance))
     if new_instance:
         arguments.append("--new-instance")
-    arguments.extend(paths or [str(STRESS_PROJECT)])
+    requested_paths = paths or [str(STRESS_PROJECT)]
+    arguments.extend(editor_location(value) for value in requested_paths)
     run(arguments, cwd=ZED)
 
 
