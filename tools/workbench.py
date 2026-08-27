@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import platform
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -69,7 +71,9 @@ RUST = workspace_path("rust")
 ZED = workspace_path("zed")
 ANALYZER = workspace_path("analyzer")
 STRESS_PROJECT = workspace_path("stress_project")
-HOST = "x86_64-unknown-linux-gnu"
+APPLICATION = CONFIG["application"]
+COMPATIBILITY = CONFIG["compatibility"]
+HOST = COMPATIBILITY["rust_host"]
 STAGE1 = RUST / "build" / HOST / "stage1"
 STAGE0 = RUST / "build" / HOST / "stage0"
 RUSTC = STAGE1 / "bin" / "rustc"
@@ -81,10 +85,20 @@ PROC_MACRO_SERVER = STAGE1 / "libexec" / "rust-analyzer-proc-macro-srv"
 STAGE1_TARGET_LIB = STAGE1 / "lib" / "rustlib" / HOST / "lib"
 BUNDLE_TEMPLATES = ROOT / "tools" / "bundle"
 DIST = ROOT / "dist"
+VM_CACHE = ROOT / ".vm-cache"
 BUILD_RECEIPT = ZED / ".build-deps" / "rust-workbench-build-receipt.json"
 RELEASE_VERSION = tomllib.loads(
     (ZED / "crates" / "rust_workbench" / "Cargo.toml").read_text(encoding="utf-8")
 )["package"]["version"]
+UBUNTU_VM_IMAGE_NAME = "ubuntu-26.04-server-cloudimg-amd64.img"
+UBUNTU_VM_RELEASE_URL = "https://cloud-images.ubuntu.com/releases/26.04/release"
+
+
+def release_archive_name() -> str:
+    return (
+        f"rust-workbench-{RELEASE_VERSION}-linux-{COMPATIBILITY['arch']}-"
+        f"glibc{COMPATIBILITY['glibc_min']}.tar.zst"
+    )
 
 CORE_GLIBC_LIBRARIES = {
     "ld-linux-x86-64.so.2",
@@ -168,6 +182,94 @@ def require_clean_source() -> None:
             "packaging requires a clean, committed source tree; commit or stash these paths:\n"
             + changes
         )
+
+
+def prerequisite_packages(scope: str) -> list[str]:
+    if scope == "build":
+        packages = [*CONFIG["prerequisites"]["host_packages"], *CONFIG["native_sdk"]["packages"]]
+    elif scope == "runtime":
+        packages = list(CONFIG["prerequisites"]["runtime_packages"])
+    elif scope == "vm":
+        packages = list(CONFIG["prerequisites"]["vm_packages"])
+    else:
+        raise SystemExit(f"unknown prerequisite scope: {scope}")
+    return sorted(set(packages))
+
+
+def prerequisites(scope: str, output_format: str) -> int:
+    packages = prerequisite_packages(scope)
+    if output_format == "apt":
+        print("sudo apt-get update")
+        print("sudo apt-get install --yes " + " ".join(shlex.quote(package) for package in packages))
+        if scope == "build":
+            print("# Install rustup and ensure cargo is on PATH: https://rustup.rs/")
+        return 0
+
+    command_sets = {
+        "build": (
+            "apt-get",
+            "cargo",
+            "cmake",
+            "curl",
+            "dpkg-deb",
+            "dpkg-query",
+            "flock",
+            "g++",
+            "gcc",
+            "git",
+            "ninja",
+            "pkg-config",
+            "python3",
+            "readelf",
+            "sha256sum",
+            "tar",
+            "zstd",
+        ),
+        "runtime": (
+            "bash",
+            "flock",
+            "getconf",
+            "ldd",
+            "readlink",
+            "realpath",
+            "sha256sum",
+        ),
+        "vm": ("cloud-localds", "qemu-img", "qemu-system-x86_64", "scp", "ssh", "ssh-keygen"),
+    }
+    failed = False
+    print(f"Rust Workbench {scope} prerequisites")
+    print(f"target: {COMPATIBILITY['os']} {COMPATIBILITY['arch']}, glibc >= {COMPATIBILITY['glibc_min']}")
+    if platform.system() != "Linux" or platform.machine() != COMPATIBILITY["arch"]:
+        print(f"UNSUPPORTED host: {platform.system()} {platform.machine()}")
+        failed = True
+    for command in command_sets[scope]:
+        resolved = shutil.which(command)
+        print(f"{'OK' if resolved else 'MISSING'} command: {command}{f' -> {resolved}' if resolved else ''}")
+        failed |= resolved is None
+    if shutil.which("dpkg-query") is None:
+        print("MISSING command: dpkg-query (cannot inspect package state)")
+        failed = True
+    else:
+        for package in packages:
+            completed = run(
+                ["dpkg-query", "-W", "-f=${db:Status-Abbrev}", package],
+                capture=True,
+                check=False,
+                verbose=False,
+            )
+            present = completed.returncode == 0 and completed.stdout.startswith("ii ")
+            print(f"{'OK' if present else 'MISSING'} package: {package}")
+            failed |= not present
+    free_bytes = shutil.disk_usage(ROOT).free
+    required_bytes = 300 * 1024**3 if scope == "build" else 4 * 1024**3
+    print(f"disk free: {human_size(free_bytes)} (recommended: {human_size(required_bytes)})")
+    failed |= free_bytes < required_bytes
+    if scope == "runtime":
+        glibc = current_glibc()
+        if glibc is None or version_tuple(glibc) < version_tuple(COMPATIBILITY["glibc_min"]):
+            print(f"UNSUPPORTED glibc: {glibc or 'not found'}")
+            failed = True
+    return 1 if failed else 0
 
 
 def record_build(component: str, artifacts: Sequence[Path], **details: object) -> None:
@@ -392,6 +494,10 @@ def build(component: str, *, portable: bool = False) -> None:
 
 def test_quick_or_full(mode: str) -> None:
     environment = portable_build_environment() if mode == "full" else os.environ.copy()
+    run(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tools/tests", "-p", "test_*.py"],
+        env=environment,
+    )
     run(
         [ZED / "script" / "qualify-rust-workbench", f"--{mode}"],
         cwd=ZED,
@@ -1000,16 +1106,28 @@ def write_broken_project(destination: Path) -> None:
 
 
 def smoke_desktop_install(app: Path, temp_path: Path, environment: dict[str, str]) -> None:
-    app_id = "dev.rustworkbench.EditorDev"
+    app_id = APPLICATION["app_id"]
     home = temp_path / "desktop home"
     data = temp_path / "desktop data"
+    prefix = temp_path / "managed prefix"
+    bin_dir = home / ".local" / "bin"
     install_environment = environment.copy()
     install_environment["HOME"] = str(home)
     install_environment["XDG_DATA_HOME"] = str(data)
 
-    run([app / "bin" / "install-desktop"], env=install_environment)
+    run(
+        [
+            app / "bin" / "install-user",
+            "install",
+            "--prefix",
+            prefix,
+            "--bin-dir",
+            bin_dir,
+        ],
+        env=install_environment,
+    )
 
-    user_launcher = home / ".local" / "bin" / "rust-workbench"
+    user_launcher = bin_dir / "rust-workbench"
     desktop_entry = data / "applications" / f"{app_id}.desktop"
     icon = data / "icons" / "hicolor" / "512x512" / "apps" / f"{app_id}.png"
     for path in (user_launcher, desktop_entry, icon):
@@ -1017,9 +1135,10 @@ def smoke_desktop_install(app: Path, temp_path: Path, environment: dict[str, str
             raise RuntimeError(f"desktop install did not create {path}")
 
     installed_root = output([user_launcher, "--print-bundle-root"], env=install_environment)
-    if Path(installed_root) != app.resolve():
+    expected_root = (prefix / "current").resolve()
+    if Path(installed_root) != expected_root:
         raise RuntimeError(
-            f"installed launcher resolved bundle root {installed_root!r}, expected {app.resolve()}"
+            f"installed launcher resolved bundle root {installed_root!r}, expected {expected_root}"
         )
 
     fields = {}
@@ -1028,7 +1147,7 @@ def smoke_desktop_install(app: Path, temp_path: Path, environment: dict[str, str
             key, value = line.split("=", 1)
             fields[key] = value
     expected_fields = {
-        "Exec": f'"{app.resolve() / "bin" / "rust-workbench"}" %F',
+        "Exec": f'"{user_launcher}" %F',
         "Icon": app_id,
         "StartupWMClass": app_id,
     }
@@ -1038,10 +1157,27 @@ def smoke_desktop_install(app: Path, temp_path: Path, environment: dict[str, str
                 f"desktop entry {key} is {fields.get(key)!r}, expected {expected!r}"
             )
 
+    marker = data / "rust-workbench" / "preserve-me"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("preserved\n", encoding="utf-8")
+    run(
+        [
+            prefix / "current" / "bin" / "install-user",
+            "uninstall",
+            "--prefix",
+            prefix,
+            "--bin-dir",
+            bin_dir,
+        ],
+        env=install_environment,
+    )
+    if user_launcher.exists() or desktop_entry.exists() or icon.exists() or not marker.exists():
+        raise RuntimeError("desktop uninstall did not remove integration while preserving user data")
+
 
 def smoke_bundle(app: Path, *, label: str) -> None:
     launcher = app / "bin" / "rust-workbench"
-    with tempfile.TemporaryDirectory(prefix="rust-workbench-smoke-") as temp:
+    with tempfile.TemporaryDirectory(prefix=".rust-workbench-smoke-", dir=app.parent) as temp:
         temp_path = Path(temp)
         data = temp_path / "data"
         project = temp_path / "native-project"
@@ -1094,6 +1230,30 @@ def validate_bundle(app: Path) -> dict[str, object]:
         raise RuntimeError(
             "removed Generated C components found in bundle:\n" + "\n".join(forbidden_paths)
         )
+
+    app_id = APPLICATION["app_id"]
+    required_metadata = (
+        app / "bin" / "rust-workbench",
+        app / "bin" / "install-user",
+        app / "share" / "rust-workbench" / "release.env",
+        app / "share" / "applications" / f"{app_id}.desktop",
+        app / "share" / "icons" / "hicolor" / "512x512" / "apps" / f"{app_id}.png",
+    )
+    missing_metadata = [str(path.relative_to(app)) for path in required_metadata if not path.exists()]
+    if missing_metadata:
+        raise RuntimeError("bundle metadata is missing:\n" + "\n".join(missing_metadata))
+
+    for path in required_metadata[:-1]:
+        text = path.read_text(encoding="utf-8")
+        if str(ROOT) in text:
+            raise RuntimeError(f"machine-specific path found in {path.relative_to(app)}")
+        if re.search(r"@[A-Z_]+@", text):
+            raise RuntimeError(f"unexpanded package placeholder in {path.relative_to(app)}")
+
+    desktop = required_metadata[-2].read_text(encoding="utf-8")
+    for expected in (f"Icon={app_id}", f"StartupWMClass={app_id}"):
+        if expected not in desktop:
+            raise RuntimeError(f"desktop entry is missing {expected}")
 
     editor = app / "libexec" / "rust-workbench"
     dynamic = run(["readelf", "-d", editor], capture=True).stdout
@@ -1159,6 +1319,34 @@ def validate_bundle(app: Path) -> dict[str, object]:
     return {"elf_files": elf_count, "maximum_required_glibc": maximum_name}
 
 
+def release_environment_text(commit: str) -> str:
+    values = {
+        "RUST_WORKBENCH_APP_NAME": APPLICATION["name"],
+        "RUST_WORKBENCH_APP_ID": APPLICATION["app_id"],
+        "RUST_WORKBENCH_RELEASE_CHANNEL": APPLICATION["release_channel"],
+        "RUST_WORKBENCH_INSTALL_DIRECTORY": APPLICATION["install_directory"],
+        "RUST_WORKBENCH_INSTALL_LAYOUT_VERSION": APPLICATION["install_layout_version"],
+        "RUST_WORKBENCH_VERSION": RELEASE_VERSION,
+        "RUST_WORKBENCH_SOURCE_COMMIT": commit,
+        "RUST_WORKBENCH_ARCH": COMPATIBILITY["arch"],
+        "RUST_WORKBENCH_RUST_HOST": COMPATIBILITY["rust_host"],
+        "RUST_WORKBENCH_NATIVE_TRIPLE": COMPATIBILITY["native_triple"],
+        "RUST_WORKBENCH_GLIBC_MIN": COMPATIBILITY["glibc_min"],
+        "RUST_WORKBENCH_GCC_MAJOR": CONFIG["native_sdk"]["gcc_major"],
+    }
+    return "".join(f"{key}={shlex.quote(str(value))}\n" for key, value in values.items())
+
+
+def render_desktop_entry() -> str:
+    template = (BUNDLE_TEMPLATES / "rust-workbench.desktop.in").read_text(encoding="utf-8")
+    rendered = template.replace("@APP_NAME@", APPLICATION["name"]).replace(
+        "@APP_ID@", APPLICATION["app_id"]
+    )
+    if re.search(r"@[A-Z_]+@", rendered):
+        raise RuntimeError("unexpanded desktop-entry placeholder")
+    return rendered
+
+
 def create_manifest(app: Path, native_versions: dict[str, str], validation: dict[str, object]) -> None:
     environment = os.environ.copy()
     environment["LD_LIBRARY_PATH"] = str(app / "lib")
@@ -1166,10 +1354,15 @@ def create_manifest(app: Path, native_versions: dict[str, str], validation: dict
     created = dt.datetime.fromtimestamp(source_epoch(), dt.UTC).isoformat()
     manifest = {
         "format_version": 2,
-        "name": "Rust Workbench",
+        "name": APPLICATION["name"],
         "version": RELEASE_VERSION,
         "created_utc": created,
         "source_commit": commit,
+        "application": {
+            "id": APPLICATION["app_id"],
+            "release_channel": APPLICATION["release_channel"],
+            "install_layout_version": APPLICATION["install_layout_version"],
+        },
         "compatibility": {
             "os": CONFIG["compatibility"]["os"],
             "architecture": CONFIG["compatibility"]["arch"],
@@ -1195,6 +1388,18 @@ def create_manifest(app: Path, native_versions: dict[str, str], validation: dict
         app / "libexec" / "rust-analyzer",
         app / "toolchain" / "bin" / "rustc",
         app / "toolchain" / "bin" / "cargo",
+        app / "bin" / "rust-workbench",
+        app / "bin" / "install-user",
+        app / "bin" / "install-desktop",
+        app / "share" / "rust-workbench" / "release.env",
+        app / "share" / "applications" / f"{APPLICATION['app_id']}.desktop",
+        app
+        / "share"
+        / "icons"
+        / "hicolor"
+        / "512x512"
+        / "apps"
+        / f"{APPLICATION['app_id']}.png",
     )
     (app / "checksums.sha256").write_text(
         "".join(
@@ -1211,11 +1416,16 @@ def populate_bundle(app: Path) -> dict[str, str]:
     (app / "share" / "applications").mkdir(parents=True)
     (app / "share" / "icons" / "hicolor" / "512x512" / "apps").mkdir(parents=True)
     (app / "share" / "licenses" / "rust-workbench").mkdir(parents=True)
+    (app / "share" / "rust-workbench").mkdir(parents=True)
 
     copy_executable(EDITOR_BINARY, app / "libexec" / "rust-workbench")
     copy_executable(ANALYZER_BINARY, app / "libexec" / "rust-analyzer")
     copy_executable(BUNDLE_TEMPLATES / "rust-workbench", app / "bin" / "rust-workbench")
+    copy_executable(BUNDLE_TEMPLATES / "install-user", app / "bin" / "install-user")
     copy_executable(BUNDLE_TEMPLATES / "install-desktop", app / "bin" / "install-desktop")
+    (app / "share" / "rust-workbench" / "release.env").write_text(
+        release_environment_text(source_commit()), encoding="utf-8"
+    )
 
     copy_tree(STAGE1, app / "toolchain")
     copy_executable(CARGO, app / "toolchain" / "bin" / "cargo")
@@ -1247,11 +1457,10 @@ def populate_bundle(app: Path) -> dict[str, str]:
         / "hicolor"
         / "512x512"
         / "apps"
-        / "dev.rustworkbench.EditorDev.png",
+        / f"{APPLICATION['app_id']}.png",
     )
-    shutil.copy2(
-        BUNDLE_TEMPLATES / "dev.rustworkbench.EditorDev.desktop",
-        app / "share" / "applications" / "dev.rustworkbench.EditorDev.desktop",
+    (app / "share" / "applications" / f"{APPLICATION['app_id']}.desktop").write_text(
+        render_desktop_entry(), encoding="utf-8"
     )
 
     native_versions = copy_native_sdk(app)
@@ -1315,13 +1524,32 @@ def archive_bundle(staging: Path, archive: Path, app_name: str) -> None:
     )
 
 
-def verify_archive(archive: Path, *, container: bool = False) -> None:
+def verify_archive(
+    archive: Path,
+    *,
+    container: bool = False,
+    vm: bool = False,
+    keep_vm_on_failure: bool = False,
+    purge_vm_image: bool = False,
+) -> None:
     if not archive.is_file():
         raise SystemExit(f"bundle archive not found: {archive}")
-    verify_root = DIST / ".verify path with spaces"
-    if verify_root.exists():
-        shutil.rmtree(verify_root)
-    verify_root.mkdir(parents=True)
+    checksum_path = archive.with_suffix(archive.suffix + ".sha256")
+    release_manifest_path = archive.with_suffix(archive.suffix + ".manifest.json")
+    if not checksum_path.is_file() or not release_manifest_path.is_file():
+        raise RuntimeError(
+            "release verification requires the archive, .sha256, and .manifest.json sidecars"
+        )
+    checksum_fields = checksum_path.read_text(encoding="utf-8").split()
+    if len(checksum_fields) != 2 or checksum_fields[1].lstrip("*") != archive.name:
+        raise RuntimeError(f"invalid release checksum sidecar: {checksum_path}")
+    actual_checksum = sha256(archive)
+    if checksum_fields[0].lower() != actual_checksum:
+        raise RuntimeError(
+            f"release checksum mismatch: expected {checksum_fields[0]}, got {actual_checksum}"
+        )
+    DIST.mkdir(parents=True, exist_ok=True)
+    verify_root = Path(tempfile.mkdtemp(prefix=".verify path with spaces-", dir=DIST))
     try:
         run(["tar", "--zstd", "-xf", archive, "-C", verify_root])
         apps = list(verify_root.glob("*.app"))
@@ -1329,9 +1557,31 @@ def verify_archive(archive: Path, *, container: bool = False) -> None:
             raise RuntimeError(f"expected one application directory in {archive}, found {apps}")
         app = apps[0]
         validate_bundle(app)
+        try:
+            manifest = json.loads((app / "manifest.json").read_text(encoding="utf-8"))
+            release_manifest = json.loads(release_manifest_path.read_text(encoding="utf-8"))
+            manifest_commit = manifest["source_commit"]
+            manifest_app_id = manifest["application"]["id"]
+        except (KeyError, TypeError, OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"invalid bundle manifest in {archive}: {error}") from error
+        if not isinstance(manifest_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", manifest_commit):
+            raise RuntimeError(f"invalid source commit in bundle manifest: {manifest_commit!r}")
+        if manifest_app_id != APPLICATION["app_id"]:
+            raise RuntimeError(
+                f"bundle application ID is {manifest_app_id!r}, expected {APPLICATION['app_id']!r}"
+            )
+        if release_manifest != manifest:
+            raise RuntimeError("release sidecar manifest does not match the embedded manifest")
         smoke_bundle(app, label="relocated archive")
         if container:
             verify_bundle_in_container(app)
+        if vm:
+            verify_bundle_in_vm(
+                archive,
+                expected_commit=manifest_commit,
+                keep_on_failure=keep_vm_on_failure,
+                purge_image=purge_vm_image,
+            )
     finally:
         shutil.rmtree(verify_root, ignore_errors=True)
 
@@ -1369,6 +1619,421 @@ def verify_bundle_in_container(app: Path) -> None:
     print("bundle smoke passed: clean Ubuntu 26.04 container")
 
 
+def require_vm_tools() -> None:
+    commands = ("cloud-localds", "curl", "qemu-img", "qemu-system-x86_64", "scp", "ssh", "ssh-keygen")
+    missing = [command for command in commands if shutil.which(command) is None]
+    if missing:
+        apt_command = " ".join(prerequisite_packages("vm"))
+        raise RuntimeError(
+            "missing VM verification commands: "
+            + ", ".join(missing)
+            + f"\nInstall them with: sudo apt-get update && sudo apt-get install --yes {apt_command}"
+        )
+    if not os.path.exists("/dev/kvm") or not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        raise RuntimeError(
+            "VM verification requires read/write access to /dev/kvm; enable hardware "
+            "virtualization and add the current user to the kvm group"
+        )
+
+
+def download_verified_vm_image() -> Path:
+    VM_CACHE.mkdir(parents=True, exist_ok=True)
+    image = VM_CACHE / UBUNTU_VM_IMAGE_NAME
+    checksum_url = f"{UBUNTU_VM_RELEASE_URL}/SHA256SUMS"
+    with (VM_CACHE / ".image.lock").open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        completed = run(
+            ["curl", "--fail", "--location", "--silent", "--show-error", checksum_url],
+            capture=True,
+        )
+        expected = ""
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[-1].lstrip("*") == UBUNTU_VM_IMAGE_NAME:
+                expected = fields[0]
+                break
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+            raise RuntimeError(f"Ubuntu checksum list did not contain {UBUNTU_VM_IMAGE_NAME}")
+
+        if image.is_file() and sha256(image) != expected.lower():
+            image.unlink()
+        if not image.is_file():
+            partial = image.with_suffix(image.suffix + ".partial")
+            partial.unlink(missing_ok=True)
+            try:
+                run(
+                    [
+                        "curl",
+                        "--fail",
+                        "--location",
+                        "--show-error",
+                        "--output",
+                        partial,
+                        f"{UBUNTU_VM_RELEASE_URL}/{UBUNTU_VM_IMAGE_NAME}",
+                    ]
+                )
+                actual = sha256(partial)
+                if actual != expected.lower():
+                    raise RuntimeError(
+                        f"Ubuntu cloud image checksum mismatch: expected {expected}, got {actual}"
+                    )
+                partial.replace(image)
+            finally:
+                partial.unlink(missing_ok=True)
+    print(f"verified Ubuntu VM image: {image}")
+    return image
+
+
+def available_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def vm_ssh_command(port: int, private_key: Path) -> list[str]:
+    return [
+        "ssh",
+        "-i",
+        str(private_key),
+        "-p",
+        str(port),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "workbench@127.0.0.1",
+    ]
+
+
+def qemu_failure_detail(process: subprocess.Popen[object], log_path: Path) -> str:
+    if process.poll() is None:
+        return ""
+    tail = ""
+    if log_path.is_file():
+        tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-30:])
+    return f"QEMU exited with status {process.returncode}.\n{tail}"
+
+
+def wait_for_vm_ssh(
+    process: subprocess.Popen[object],
+    port: int,
+    private_key: Path,
+    log_path: Path,
+    *,
+    previous_boot_id: str | None = None,
+    timeout_seconds: int = 900,
+) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    attempts = 0
+    command = vm_ssh_command(port, private_key)
+    while time.monotonic() < deadline:
+        detail = qemu_failure_detail(process, log_path)
+        if detail:
+            raise RuntimeError(detail)
+        completed = run(
+            [*command, "cat /proc/sys/kernel/random/boot_id"],
+            check=False,
+            capture=True,
+            verbose=False,
+        )
+        boot_id = completed.stdout.strip()
+        if completed.returncode == 0 and boot_id and boot_id != previous_boot_id:
+            return boot_id
+        attempts += 1
+        if attempts % 10 == 0:
+            print("waiting for Ubuntu VM SSH...", flush=True)
+        time.sleep(3)
+    raise RuntimeError(f"timed out waiting for Ubuntu VM SSH after {timeout_seconds} seconds")
+
+
+def guest_verification_script(archive_name: str, expected_commit: str) -> str:
+    script = r'''#!/usr/bin/env bash
+set -euo pipefail
+
+archive="$HOME/incoming/@ARCHIVE@"
+incoming="$HOME/incoming"
+extract_root="$HOME/Verification path with spaces"
+install_root="$HOME/.local/opt/rust-workbench"
+launcher="$HOME/.local/bin/rust-workbench"
+app_id="@APP_ID@"
+
+cd "$incoming"
+sha256sum --check "@ARCHIVE@.sha256"
+test ! -e /usr/bin/rustc
+test ! -e /usr/bin/cargo
+test ! -e /usr/bin/cc
+
+mkdir -p "$extract_root"
+tar --zstd -xf "$archive" -C "$extract_root"
+mapfile -t applications < <(find "$extract_root" -mindepth 1 -maxdepth 1 -type d -name '*.app')
+[[ ${#applications[@]} -eq 1 ]]
+application="${applications[0]}"
+
+python3 - "$application/manifest.json" <<'PY'
+import json
+import sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+assert manifest["source_commit"] == "@SOURCE_COMMIT@", manifest["source_commit"]
+assert manifest["application"]["id"] == "@APP_ID@", manifest["application"]
+PY
+
+"$application/bin/rust-workbench" --doctor
+"$application/bin/install-user" install
+test -x "$launcher"
+test -L "$install_root/current"
+test "$("$launcher" --print-bundle-root)" = "$(readlink -f "$install_root/current")"
+desktop="$HOME/.local/share/applications/$app_id.desktop"
+icon="$HOME/.local/share/icons/hicolor/512x512/apps/$app_id.png"
+desktop-file-validate "$desktop"
+grep -Fx "Exec=\"$launcher\" %F" "$desktop"
+grep -Fx "Icon=$app_id" "$desktop"
+grep -Fx "StartupWMClass=$app_id" "$desktop"
+test -s "$icon"
+
+rm -rf "$extract_root"
+sudo iptables -A OUTPUT -o lo -j ACCEPT
+sudo iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A OUTPUT -j REJECT
+
+"$launcher" --doctor
+"$launcher" --run-toolchain rustc -Vv
+"$launcher" --run-toolchain cargo -V
+"$launcher" --run-toolchain rust-analyzer --version
+"$launcher" --run-toolchain cc --version
+
+project="$HOME/native-smoke"
+mkdir -p "$project/src"
+cat > "$project/Cargo.toml" <<'EOF'
+[package]
+name = "rust_workbench_vm_smoke"
+version = "0.1.0"
+edition = "2024"
+EOF
+cat > "$project/native.c" <<'EOF'
+int rust_workbench_answer(void) { return 42; }
+EOF
+cat > "$project/build.rs" <<'EOF'
+use std::{env, path::PathBuf, process::Command};
+fn main() {
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let object = out.join("native.o");
+    let archive = out.join("libnative_vm.a");
+    assert!(Command::new(env::var_os("CC").unwrap()).args(["-c", "native.c", "-o"]).arg(&object).status().unwrap().success());
+    assert!(Command::new(env::var_os("AR").unwrap()).arg("crs").arg(&archive).arg(&object).status().unwrap().success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=native_vm");
+}
+EOF
+cat > "$project/src/main.rs" <<'EOF'
+unsafe extern "C" { fn rust_workbench_answer() -> i32; }
+fn main() { assert_eq!(unsafe { rust_workbench_answer() }, 42); println!("vm smoke: 42"); }
+EOF
+"$launcher" --run-toolchain cargo run --quiet --manifest-path "$project/Cargo.toml"
+
+vulkaninfo --summary >/tmp/rust-workbench-vulkan.txt
+data="$HOME/.local/share/rust-workbench"
+gui_log="$HOME/rust-workbench-first-frame.log"
+timeout 90s dbus-run-session -- xvfb-run -a env \
+  LIBGL_ALWAYS_SOFTWARE=1 RUST_LOG=info RUST_WORKBENCH_DATA_DIR="$data" \
+  "$launcher" "$project" >"$gui_log" 2>&1 &
+gui_pid=$!
+frame_rendered=0
+for _ in $(seq 1 90); do
+  if grep -Rqs "Rendered first frame" "$gui_log" "$data" 2>/dev/null; then
+    frame_rendered=1
+    break
+  fi
+  kill -0 "$gui_pid" 2>/dev/null || break
+  sleep 1
+done
+kill "$gui_pid" 2>/dev/null || true
+wait "$gui_pid" 2>/dev/null || true
+if [[ $frame_rendered -ne 1 ]]; then
+  echo "Editor did not render a first frame" >&2
+  tail -n 100 "$gui_log" >&2 || true
+  find "$data" -type f -name '*.log' -exec tail -n 50 {} \; >&2 || true
+  exit 1
+fi
+
+mkdir -p "$data"
+printf 'preserve across reboot and uninstall\n' > "$data/vm-preserve-marker"
+echo "guest pre-reboot verification passed"
+'''
+    return (
+        textwrap.dedent(script)
+        .replace("@ARCHIVE@", archive_name)
+        .replace("@APP_ID@", APPLICATION["app_id"])
+        .replace("@SOURCE_COMMIT@", expected_commit)
+    )
+
+
+def verify_bundle_in_vm(
+    archive: Path,
+    *,
+    expected_commit: str,
+    keep_on_failure: bool = False,
+    purge_image: bool = False,
+) -> None:
+    require_vm_tools()
+    image = download_verified_vm_image()
+    VM_CACHE.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="run-", dir=VM_CACHE))
+    private_key = work / "id_ed25519"
+    overlay = work / "ubuntu-overlay.qcow2"
+    seed = work / "cloud-init.img"
+    serial_log = work / "serial.log"
+    qemu_log = work / "qemu.log"
+    port = available_tcp_port()
+    process: subprocess.Popen[object] | None = None
+    succeeded = False
+
+    try:
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", private_key])
+        public_key = private_key.with_suffix(".pub").read_text(encoding="utf-8").strip()
+        packages = sorted(
+            set(
+                prerequisite_packages("runtime")
+                + [
+                    "dbus-x11",
+                    "fonts-dejavu-core",
+                    "iptables",
+                    "mesa-vulkan-drivers",
+                    "vulkan-tools",
+                    "xauth",
+                    "xvfb",
+                    "zstd",
+                ]
+            )
+        )
+        package_yaml = "\n".join(f"  - {package}" for package in packages)
+        user_data = (
+            "#cloud-config\n"
+            "package_update: true\n"
+            "package_upgrade: false\n"
+            "packages:\n"
+            f"{package_yaml}\n"
+            "users:\n"
+            "  - name: workbench\n"
+            "    gecos: Rust Workbench verifier\n"
+            "    groups: [adm, sudo]\n"
+            "    shell: /bin/bash\n"
+            "    sudo: ALL=(ALL) NOPASSWD:ALL\n"
+            "    lock_passwd: true\n"
+            "    ssh_authorized_keys:\n"
+            f"      - {public_key}\n"
+            "ssh_pwauth: false\n"
+        )
+        metadata = f"instance-id: rust-workbench-{time.time_ns()}\nlocal-hostname: rust-workbench-vm\n"
+        (work / "user-data").write_text(user_data, encoding="utf-8")
+        (work / "meta-data").write_text(metadata, encoding="utf-8")
+        run(["cloud-localds", seed, work / "user-data", work / "meta-data"])
+        run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", image, overlay, "40G"])
+
+        qemu_command = [
+            "qemu-system-x86_64",
+            "-enable-kvm",
+            "-cpu",
+            "host",
+            "-smp",
+            "4",
+            "-m",
+            "8192",
+            "-display",
+            "none",
+            "-monitor",
+            "none",
+            "-serial",
+            f"file:{serial_log}",
+            "-drive",
+            f"file={overlay},if=virtio,format=qcow2,cache=unsafe",
+            "-drive",
+            f"file={seed},if=virtio,format=raw,readonly=on",
+            "-netdev",
+            f"user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22",
+            "-device",
+            "virtio-net-pci,netdev=net0",
+        ]
+        print(f"starting disposable Ubuntu 26.04 VM (SSH port {port})")
+        with qemu_log.open("w", encoding="utf-8") as qemu_output:
+            process = subprocess.Popen(
+                qemu_command,
+                cwd=ROOT,
+                stdout=qemu_output,
+                stderr=subprocess.STDOUT,
+            )
+            boot_id = wait_for_vm_ssh(process, port, private_key, qemu_log)
+            ssh = vm_ssh_command(port, private_key)
+            run([*ssh, "sudo cloud-init status --wait --long"])
+
+            incoming_checksum = work / f"{archive.name}.sha256"
+            incoming_checksum.write_text(f"{sha256(archive)}  {archive.name}\n", encoding="utf-8")
+            guest_script = work / "verify-bundle.sh"
+            guest_script.write_text(
+                guest_verification_script(archive.name, expected_commit), encoding="utf-8"
+            )
+            guest_script.chmod(0o755)
+            scp = [
+                "scp",
+                "-i",
+                str(private_key),
+                "-P",
+                str(port),
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+            ]
+            run([*ssh, "mkdir -p ~/incoming"])
+            run([*scp, archive, incoming_checksum, "workbench@127.0.0.1:incoming/"])
+            run([*scp, guest_script, "workbench@127.0.0.1:verify-bundle.sh"])
+            run([*ssh, "bash ~/verify-bundle.sh"])
+
+            run([*ssh, "sudo systemctl reboot"], check=False)
+            wait_for_vm_ssh(
+                process,
+                port,
+                private_key,
+                qemu_log,
+                previous_boot_id=boot_id,
+                timeout_seconds=300,
+            )
+            run(
+                [
+                    *ssh,
+                    "set -e; ~/.local/bin/rust-workbench --doctor; "
+                    "test -f ~/.local/share/rust-workbench/vm-preserve-marker; "
+                    "~/.local/bin/rust-workbench-uninstall uninstall; "
+                    "test ! -e ~/.local/bin/rust-workbench; "
+                    f"test ! -e ~/.local/share/applications/{APPLICATION['app_id']}.desktop; "
+                    "test -f ~/.local/share/rust-workbench/vm-preserve-marker",
+                ]
+            )
+        succeeded = True
+        print("bundle smoke passed: disposable Ubuntu 26.04 KVM, reboot, GUI, and uninstall")
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if succeeded or not keep_on_failure:
+            shutil.rmtree(work, ignore_errors=True)
+        else:
+            print(f"failed VM artifacts retained at {work}", file=sys.stderr)
+        if purge_image and (succeeded or not keep_on_failure):
+            image.unlink(missing_ok=True)
+
+
 def package_linux(*, skip_build: bool, keep_staging: bool, verify: bool) -> Path:
     require_clean_source()
     ensure_package_artifacts(skip_build=skip_build)
@@ -1376,7 +2041,7 @@ def package_linux(*, skip_build: bool, keep_staging: bool, verify: bool) -> Path
     staging = Path(tempfile.mkdtemp(prefix=".rust-workbench-package-", dir=DIST))
     app_name = "rust-workbench.app"
     app = staging / app_name
-    archive = DIST / CONFIG["compatibility"]["archive"]
+    archive = DIST / release_archive_name()
     try:
         native_versions = populate_bundle(app)
         validation = validate_bundle(app)
@@ -1403,7 +2068,7 @@ def package_linux(*, skip_build: bool, keep_staging: bool, verify: bool) -> Path
 
 
 def latest_archive() -> Path:
-    configured = DIST / CONFIG["compatibility"]["archive"]
+    configured = DIST / release_archive_name()
     if configured.is_file():
         return configured
     candidates = sorted(
@@ -1419,6 +2084,11 @@ def parser() -> argparse.ArgumentParser:
     subcommands = result.add_subparsers(dest="command", required=True)
     subcommands.add_parser("doctor", help="validate source, tools, artifacts, and ABI")
     subcommands.add_parser("bootstrap", help="install workspace-local native dependencies")
+    prerequisites_parser = subcommands.add_parser(
+        "prerequisites", help="report or print installation commands for required host packages"
+    )
+    prerequisites_parser.add_argument("scope", choices=("build", "runtime", "vm"))
+    prerequisites_parser.add_argument("--format", choices=("report", "apt"), default="report")
 
     build_parser = subcommands.add_parser("build", help="build compiler, analyzer, editor, or all")
     build_parser.add_argument("component", choices=("compiler", "analyzer", "editor", "all"))
@@ -1433,6 +2103,9 @@ def parser() -> argparse.ArgumentParser:
     )
     test_parser.add_argument("--archive", type=Path)
     test_parser.add_argument("--container", action="store_true")
+    test_parser.add_argument("--vm", action="store_true")
+    test_parser.add_argument("--keep-vm-on-failure", action="store_true")
+    test_parser.add_argument("--purge-vm-image", action="store_true")
 
     run_parser = subcommands.add_parser("run", help="launch Rust Workbench")
     run_parser.add_argument("paths", nargs="*")
@@ -1478,9 +2151,20 @@ def main() -> int:
         return doctor()
     if arguments.command == "bootstrap":
         bootstrap()
+    elif arguments.command == "prerequisites":
+        return prerequisites(arguments.scope, arguments.format)
     elif arguments.command == "build":
         build(arguments.component, portable=arguments.portable)
     elif arguments.command == "test":
+        bundle_options = (
+            arguments.archive is not None
+            or arguments.container
+            or arguments.vm
+            or arguments.keep_vm_on_failure
+            or arguments.purge_vm_image
+        )
+        if arguments.suite != "bundle" and bundle_options:
+            raise SystemExit("bundle verification options are valid only with 'test bundle'")
         if arguments.suite in ("quick", "full"):
             test_quick_or_full(arguments.suite)
         elif arguments.suite == "resilience":
@@ -1492,7 +2176,15 @@ def main() -> int:
         elif arguments.suite == "performance":
             test_performance()
         else:
-            verify_archive((arguments.archive or latest_archive()).resolve(), container=arguments.container)
+            if (arguments.keep_vm_on_failure or arguments.purge_vm_image) and not arguments.vm:
+                raise SystemExit("--keep-vm-on-failure and --purge-vm-image require --vm")
+            verify_archive(
+                (arguments.archive or latest_archive()).resolve(),
+                container=arguments.container,
+                vm=arguments.vm,
+                keep_vm_on_failure=arguments.keep_vm_on_failure,
+                purge_vm_image=arguments.purge_vm_image,
+            )
     elif arguments.command == "run":
         run_editor(
             arguments.paths,
@@ -1534,3 +2226,8 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130) from None
+    except (RuntimeError, OSError, subprocess.CalledProcessError) as error:
+        if os.environ.get("RUST_WORKBENCH_DEBUG_TOOLS") == "1":
+            raise
+        print(f"Rust Workbench command failed: {error}", file=sys.stderr)
+        raise SystemExit(1) from None

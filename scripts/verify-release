@@ -6,6 +6,9 @@ cd "$root"
 
 archive=""
 container=0
+vm=0
+keep_vm=0
+purge_vm_image=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --archive)
@@ -17,8 +20,22 @@ while [[ $# -gt 0 ]]; do
       container=1
       shift
       ;;
+    --vm)
+      vm=1
+      shift
+      ;;
+    --keep-vm-on-failure)
+      vm=1
+      keep_vm=1
+      shift
+      ;;
+    --purge-vm-image)
+      vm=1
+      purge_vm_image=1
+      shift
+      ;;
     *)
-      echo "usage: scripts/verify-release [--archive PATH] [--container]" >&2
+      echo "usage: scripts/verify-release [--archive PATH] [--container] [--vm] [--keep-vm-on-failure] [--purge-vm-image]" >&2
       exit 2
       ;;
   esac
@@ -27,4 +44,7 @@ done
 arguments=(test bundle)
 [[ -z "$archive" ]] || arguments+=(--archive "$archive")
 [[ $container -eq 0 ]] || arguments+=(--container)
+[[ $vm -eq 0 ]] || arguments+=(--vm)
+[[ $keep_vm -eq 0 ]] || arguments+=(--keep-vm-on-failure)
+[[ $purge_vm_image -eq 0 ]] || arguments+=(--purge-vm-image)
 ./workbench "${arguments[@]}"

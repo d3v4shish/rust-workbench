@@ -4,11 +4,52 @@ zed = "zed-rust"
 analyzer = "rust/src/tools/rust-analyzer"
 stress_project = "zed-rust/rust-ownership-stress-lab"
 
+[application]
+name = "Rust Workbench"
+app_id = "dev.rustworkbench.EditorDev"
+release_channel = "dev"
+install_directory = "rust-workbench"
+install_layout_version = 1
+
 [compatibility]
 os = "linux"
 arch = "x86_64"
+rust_host = "x86_64-unknown-linux-gnu"
+native_triple = "x86_64-linux-gnu"
 glibc_min = "2.43"
-archive = "rust-workbench-1.1.0-linux-x86_64-glibc2.43.tar.zst"
+
+[prerequisites]
+host_packages = [
+  "apt",
+  "binutils",
+  "build-essential",
+  "ca-certificates",
+  "cmake",
+  "curl",
+  "dpkg",
+  "git",
+  "ninja-build",
+  "pkg-config",
+  "python3",
+  "tar",
+  "util-linux",
+  "zstd",
+]
+runtime_packages = [
+  "bash",
+  "coreutils-from-uutils",
+  "desktop-file-utils",
+  "libc-bin",
+  "libvulkan1",
+  "sed",
+  "util-linux",
+]
+vm_packages = [
+  "cloud-image-utils",
+  "openssh-client",
+  "qemu-system-x86",
+  "qemu-utils",
+]
 
 [cleanup]
 debug_caches = [

@@ -3,6 +3,13 @@ set -euo pipefail
 
 launcher_path="$(readlink -f "${BASH_SOURCE[0]}")"
 bundle_root="$(cd "$(dirname "$launcher_path")/.." && pwd -P)"
+release_environment="$bundle_root/share/rust-workbench/release.env"
+if [[ ! -r "$release_environment" ]]; then
+  echo "Rust Workbench release metadata is missing: $release_environment" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$release_environment"
 editor="$bundle_root/libexec/rust-workbench"
 analyzer="$bundle_root/libexec/rust-analyzer"
 toolchain="$bundle_root/toolchain"
@@ -33,20 +40,20 @@ else
 fi
 
 export CARGO_HOME="${CARGO_HOME:-$data_home/cargo}"
-export ZED_UPDATE_EXPLANATION="Rust Workbench is updated by replacing this relocatable bundle."
-export ZED_RELEASE_CHANNEL=dev
+export ZED_UPDATE_EXPLANATION="Rust Workbench is updated by running the bundled install-user command."
+export ZED_RELEASE_CHANNEL="$RUST_WORKBENCH_RELEASE_CHANNEL"
 export ZED_GENERATE_MINIDUMPS=1
 unset ZED_MINIDUMP_ENDPOINT || true
 mkdir -p "$CARGO_HOME"
 
 doctor() {
   local failed=0
-  local required_glibc="2.43"
+  local required_glibc="$RUST_WORKBENCH_GLIBC_MIN"
   local arch
   arch="$(uname -m)"
   echo "Rust Workbench bundle: $bundle_root"
-  echo "Architecture: $arch (required: x86_64)"
-  if [[ "$arch" != "x86_64" ]]; then
+  echo "Architecture: $arch (required: $RUST_WORKBENCH_ARCH)"
+  if [[ "$arch" != "$RUST_WORKBENCH_ARCH" ]]; then
     failed=1
   fi
 

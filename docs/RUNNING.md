@@ -9,6 +9,21 @@ scripts/run-workbench zed-rust/rust-ownership-stress-lab
 Any file or directory arguments after the command are forwarded to the editor.
 Use `./workbench run --debug` to launch a debug editor build.
 
+For a managed release installation, use the stable command from any directory:
+
+```bash
+rust-workbench --doctor
+rust-workbench path/to/project
+rust-workbench --new-instance path/to/project
+rust-workbench --instance teaching-demo path/to/project
+```
+
+The command resolves `~/.local/opt/rust-workbench/current` at runtime, so an
+upgrade or rollback does not require changing desktop entries, shell aliases,
+or project configuration. If `~/.local/bin` is not already on `PATH`, invoke
+`$HOME/.local/bin/rust-workbench` or add that standard user command directory
+to the shell profile.
+
 ## Instance isolation
 
 Each running editor owns a separate profile, database, log directory, cache,
@@ -30,6 +45,10 @@ the default profile's settings and keymap once, then diverge independently.
 Development profiles live under `zed-rust/rust-workbench-data`. Bundle profiles
 live under `${XDG_DATA_HOME:-$HOME/.local/share}/rust-workbench`, unless
 `RUST_WORKBENCH_DATA_DIR` overrides the root.
+
+Ordinary application uninstall preserves that profile root. Only
+`rust-workbench-uninstall uninstall --purge-data` removes it, and the installer
+refuses to purge a directory that it did not mark as Rust Workbench data.
 
 ## Privacy and local diagnostics
 

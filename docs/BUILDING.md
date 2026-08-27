@@ -10,7 +10,26 @@ system packages or use `sudo`.
 Required host commands include Git, Python 3.11 or newer, Cargo, `apt-get`,
 `dpkg-deb`, `readelf`, `tar`, `zstd`, `flock`, and standard GNU utilities.
 Network access is needed for the first bootstrap and any uncached Cargo or
-WebRTC dependency.
+WebRTC dependency. A full source build should start with at least 300 GiB free.
+
+The package inventory has one source of truth in `workbench.toml`. Report the
+current machine state or print the exact `apt` commands with:
+
+```bash
+./workbench prerequisites build
+./workbench prerequisites build --format apt
+```
+
+Run the printed `apt` commands once. Install Rust through the official rustup
+installer if `cargo` is reported missing, load `$HOME/.cargo/env`, and confirm
+`cargo --version` before continuing. The build does not depend on a specific
+checkout path, home directory, or preinstalled custom compiler.
+
+The system package set includes GCC 15 and its development files because the
+release assembler copies their package-owned files into the bundle's native
+SDK. The separate `./workbench bootstrap` step downloads Zed's graphics and
+audio development packages into `zed-rust/.build-deps` without installing
+those packages system-wide.
 
 ## Complete development build
 
@@ -48,9 +67,14 @@ a release:
 ```
 
 `quick` covers analyzer, Zed integration, the intentionally broken stress lab,
-and touched-crate compilation. `full` additionally runs compiler rewrite tests,
-rebuilds a coherent stage1 toolchain, builds the release editor, and runs the
-compiler-backed integration benchmarks.
+the managed installer lifecycle, and touched-crate compilation. `full`
+additionally runs compiler rewrite tests, rebuilds a coherent stage1 toolchain,
+builds the release editor, and runs the compiler-backed integration benchmarks.
+
+Before packaging, the build receipt must identify the current clean commit and
+the editor must have been built with the portable layout. `scripts/build-release`
+performs those checks and then runs the disposable VM release gate described in
+[Packaging](PACKAGING.md).
 
 ## Generated files
 

@@ -49,8 +49,9 @@ Preserve these product requirements:
 - `tools/workbench.py` and `workbench.toml`: the unified build, test, run,
   packaging, cleanup, compatibility, and release configuration.
 - `tools/bundle/`: relocatable bundle launchers, desktop integration, and
-  native-tool wrappers. Durable installation fixes belong here, not in a local
-  installed copy.
+  native-tool wrappers. `install-user` owns managed install, update, rollback,
+  uninstall, and desktop integration behavior. Durable installation fixes
+  belong here, not in a local installed copy.
 - `scripts/`: stable human-facing entry points. Prefer these for complete builds
   and releases.
 - `docs/`: project build, runtime, architecture, packaging, licensing, and
@@ -103,6 +104,8 @@ Do not use `git add -f` to include any of these:
 
 - `dist/`, extracted `rust-workbench.app` directories, archives, checksums, or
   generated release manifests.
+- `.vm-cache/`, cloud images, QEMU overlays, cloud-init seeds, VM SSH keys, or
+  VM serial logs.
 - `rust/build/`, `rust/target/`, `zed-rust/target/`, analyzer `target/`
   directories, incremental state, or compiled binaries and libraries.
 - `zed-rust/.build-deps/`, generated native sysroots, downloaded SDK packages,
@@ -168,6 +171,8 @@ Run commands from the repository root unless the command says otherwise.
 
 ```bash
 # Inspect prerequisites, source state, built artifacts, and ABI compatibility.
+./workbench prerequisites build
+./workbench prerequisites build --format apt
 ./workbench doctor
 
 # Download and extract workspace-local native dependencies.
@@ -198,6 +203,7 @@ Use the narrowest useful test while iterating:
 ./workbench test performance
 ./workbench test quick
 ./workbench test full
+python3 -m unittest discover -s tools/tests -p 'test_*.py'
 ```
 
 - Analyzer, protocol, or compiler-transport changes: run `resilience` and
@@ -228,14 +234,16 @@ needed.
 ## Release Procedure
 
 1. Update the package version in
-   `zed-rust/crates/rust_workbench/Cargo.toml`, its lockfile entry, the archive
-   name in `workbench.toml`, and versioned documentation references together.
+   `zed-rust/crates/rust_workbench/Cargo.toml`, its lockfile entry, and versioned
+   documentation references together. The archive name is generated from that
+   version and `workbench.toml` compatibility metadata.
 2. Run the relevant focused gates, followed by `./workbench test full`.
 3. Commit the intended source and confirm `git status --short` is empty.
 4. Run `scripts/build-release`. Release packaging intentionally refuses a dirty
    worktree.
-5. Run `scripts/verify-release`; use `scripts/verify-release --container` when
-   Docker access is available.
+5. Confirm the mandatory Ubuntu 26.04 KVM gate within `scripts/build-release`
+   passed. `scripts/verify-release --vm` repeats it for an existing archive;
+   `--container` is an optional additional check.
 6. Confirm the archive checksum and verify that both the sidecar and embedded
    manifests identify `git rev-parse HEAD`.
 7. Create the annotated `rust-workbench-vVERSION` tag on that exact commit and
@@ -249,3 +257,6 @@ needed.
 The release target is Ubuntu 26.04, Linux x86-64, with glibc 2.43 or newer. The
 host supplies Vulkan and X11 or Wayland. See `docs/BUILDING.md`,
 `docs/PACKAGING.md`, and `docs/TROUBLESHOOTING.md` for operational details.
+Do not tag, upload, replace a release asset, or install the replacement on the
+host until the disposable VM gate passes. Moving an existing release tag is an
+exceptional destructive operation and still requires explicit owner approval.

@@ -2,5 +2,8 @@
 set -euo pipefail
 
 sdk_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+bundle_root="$(cd "$sdk_root/.." && pwd -P)"
+# shellcheck disable=SC1090
+source "$bundle_root/share/rust-workbench/release.env"
 tool="$(basename "$0")"
-exec "$sdk_root/sysroot/usr/bin/x86_64-linux-gnu-$tool" "$@"
+exec "$sdk_root/sysroot/usr/bin/$RUST_WORKBENCH_NATIVE_TRIPLE-$tool" "$@"

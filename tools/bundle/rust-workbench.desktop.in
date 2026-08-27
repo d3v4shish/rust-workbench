@@ -1,14 +1,14 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Rust Workbench
+Name=@APP_NAME@
 GenericName=Rust Editor
 Comment=Compiler-backed visual Rust ownership learning editor
 Exec=rust-workbench %F
-Icon=dev.rustworkbench.EditorDev
+Icon=@APP_ID@
 Terminal=false
 StartupNotify=true
-StartupWMClass=dev.rustworkbench.EditorDev
+StartupWMClass=@APP_ID@
 Categories=Development;IDE;
 Keywords=Rust;Zed;IDE;Ownership;Borrow Checker;
 MimeType=text/plain;inode/directory;

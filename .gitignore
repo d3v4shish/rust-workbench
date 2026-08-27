@@ -6,6 +6,7 @@
 
 # Unified Rust Workbench outputs.
 /dist/
+/.vm-cache/
 /rustc-ice-*.txt
 /rust/ownership_visual_repro
 /zed-rust/.build-deps/

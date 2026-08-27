@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+source_bundle="$(cd "$(dirname "$script_path")/.." && pwd -P)"
+release_environment="$source_bundle/share/rust-workbench/release.env"
+if [[ ! -r "$release_environment" ]]; then
+  echo "Rust Workbench release metadata is missing: $release_environment" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$release_environment"
+
+[[ "${RUST_WORKBENCH_APP_ID:-}" =~ ^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$ ]] \
+  || { echo "Rust Workbench install error: invalid application ID in release metadata" >&2; exit 1; }
+[[ "${RUST_WORKBENCH_VERSION:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+  || { echo "Rust Workbench install error: invalid version in release metadata" >&2; exit 1; }
+[[ "${RUST_WORKBENCH_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] \
+  || { echo "Rust Workbench install error: invalid source commit in release metadata" >&2; exit 1; }
+[[ "${RUST_WORKBENCH_INSTALL_DIRECTORY:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+  || { echo "Rust Workbench install error: invalid install directory in release metadata" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+usage: install-user [install|rollback|uninstall] [OPTIONS]
+
+Install options:
+  --prefix PATH       Managed application root (default: ~/.local/opt/rust-workbench)
+  --bin-dir PATH      User command directory (default: ~/.local/bin)
+  --dry-run           Print the selected paths without changing them
+
+Uninstall options:
+  --prefix PATH       Managed application root
+  --bin-dir PATH      User command directory
+  --purge-data        Also remove Rust Workbench profiles and caches
+  --dry-run           Print what would be removed
+
+Rollback options:
+  --prefix PATH       Managed application root
+  --bin-dir PATH      User command directory
+  --dry-run           Print the selected paths without changing them
+EOF
+}
+
+die() {
+  echo "Rust Workbench install error: $*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+
+canonical_path() {
+  realpath -m -- "$1"
+}
+
+reject_desktop_unsafe_path() {
+  case "$1" in
+    *$'\n'*|*'"'*|*'\'*|*'%'*)
+      die "desktop integration paths cannot contain a newline, double quote, backslash, or percent sign: $1"
+      ;;
+  esac
+}
+
+safe_remove_root() {
+  local path="$1"
+  [[ -n "$path" && "$path" != "/" && "$path" != "$HOME" ]] \
+    || die "refusing unsafe managed path: $path"
+}
+
+atomic_symlink() {
+  local target="$1"
+  local destination="$2"
+  local temporary="${destination}.new.$$"
+  ln -s -- "$target" "$temporary"
+  mv -Tf -- "$temporary" "$destination"
+}
+
+require_owned_or_absent_command() {
+  local destination="$1"
+  local resolved=""
+  if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+    return
+  fi
+  if [[ -L "$destination" ]]; then
+    resolved="$(readlink -f "$destination" 2>/dev/null || true)"
+    if [[ "$resolved" == "$install_root/"* \
+      || "$resolved" == "$HOME/.local/opt/rust-workbench-v"*/bin/* ]]; then
+      return
+    fi
+  fi
+  die "refusing to replace a command not owned by Rust Workbench: $destination"
+}
+
+refresh_desktop_caches() {
+  local desktop_data_dir="$1"
+  if [[ -d "$desktop_data_dir/applications" ]] \
+    && command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$desktop_data_dir/applications"
+  fi
+  if [[ -d "$desktop_data_dir/icons/hicolor" ]] \
+    && command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "$desktop_data_dir/icons/hicolor" >/dev/null 2>&1 || true
+  fi
+  if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+  elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+    kbuildsycoca5 --noincremental >/dev/null 2>&1 || true
+  fi
+}
+
+mode="install"
+if [[ "${1:-}" == "install" || "${1:-}" == "rollback" || "${1:-}" == "uninstall" ]]; then
+  mode="$1"
+  shift
+fi
+
+prefix="${RUST_WORKBENCH_INSTALL_ROOT:-$HOME/.local/opt/$RUST_WORKBENCH_INSTALL_DIRECTORY}"
+bin_dir="${RUST_WORKBENCH_BIN_DIR:-$HOME/.local/bin}"
+purge_data=0
+dry_run=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prefix)
+      [[ $# -ge 2 ]] || die "--prefix requires a path"
+      prefix="$2"
+      shift 2
+      ;;
+    --bin-dir)
+      [[ $# -ge 2 ]] || die "--bin-dir requires a path"
+      bin_dir="$2"
+      shift 2
+      ;;
+    --purge-data)
+      purge_data=1
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+[[ "$mode" == "uninstall" || $purge_data -eq 0 ]] \
+  || die "--purge-data is valid only with uninstall"
+
+for command in realpath mkdir ln mv rm install awk flock readlink date cat basename; do
+  require_command "$command"
+done
+
+install_root="$(canonical_path "$prefix")"
+bin_dir="$(canonical_path "$bin_dir")"
+desktop_data_dir="$(canonical_path "${XDG_DATA_HOME:-$HOME/.local/share}")"
+data_home="$(canonical_path "${RUST_WORKBENCH_DATA_DIR:-$desktop_data_dir/rust-workbench}")"
+safe_remove_root "$install_root"
+reject_desktop_unsafe_path "$bin_dir"
+[[ "$data_home" != "$desktop_data_dir" ]] \
+  || die "refusing to use the complete desktop data directory as application data: $data_home"
+
+app_id="$RUST_WORKBENCH_APP_ID"
+desktop_target="$desktop_data_dir/applications/$app_id.desktop"
+icon_target="$desktop_data_dir/icons/hicolor/512x512/apps/$app_id.png"
+bin_target="$bin_dir/rust-workbench"
+uninstall_target="$bin_dir/rust-workbench-uninstall"
+payload_id="$RUST_WORKBENCH_VERSION-${RUST_WORKBENCH_SOURCE_COMMIT:0:12}"
+versions_dir="$install_root/versions"
+payload_target="$versions_dir/$payload_id"
+current_link="$install_root/current"
+previous_link="$install_root/previous"
+data_marker="$data_home/.rust-workbench-managed-data"
+case "$install_root/" in
+  "$source_bundle/"*) die "the managed install root cannot be inside the source bundle" ;;
+esac
+
+if [[ $dry_run -eq 1 ]]; then
+  printf 'mode: %s\nsource: %s\ninstall root: %s\npayload: %s\ncommand: %s\ndesktop: %s\nicon: %s\ndata: %s\n' \
+    "$mode" "$source_bundle" "$install_root" "$payload_target" "$bin_target" \
+    "$desktop_target" "$icon_target" "$data_home"
+  exit 0
+fi
+
+if [[ "$mode" == "rollback" && ! -d "$install_root" ]]; then
+  die "there is no managed installation at $install_root"
+fi
+mkdir -p "$install_root"
+exec {install_lock_fd}>"$install_root/.install.lock"
+flock "$install_lock_fd"
+
+remove_integration() {
+  local candidate resolved
+  for candidate in "$bin_target" "$uninstall_target"; do
+    if [[ -L "$candidate" ]]; then
+      resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
+      if [[ "$resolved" == "$install_root/"* ]]; then
+        rm -f -- "$candidate"
+      fi
+    fi
+  done
+  rm -f -- "$desktop_target" "$icon_target"
+  rm -f -- "$desktop_data_dir/applications/dev.rustworkbench.RustWorkbench.desktop"
+  refresh_desktop_caches "$desktop_data_dir"
+}
+
+if [[ "$mode" == "rollback" ]]; then
+  [[ -L "$current_link" ]] || die "there is no installed version to roll back"
+  [[ -L "$previous_link" ]] || die "there is no previous installed version"
+  current_target="$(readlink "$current_link")"
+  previous_target="$(readlink "$previous_link")"
+  [[ "$current_target" =~ ^versions/[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+    || die "invalid current-version link: $current_target"
+  [[ "$previous_target" =~ ^versions/[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+    || die "invalid previous-version link: $previous_target"
+  "$install_root/$previous_target/bin/rust-workbench" --doctor
+  rollback_swap_error() {
+    trap - ERR
+    atomic_symlink "$current_target" "$current_link" || true
+    atomic_symlink "$previous_target" "$previous_link" || true
+    die "rollback switch failed; original version restored"
+  }
+  trap rollback_swap_error ERR
+  atomic_symlink "$previous_target" "$current_link"
+  atomic_symlink "$current_target" "$previous_link"
+  trap - ERR
+  if ! "$bin_target" --doctor; then
+    atomic_symlink "$current_target" "$current_link"
+    atomic_symlink "$previous_target" "$previous_link"
+    die "rolled-back command failed its doctor; original version restored"
+  fi
+  echo "Rolled back Rust Workbench to $(basename "$previous_target")"
+  exit 0
+fi
+
+if [[ "$mode" == "uninstall" ]]; then
+  if [[ $purge_data -eq 1 ]]; then
+    safe_remove_root "$data_home"
+    [[ -f "$data_marker" && "$(cat "$data_marker")" == "$app_id" ]] \
+      || die "refusing to purge an unmarked application data directory: $data_home"
+  fi
+  remove_integration
+  rm -f -- "$current_link" "$previous_link"
+  rm -rf -- "$versions_dir"
+  rm -f -- "$install_root/.install.lock"
+  rmdir -- "$install_root" 2>/dev/null || true
+  if [[ $purge_data -eq 1 ]]; then
+    rm -rf -- "$data_home"
+    echo "Removed Rust Workbench application and user data."
+  else
+    echo "Removed Rust Workbench application; preserved user data at $data_home"
+  fi
+  exit 0
+fi
+
+for command in cp du df sha256sum; do
+  require_command "$command"
+done
+
+require_owned_or_absent_command "$bin_target"
+require_owned_or_absent_command "$uninstall_target"
+
+"$source_bundle/bin/rust-workbench" --doctor
+mkdir -p "$versions_dir"
+
+if [[ -d "$payload_target" ]]; then
+  if ! "$payload_target/bin/rust-workbench" --doctor; then
+    invalid_target="$install_root/.invalid-$payload_id-$(date -u +%Y%m%dT%H%M%SZ)"
+    mv -- "$payload_target" "$invalid_target"
+    echo "Moved an invalid existing payload to $invalid_target" >&2
+  fi
+fi
+
+payload_created=0
+if [[ ! -d "$payload_target" ]]; then
+  required_kib="$(du -sk -- "$source_bundle" | awk '{print $1}')"
+  available_kib="$(df -Pk -- "$versions_dir" | awk 'NR == 2 {print $4}')"
+  reserve_kib=$((required_kib / 10 + 262144))
+  if (( available_kib < required_kib + reserve_kib )); then
+    die "not enough free disk space: need $((required_kib + reserve_kib)) KiB, have $available_kib KiB"
+  fi
+
+  staging="$install_root/.staging-$payload_id-$$"
+  cleanup_staging() {
+    [[ -z "${staging:-}" || ! -e "$staging" ]] || rm -rf -- "$staging"
+  }
+  trap cleanup_staging EXIT INT TERM
+  mkdir "$staging"
+  cp -a --reflink=auto "$source_bundle/." "$staging/"
+  "$staging/bin/rust-workbench" --doctor
+  mv -- "$staging" "$payload_target"
+  payload_created=1
+  staging=""
+  trap - EXIT INT TERM
+fi
+
+previous_current=""
+if [[ -L "$current_link" ]]; then
+  previous_current="$(readlink "$current_link")"
+  [[ "$previous_current" =~ ^versions/[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+    || die "invalid current-version link: $previous_current"
+fi
+previous_previous=""
+if [[ -L "$previous_link" ]]; then
+  previous_previous="$(readlink "$previous_link")"
+  [[ "$previous_previous" =~ ^versions/[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+    || die "invalid previous-version link: $previous_previous"
+fi
+
+integration_backup="$install_root/.integration-backup-$$"
+mkdir "$integration_backup"
+cleanup_integration_backup() {
+  rm -rf -- "$integration_backup"
+}
+trap cleanup_integration_backup EXIT
+previous_bin_present=0
+previous_uninstall_present=0
+previous_bin_target=""
+previous_uninstall_target=""
+if [[ -L "$bin_target" ]]; then
+  previous_bin_present=1
+  previous_bin_target="$(readlink "$bin_target")"
+fi
+if [[ -L "$uninstall_target" ]]; then
+  previous_uninstall_present=1
+  previous_uninstall_target="$(readlink "$uninstall_target")"
+fi
+if [[ -e "$desktop_target" || -L "$desktop_target" ]]; then
+  cp -a -- "$desktop_target" "$integration_backup/desktop"
+fi
+if [[ -e "$icon_target" || -L "$icon_target" ]]; then
+  cp -a -- "$icon_target" "$integration_backup/icon"
+fi
+
+rollback_current() {
+  if [[ -n "$previous_current" ]]; then
+    atomic_symlink "$previous_current" "$current_link"
+  else
+    rm -f -- "$current_link"
+  fi
+  if [[ -n "$previous_previous" ]]; then
+    atomic_symlink "$previous_previous" "$previous_link"
+  else
+    rm -f -- "$previous_link"
+  fi
+}
+
+discard_new_payload() {
+  if [[ $payload_created -eq 1 && -d "$payload_target" ]]; then
+    rm -rf -- "$payload_target"
+  fi
+}
+
+restore_integration() {
+  if [[ $previous_bin_present -eq 1 ]]; then
+    atomic_symlink "$previous_bin_target" "$bin_target"
+  else
+    rm -f -- "$bin_target"
+  fi
+  if [[ $previous_uninstall_present -eq 1 ]]; then
+    atomic_symlink "$previous_uninstall_target" "$uninstall_target"
+  else
+    rm -f -- "$uninstall_target"
+  fi
+  if [[ -e "$integration_backup/desktop" || -L "$integration_backup/desktop" ]]; then
+    rm -f -- "$desktop_target"
+    cp -a -- "$integration_backup/desktop" "$desktop_target"
+  else
+    rm -f -- "$desktop_target"
+  fi
+  if [[ -e "$integration_backup/icon" || -L "$integration_backup/icon" ]]; then
+    rm -f -- "$icon_target"
+    cp -a -- "$integration_backup/icon" "$icon_target"
+  else
+    rm -f -- "$icon_target"
+  fi
+  refresh_desktop_caches "$desktop_data_dir" || true
+}
+
+rollback_on_error() {
+  status=$?
+  trap - ERR
+  rollback_current || true
+  restore_integration || true
+  discard_new_payload || true
+  rm -rf -- "$integration_backup"
+  echo "Rust Workbench install error: installation failed; previous version restored" >&2
+  exit "$status"
+}
+trap rollback_on_error ERR
+
+if [[ -n "$previous_current" && "$previous_current" != "versions/$payload_id" ]]; then
+  atomic_symlink "$previous_current" "$previous_link"
+fi
+atomic_symlink "versions/$payload_id" "$current_link"
+if ! "$current_link/bin/rust-workbench" --doctor; then
+  trap - ERR
+  rollback_current || true
+  restore_integration || true
+  discard_new_payload || true
+  rm -rf -- "$integration_backup"
+  die "installed payload failed its post-switch doctor; previous version restored"
+fi
+
+mkdir -p "$bin_dir" "$(dirname "$desktop_target")" "$(dirname "$icon_target")"
+atomic_symlink "$current_link/bin/rust-workbench" "$bin_target"
+atomic_symlink "$current_link/bin/install-user" "$uninstall_target"
+install -m 0644 "$current_link/share/icons/hicolor/512x512/apps/$app_id.png" "$icon_target"
+awk -v executable="$bin_target" '
+  /^Exec=/ { print "Exec=\"" executable "\" %F"; next }
+  { print }
+' "$current_link/share/applications/$app_id.desktop" > "${desktop_target}.new.$$"
+chmod 0644 "${desktop_target}.new.$$"
+mv -Tf -- "${desktop_target}.new.$$" "$desktop_target"
+rm -f -- "$desktop_data_dir/applications/dev.rustworkbench.RustWorkbench.desktop"
+refresh_desktop_caches "$desktop_data_dir"
+
+if ! "$bin_target" --doctor; then
+  trap - ERR
+  rollback_current || true
+  restore_integration || true
+  discard_new_payload || true
+  rm -rf -- "$integration_backup"
+  die "installed command failed its doctor; previous version restored"
+fi
+
+mkdir -p "$data_home"
+printf '%s\n' "$app_id" > "$data_marker"
+rm -rf -- "$integration_backup"
+trap - ERR EXIT
+
+current_payload="$(readlink "$current_link")"
+previous_payload="$(readlink "$previous_link" 2>/dev/null || true)"
+for candidate in "$versions_dir"/*; do
+  [[ -d "$candidate" ]] || continue
+  relative="versions/$(basename "$candidate")"
+  if [[ "$relative" != "$current_payload" && "$relative" != "$previous_payload" ]]; then
+    rm -rf -- "$candidate"
+  fi
+done
+for invalid in "$install_root"/.invalid-*; do
+  [[ -e "$invalid" ]] || continue
+  rm -rf -- "$invalid"
+done
+
+legacy_root="$HOME/.local/opt/rust-workbench-v$RUST_WORKBENCH_VERSION"
+echo "Installed $RUST_WORKBENCH_APP_NAME $RUST_WORKBENCH_VERSION at $payload_target"
+echo "Command: $bin_target"
+if [[ -d "$legacy_root" && "$(canonical_path "$legacy_root")" != "$payload_target" ]]; then
+  echo "Legacy bundle preserved at $legacy_root; remove it after confirming the managed install."
+fi
