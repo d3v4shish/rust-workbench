@@ -30,6 +30,7 @@ that optional gate.
 ```bash
 tar --zstd -xf rust-workbench-1.1.0-linux-x86_64-glibc2.43.tar.zst
 rust-workbench.app/bin/rust-workbench --doctor
+rust-workbench.app/bin/install-desktop
 rust-workbench.app/bin/rust-workbench path/to/rust/project
 ```
 

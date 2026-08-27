@@ -2,17 +2,25 @@
 set -euo pipefail
 
 bundle_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-desktop_source="$bundle_root/share/applications/dev.rustworkbench.RustWorkbench.desktop"
-desktop_target="${XDG_DATA_HOME:-$HOME/.local/share}/applications/dev.rustworkbench.RustWorkbench.desktop"
-icon_target="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/512x512/apps/rust-workbench.png"
+desktop_data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+app_id="dev.rustworkbench.EditorDev"
+desktop_source="$bundle_root/share/applications/$app_id.desktop"
+desktop_target="$desktop_data_dir/applications/$app_id.desktop"
+icon_target="$desktop_data_dir/icons/hicolor/512x512/apps/$app_id.png"
 bin_target="$HOME/.local/bin/rust-workbench"
 
 mkdir -p "$(dirname "$desktop_target")" "$(dirname "$icon_target")" "$(dirname "$bin_target")"
-install -m 0644 "$bundle_root/share/icons/hicolor/512x512/apps/rust-workbench.png" "$icon_target"
+install -m 0644 "$bundle_root/share/icons/hicolor/512x512/apps/$app_id.png" "$icon_target"
 ln -sfn "$bundle_root/bin/rust-workbench" "$bin_target"
 sed \
-  -e "s|^Exec=.*|Exec=$bundle_root/bin/rust-workbench %F|" \
-  -e "s|^Icon=.*|Icon=$icon_target|" \
+  -e "s|^Exec=.*|Exec=\"$bundle_root/bin/rust-workbench\" %F|" \
   "$desktop_source" > "$desktop_target"
 chmod 0644 "$desktop_target"
+rm -f "$desktop_data_dir/applications/dev.rustworkbench.RustWorkbench.desktop"
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$desktop_data_dir/applications"
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -f -t "$desktop_data_dir/icons/hicolor" >/dev/null 2>&1 || true
+fi
 echo "Installed Rust Workbench desktop entry and $bin_target"

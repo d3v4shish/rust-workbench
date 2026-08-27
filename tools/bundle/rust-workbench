@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bundle_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+launcher_path="$(readlink -f "${BASH_SOURCE[0]}")"
+bundle_root="$(cd "$(dirname "$launcher_path")/.." && pwd -P)"
 editor="$bundle_root/libexec/rust-workbench"
 analyzer="$bundle_root/libexec/rust-analyzer"
 toolchain="$bundle_root/toolchain"

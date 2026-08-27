@@ -999,6 +999,46 @@ def write_broken_project(destination: Path) -> None:
     )
 
 
+def smoke_desktop_install(app: Path, temp_path: Path, environment: dict[str, str]) -> None:
+    app_id = "dev.rustworkbench.EditorDev"
+    home = temp_path / "desktop home"
+    data = temp_path / "desktop data"
+    install_environment = environment.copy()
+    install_environment["HOME"] = str(home)
+    install_environment["XDG_DATA_HOME"] = str(data)
+
+    run([app / "bin" / "install-desktop"], env=install_environment)
+
+    user_launcher = home / ".local" / "bin" / "rust-workbench"
+    desktop_entry = data / "applications" / f"{app_id}.desktop"
+    icon = data / "icons" / "hicolor" / "512x512" / "apps" / f"{app_id}.png"
+    for path in (user_launcher, desktop_entry, icon):
+        if not path.exists():
+            raise RuntimeError(f"desktop install did not create {path}")
+
+    installed_root = output([user_launcher, "--print-bundle-root"], env=install_environment)
+    if Path(installed_root) != app.resolve():
+        raise RuntimeError(
+            f"installed launcher resolved bundle root {installed_root!r}, expected {app.resolve()}"
+        )
+
+    fields = {}
+    for line in desktop_entry.read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key] = value
+    expected_fields = {
+        "Exec": f'"{app.resolve() / "bin" / "rust-workbench"}" %F',
+        "Icon": app_id,
+        "StartupWMClass": app_id,
+    }
+    for key, expected in expected_fields.items():
+        if fields.get(key) != expected:
+            raise RuntimeError(
+                f"desktop entry {key} is {fields.get(key)!r}, expected {expected!r}"
+            )
+
+
 def smoke_bundle(app: Path, *, label: str) -> None:
     launcher = app / "bin" / "rust-workbench"
     with tempfile.TemporaryDirectory(prefix="rust-workbench-smoke-") as temp:
@@ -1008,6 +1048,7 @@ def smoke_bundle(app: Path, *, label: str) -> None:
         write_smoke_project(project)
         environment = bundle_environment(app, data, project / "target")
         run([launcher, "--doctor"], env=environment)
+        smoke_desktop_install(app, temp_path, environment)
         run([launcher, "--run-toolchain", "cargo", "run", "--quiet", "--manifest-path", project / "Cargo.toml"], env=environment)
 
         broken = temp_path / "broken-project"
@@ -1200,11 +1241,17 @@ def populate_bundle(app: Path) -> dict[str, str]:
     shutil.copy2(ZED / "LICENSE-GPL", license_dir / "zed-LICENSE-GPL")
     shutil.copy2(
         ZED / "crates" / "zed" / "resources" / "app-icon-rust-workbench.png",
-        app / "share" / "icons" / "hicolor" / "512x512" / "apps" / "rust-workbench.png",
+        app
+        / "share"
+        / "icons"
+        / "hicolor"
+        / "512x512"
+        / "apps"
+        / "dev.rustworkbench.EditorDev.png",
     )
     shutil.copy2(
-        BUNDLE_TEMPLATES / "dev.rustworkbench.RustWorkbench.desktop",
-        app / "share" / "applications" / "dev.rustworkbench.RustWorkbench.desktop",
+        BUNDLE_TEMPLATES / "dev.rustworkbench.EditorDev.desktop",
+        app / "share" / "applications" / "dev.rustworkbench.EditorDev.desktop",
     )
 
     native_versions = copy_native_sdk(app)
