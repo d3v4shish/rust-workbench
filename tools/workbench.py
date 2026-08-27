@@ -1861,6 +1861,9 @@ if [[ $frame_rendered -ne 1 ]]; then
   exit 1
 fi
 
+# The application and toolchain checks above ran with outbound traffic rejected.
+# Restore networking so the SSH transport can flush its bounded result normally.
+sudo iptables -D OUTPUT -j REJECT
 mkdir -p "$data"
 printf 'preserve across reboot and uninstall\n' > "$data/vm-preserve-marker"
 echo "guest pre-reboot verification passed"
@@ -1996,7 +1999,13 @@ def verify_bundle_in_vm(
             run([*scp, guest_script, "workbench@127.0.0.1:verify-bundle.sh"])
             run([*ssh, "bash ~/verify-bundle.sh"])
 
-            run([*ssh, "sudo systemctl reboot"], check=False)
+            run(
+                [
+                    *ssh,
+                    "sudo systemd-run --quiet --unit=rust-workbench-verifier-reboot "
+                    "--on-active=2s /usr/bin/systemctl reboot",
+                ]
+            )
             wait_for_vm_ssh(
                 process,
                 port,
